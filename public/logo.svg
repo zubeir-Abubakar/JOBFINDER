@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 548" role="img" aria-labelledby="t">
+  <title id="t">Towfiq AI Agents</title>
+  <defs>
+    <linearGradient id="navy" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#155a96"/>
+      <stop offset="0.55" stop-color="#0a3a67"/>
+      <stop offset="1" stop-color="#052544"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#0a3f74"/>
+      <stop offset="0.55" stop-color="#0d7fc1"/>
+      <stop offset="1" stop-color="#25b9e6"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#0a6aa8"/>
+      <stop offset="0.5" stop-color="#1aa6dd"/>
+      <stop offset="1" stop-color="#6ee6ff"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(24 0)">
+    <g fill="none" stroke="url(#cyan)" stroke-width="3" opacity="0.5">
+      <path d="M336 72 L388 112 L404 192"/>
+      <path d="M388 112 L448 158"/>
+    </g>
+    <g fill="url(#cyan)" opacity="0.9">
+      <circle cx="336" cy="72" r="15"/>
+      <circle cx="388" cy="112" r="9"/>
+      <circle cx="404" cy="192" r="12"/>
+      <circle cx="448" cy="158" r="8"/>
+    </g>
+    <path fill="url(#navy)" d="M54 96h212l-14 50h-46l-14 256h-64l14-256H54z"/>
+    <path fill="url(#blue)" d="M300 90l110 318h-68l-42-126-42 126h-68z"/>
+    <path fill="url(#blue)" d="M252 314h104l-8 38h-88z"/>
+    <g transform="translate(272 268) rotate(45)">
+      <path fill="url(#cyan)" d="M-26 92V-92h-46L0-206l72 114h-46V92z"/>
+    </g>
+  </g>
+
+  <text x="280" y="486" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="88" font-weight="700" letter-spacing="3" fill="#0b3a68">TOWFIQ</text>
+  <text x="280" y="530" text-anchor="middle" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="30" font-weight="600" letter-spacing="13" fill="#0d7fb8">AI AGENTS</text>
+</svg>
