@@ -89,8 +89,8 @@ export default async function AdminEmailPage({
                 <input type="checkbox" name="connected" defaultChecked={email.connected} /> Mark the provider as connected
               </label>
               <div className="alert alert-info">
-                Marking this connected does not send anything by itself. Delivery requires the OAuth credentials below and a mail-sending implementation for this
-                deployment. Until then, notifications are recorded in-app only and no email is claimed as sent.
+                Marking this connected does not send anything by itself. The explicit test in Settings can send one message through the connected Gmail account;
+                automatic notification emails are not implemented. In-app notifications remain independent of email delivery.
               </div>
               <SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save email configuration</SubmitButton>
             </form>

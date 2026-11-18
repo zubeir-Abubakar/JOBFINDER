@@ -7,7 +7,7 @@ import { join } from "node:path";
 const dataDir = mkdtempSync(join(tmpdir(), "atw-profile-editor-"));
 process.env.DATA_DIR = dataDir;
 
-const { getDb, nowIso, run } = await import("../lib/db.ts");
+const { getDb, nowIso, run, SCHEMA_VERSION } = await import("../lib/db.ts");
 const { getProfileData, parseLanguageEntries, parseLanguageText, formatLanguageEntries } = await import("../lib/profile.ts");
 const { sanitizeRichText, richTextToPlain, richTextToBullets, listToHtml } = await import("../lib/rich-text.ts");
 
@@ -60,7 +60,7 @@ test("schema v7 adds editor columns without rewriting existing records", () => {
   assert.ok(columns("skills").includes("deleted_at"));
   assert.ok(columns("profiles").includes("languages_synced_at"));
   assert.ok(columns("profiles").includes("cv_synced_source"));
-  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, SCHEMA_VERSION);
 });
 
 test("profile rows passed to client components are plain objects", () => {

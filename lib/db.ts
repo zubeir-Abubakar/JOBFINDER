@@ -321,6 +321,113 @@ CREATE TABLE IF NOT EXISTS temp_objects (
   meta TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_temp_objects_expiry ON temp_objects(status, expires_at);
+CREATE TABLE IF NOT EXISTS recruitment_runs (
+  id TEXT PRIMARY KEY,
+  run_key TEXT NOT NULL UNIQUE,
+  workflow_id TEXT,
+  scheduled_for TEXT,
+  trigger TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'scheduled',
+  state_history TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  jobs_discovered INTEGER NOT NULL DEFAULT 0,
+  jobs_eligible INTEGER NOT NULL DEFAULT 0,
+  jobs_qualified INTEGER NOT NULL DEFAULT 0,
+  packages_prepared INTEGER NOT NULL DEFAULT 0,
+  applications_submitted INTEGER NOT NULL DEFAULT 0,
+  applications_unverified INTEGER NOT NULL DEFAULT 0,
+  applications_intervention INTEGER NOT NULL DEFAULT 0,
+  applications_simulated INTEGER NOT NULL DEFAULT 0,
+  failures INTEGER NOT NULL DEFAULT 0,
+  warnings INTEGER NOT NULL DEFAULT 0,
+  report TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recruitment_runs_created ON recruitment_runs(created_at DESC);
+CREATE TABLE IF NOT EXISTS recruitment_run_agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL,
+  agent_key TEXT NOT NULL,
+  assignment TEXT NOT NULL,
+  status TEXT NOT NULL,
+  attempt INTEGER NOT NULL DEFAULT 1,
+  output TEXT,
+  error TEXT,
+  coordinator_decision TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recruitment_run_agents_run ON recruitment_run_agents(run_id, id);
+CREATE TABLE IF NOT EXISTS schedule_jobs (
+  key TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  time TEXT NOT NULL,
+  timezone TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  next_run_at TEXT,
+  last_run_at TEXT,
+  last_run_id TEXT,
+  last_status TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS submission_attempts (
+  id TEXT PRIMARY KEY,
+  application_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  run_id TEXT,
+  channel TEXT NOT NULL,
+  endpoint TEXT,
+  status TEXT NOT NULL,
+  http_status INTEGER,
+  reference TEXT,
+  evidence TEXT,
+  error TEXT,
+  attempted_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_submission_attempts_job ON submission_attempts(job_id, status);
+CREATE TABLE IF NOT EXISTS application_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  message TEXT,
+  meta TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_application_events_app ON application_events(application_id, id);
+CREATE TABLE IF NOT EXISTS discovery_source_status (
+  source_key TEXT NOT NULL,
+  employer TEXT,
+  endpoint TEXT NOT NULL,
+  method TEXT NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 0,
+  postings INTEGER NOT NULL DEFAULT 0,
+  fresh INTEGER NOT NULL DEFAULT 0,
+  relevant INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  last_checked_at TEXT NOT NULL,
+  last_success_at TEXT,
+  PRIMARY KEY (source_key, endpoint)
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_source_checked ON discovery_source_status(last_checked_at DESC);
+CREATE TABLE IF NOT EXISTS application_interventions (
+  id TEXT PRIMARY KEY,
+  application_id TEXT NOT NULL,
+  job_id TEXT NOT NULL,
+  field TEXT,
+  question TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  answer TEXT,
+  resolved_at TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_interventions_status ON application_interventions(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_interventions_app ON application_interventions(application_id, status);
 `;
 
 type GlobalWithDb = typeof globalThis & { __atwDb?: DatabaseSync };
@@ -387,10 +494,23 @@ export function v(value: unknown): string | number | null {
 const DEFAULT_SETTINGS: Record<string, unknown> = {
   retention_days: 30,
   auto_delete_expired: true,
-  approval_mode: true,
-  autonomous_submission: false,
-  min_match_score: 60,
-  max_applications_per_day: 5,
+  // Phase 2 autonomy: qualifying applications (>= 85%) are submitted without a
+  // per-application approval gate. Unknown or unsafe answers still queue for a
+  // human, and no submission is ever recorded without employer evidence.
+  approval_mode: false,
+  autonomous_submission: true,
+  min_match_score: 85,
+  max_applications_per_day: 3,
+  recruitment_dry_run: false,
+  recruitment_submission_enabled: true,
+  // Phase 2.6: automatic submission defaults on, but a fresh installation is
+  // not activated until the owner explicitly activates the standing policy.
+  standing_authorisation_activated_at: null as string | null,
+  authorised_answers: {} as Record<string, string>,
+  ashby_job_boards: [] as string[],
+  employer_career_pages: [] as string[],
+  greenhouse_boards: [] as string[],
+  lever_sites: [] as string[],
   search_frequency: "daily",
   duplicate_detection: true,
   notify_daily_report: true,
@@ -496,7 +616,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 12;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -554,6 +674,50 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "experiences", "source_key", "source_key TEXT");
   ensureColumn(db, "experiences", "edited_at", "edited_at TEXT");
   ensureColumn(db, "experiences", "deleted_at", "deleted_at TEXT");
+  // Autonomous recruitment records. Additive only: earlier vacancy and
+  // application rows keep their NULLs and are never rewritten.
+  ensureColumn(db, "jobs", "source_platform", "source_platform TEXT");
+  ensureColumn(db, "jobs", "application_url", "application_url TEXT");
+  ensureColumn(db, "jobs", "published_at", "published_at TEXT");
+  ensureColumn(db, "jobs", "eligibility", "eligibility TEXT");
+  ensureColumn(db, "jobs", "eligibility_notes", "eligibility_notes TEXT");
+  ensureColumn(db, "jobs", "eligibility_checked_at", "eligibility_checked_at TEXT");
+  ensureColumn(db, "jobs", "qualified", "qualified INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "jobs", "run_id", "run_id TEXT");
+  ensureColumn(db, "jobs", "dedupe_key", "dedupe_key TEXT");
+  ensureColumn(db, "jobs", "company_domain", "company_domain TEXT");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_key ON jobs(dedupe_key)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_run ON jobs(run_id)");
+  ensureColumn(db, "applications", "run_id", "run_id TEXT");
+  ensureColumn(db, "applications", "submission_status", "submission_status TEXT");
+  ensureColumn(db, "applications", "submission_evidence", "submission_evidence TEXT");
+  ensureColumn(db, "applications", "confirmation_ref", "confirmation_ref TEXT");
+  ensureColumn(db, "applications", "match_score_at_submit", "match_score_at_submit INTEGER");
+  ensureColumn(db, "applications", "follow_up_at", "follow_up_at TEXT");
+  ensureColumn(db, "applications", "interview_status", "interview_status TEXT");
+  ensureColumn(db, "applications", "applied_channel", "applied_channel TEXT");
+  ensureColumn(db, "documents", "run_id", "run_id TEXT");
+  ensureColumn(db, "documents", "master_cv_ref", "master_cv_ref TEXT");
+  // Per-source discovery contribution and the run mode (full or discovery only).
+  ensureColumn(db, "recruitment_runs", "source_metrics", "source_metrics TEXT");
+  ensureColumn(db, "recruitment_runs", "mode", "mode TEXT");
+  ensureColumn(db, "schedule_jobs", "last_checked_at", "last_checked_at TEXT");
+  // Execution provenance per assigned agent. A step that only recorded a task is
+  // distinguishable from one that actually called a model, and the serving
+  // provider/model is stored beside it. Historical rows stay NULL (unknown).
+  ensureColumn(db, "recruitment_run_agents", "execution_mode", "execution_mode TEXT");
+  ensureColumn(db, "recruitment_run_agents", "provider", "provider TEXT");
+  ensureColumn(db, "recruitment_run_agents", "model", "model TEXT");
+  // Phase 2.4: deterministic vacancy classification and the pre-submission
+  // readiness checklist are stored beside the vacancy/application they explain.
+  ensureColumn(db, "jobs", "classification", "classification TEXT");
+  ensureColumn(db, "jobs", "requirements", "requirements TEXT");
+  ensureColumn(db, "applications", "readiness", "readiness TEXT");
+  ensureColumn(db, "applications", "readiness_checked_at", "readiness_checked_at TEXT");
+  // Phase 2.6: submissions that were prepared but deliberately not sent because
+  // the standing policy is inactive, and the queue of essential questions that
+  // need the owner's answer before a form can be completed.
+  ensureColumn(db, "recruitment_runs", "applications_simulated", "applications_simulated INTEGER NOT NULL DEFAULT 0");
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 
@@ -636,6 +800,9 @@ function migrate(db: DatabaseSync) {
   }
 
   migrateAdminIdentity(db);
+  migrateAutonomyDefaults(db);
+  migrateStandingAuthorisationDefaults(db);
+  enforceThresholdFloor(db);
 
   // Normalise legacy statuses written by earlier builds.
   db.exec("UPDATE agents SET status = 'working' WHERE status = 'running'");
@@ -685,6 +852,50 @@ function seed(db: DatabaseSync) {
     );
     stmt.run("manual", "Manual vacancy entry", "manual", null, 1, "Paste a vacancy URL and description from any Swiss job board or employer site.");
   }
+
+  // Recruitment discovery sources. INSERT OR IGNORE keeps an existing, possibly
+  // edited row (including a disabled state) exactly as it is.
+  const sourceStmt = db.prepare("INSERT OR IGNORE INTO job_sources (key, name, kind, url, enabled, notes) VALUES (?, ?, ?, ?, ?, ?)");
+  sourceStmt.run(
+    "ashby",
+    "Ashby-hosted job boards",
+    "ashby",
+    "https://api.ashbyhq.com/posting-api/job-board",
+    1,
+    "Public Ashby posting API (no key). Configure board slugs in Settings or ASHBY_JOB_BOARDS, e.g. acme,otherco.",
+  );
+  sourceStmt.run(
+    "career_pages",
+    "Employer career pages",
+    "career_page",
+    null,
+    1,
+    "Direct employer career pages with schema.org JobPosting data. Configure URLs in Settings or EMPLOYER_CAREER_PAGES.",
+  );
+  sourceStmt.run(
+    "greenhouse",
+    "Greenhouse-hosted job boards",
+    "greenhouse",
+    "https://boards-api.greenhouse.io/v1/boards",
+    1,
+    "Public Greenhouse job board API (no key). Configure board tokens in Settings or GREENHOUSE_BOARDS.",
+  );
+  sourceStmt.run(
+    "lever",
+    "Lever job boards",
+    "lever",
+    "https://api.lever.co/v0/postings",
+    1,
+    "Public Lever postings API (no key). Configure site names in Settings or LEVER_SITES.",
+  );
+  sourceStmt.run(
+    "jobs_ch",
+    "jobs.ch Swiss job board",
+    "api",
+    "https://www.jobs.ch/api/v1/public/search",
+    1,
+    "Verified public search JSON plus schema.org JobPosting detail (no key). Configure queries in JOBS_CH_QUERIES.",
+  );
 
   const profile = db.prepare("SELECT id FROM profiles WHERE id = 1").get();
   if (!profile) {
@@ -776,6 +987,89 @@ function seed(db: DatabaseSync) {
   }
 
   provisionFromEnv(db);
+}
+
+/**
+ * Phase 2 changes the operating default from "approve every application" to
+ * "submit qualifying applications". The change is applied once, guarded by a
+ * marker, so an owner who later re-enables approval mode keeps that choice on
+ * the next start. Values that were already customised are left untouched.
+ */
+function migrateAutonomyDefaults(db: DatabaseSync) {
+  const marker = db.prepare("SELECT value FROM settings WHERE key = 'autonomy_defaults_v2'").get();
+  if (marker) return;
+  const read = (key: string): unknown => {
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value?: string } | undefined;
+    if (!row?.value) return undefined;
+    try {
+      return JSON.parse(row.value);
+    } catch {
+      return undefined;
+    }
+  };
+  const write = (key: string, value: unknown) => {
+    db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?").run(JSON.stringify(value), nowIso(), key);
+  };
+  if (read("approval_mode") === true) write("approval_mode", false);
+  if (read("autonomous_submission") === false) write("autonomous_submission", true);
+  if (read("min_match_score") === 60) write("min_match_score", 85);
+  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autonomy_defaults_v2', ?, ?)").run(
+    JSON.stringify({ applied_at: nowIso(), version: 2 }),
+    nowIso(),
+  );
+}
+
+/**
+ * Phase 2.6 defaults. The previous default cap was 5/day; a stored 5 is raised
+ * or lowered to the new default 3 exactly once. A custom value (for example 4)
+ * is preserved, so the owner's explicit choice is never silently overwritten.
+ * Activation is inserted as NULL: defaults do not authorise real submissions.
+ */
+function migrateStandingAuthorisationDefaults(db: DatabaseSync) {
+  const marker = db.prepare("SELECT value FROM settings WHERE key = 'autonomy_defaults_v3'").get();
+  if (marker) return;
+  const read = (key: string): unknown => {
+    const row = db.prepare("SELECT value FROM settings WHERE key = ?").get(key) as { value?: string } | undefined;
+    if (!row?.value) return undefined;
+    try {
+      return JSON.parse(row.value);
+    } catch {
+      return undefined;
+    }
+  };
+  const write = (key: string, value: unknown) => {
+    const exists = db.prepare("SELECT 1 FROM settings WHERE key = ?").get(key);
+    if (exists) db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?").run(JSON.stringify(value), nowIso(), key);
+    else db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)").run(key, JSON.stringify(value), nowIso());
+  };
+  if (read("max_applications_per_day") === 5) write("max_applications_per_day", 3);
+  if (read("autonomous_submission") === false) write("autonomous_submission", true);
+  if (read("approval_mode") === true) write("approval_mode", false);
+  if (read("standing_authorisation_activated_at") === undefined) write("standing_authorisation_activated_at", null);
+  if (read("authorised_answers") === undefined) write("authorised_answers", {});
+  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autonomy_defaults_v3', ?, ?)").run(
+    JSON.stringify({ applied_at: nowIso(), version: 3, activated: false }),
+    nowIso(),
+  );
+}
+
+/**
+ * The stored threshold can never sit below the enforced floor. A value above
+ * 85% is preserved; a legacy 80 (written before the floor existed) is raised.
+ * This runs on every open and is idempotent.
+ */
+function enforceThresholdFloor(db: DatabaseSync) {
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'min_match_score'").get() as { value?: string } | undefined;
+  if (!row?.value) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.value);
+  } catch {
+    return;
+  }
+  const value = Number(parsed);
+  if (!Number.isFinite(value) || value >= 85) return;
+  db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = 'min_match_score'").run(JSON.stringify(85), nowIso());
 }
 
 /**

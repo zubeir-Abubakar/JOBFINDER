@@ -89,6 +89,7 @@ export default async function AgentsPage({
   const paused = latestPausedWorkflow();
   const health = await providerHealth();
   const gateway = health.find((item) => item.name === "freellmapi");
+  const ollama = health.find((item) => item.name === "ollama");
   const pending = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NULL")?.c ?? 0;
   const filteredTasks = focus ? tasks.filter((task) => task.agent_key === focus) : tasks.slice(0, 30);
   const focusedAgent = focus ? agents.find((agent) => agent.key === focus) : null;
@@ -141,10 +142,12 @@ export default async function AgentsPage({
         {pending > 0 ? `${pending} vacancy(ies) still need analysis. ` : ""}
         {gateway?.available
           ? `AI gateway: FreeLLMAPI connected (${gateway.model}).`
-          : gateway?.configured
-            ? `AI gateway: FreeLLMAPI configured but unreachable — ${gateway.detail}`
-            : "AI gateway: FreeLLMAPI is not configured."}{" "}
-        No fallback provider is permitted. Spending limit CHF 0.
+          : ollama?.available
+            ? `AI gateway: FreeLLMAPI unavailable; Ollama fallback connected (${ollama.model}).`
+            : gateway?.configured
+              ? `AI gateway: FreeLLMAPI configured but unreachable — ${gateway.detail}`
+              : "AI gateway: FreeLLMAPI is not configured."}{" "}
+        Ollama fallback: {ollama?.enabled ? (ollama.available ? "ready" : ollama.detail) : "disabled"}. Spending limit CHF 0.
       </div>
 
       <section className="card mb-4">

@@ -8,6 +8,7 @@ import {
   freeLlmConfigured,
   freeLlmPolicyIssue,
   isBillableModelId,
+  ollamaConfigured,
   providerConfigured,
   scrubProviderError,
 } from "../lib/providers.ts";
@@ -23,6 +24,9 @@ const MANAGED = [
   "OPENROUTER_ENABLED",
   "OPENROUTER_API_KEY",
   "OLLAMA_ENABLED",
+  "OLLAMA_BASE_URL",
+  "OLLAMA_MODEL",
+  "OLLAMA_CODER_MODEL",
 ];
 
 function withEnv(values: Record<string, string | undefined>, fn: () => void) {
@@ -160,6 +164,27 @@ test("Ollama disabled alone never makes a provider available", () => {
   withEnv({ OLLAMA_ENABLED: "false" }, () => {
     assert.equal(providerConfigured(), false);
   });
+});
+
+test("an unset FreeLLMAPI model does not disable a healthy Ollama fallback", () => {
+  withEnv(
+    {
+      FREELLMAPI_ENABLED: "true",
+      FREELLMAPI_BASE_URL: "http://127.0.0.1:31415/v1",
+      FREELLMAPI_API_KEY: "test-key-not-real-000000",
+      FREELLMAPI_MODEL: "",
+      FREELLMAPI_ALLOWED_MODELS: "",
+      OLLAMA_ENABLED: "true",
+      OLLAMA_BASE_URL: "http://localhost:11434",
+      OLLAMA_MODEL: "llama3.2:3b",
+      OLLAMA_CODER_MODEL: "qwen2.5-coder:1.5b",
+    },
+    () => {
+      assert.equal(freeLlmConfigured(), false, "an unset model leaves the gateway incomplete, not the fallback");
+      assert.equal(ollamaConfigured(), true);
+      assert.equal(providerConfigured(), true, "the enabled local fallback is a complete configuration on its own");
+    },
+  );
 });
 
 test("provider errors never expose the gateway key", () => {

@@ -49,7 +49,7 @@ export function agentAvailability(key: string): AgentAvailability {
         dependency: "AI provider",
         reason: policy
           ? `No permitted AI model is selected. ${policy}`
-          : "No AI provider is configured. Set FREELLMAPI_ENABLED=true, FREELLMAPI_BASE_URL, FREELLMAPI_API_KEY, FREELLMAPI_MODEL and FREELLMAPI_ALLOWED_MODELS to enable the local gateway. No fallback provider is used.",
+          : "No AI provider is configured. Set the FreeLLMAPI variables to enable the primary gateway, or set OLLAMA_ENABLED=true, OLLAMA_BASE_URL, OLLAMA_MODEL and OLLAMA_CODER_MODEL for local fallback.",
         cause: "configuration",
       };
     }
@@ -58,7 +58,7 @@ export function agentAvailability(key: string): AgentAvailability {
       return {
         available: false,
         dependency: "AI provider",
-        reason: `FreeLLMAPI is configured but unavailable: ${snapshot.detail}`,
+        reason: `AI providers are configured but unavailable: ${snapshot.detail}`,
         cause: "health",
       };
     }

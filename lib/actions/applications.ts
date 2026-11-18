@@ -114,6 +114,31 @@ export async function recordSubmissionAction(_prev: SubmissionState | undefined,
   return { ok: "Submission recorded with confirmation reference. Documents now follow the retention policy." };
 }
 
+export async function answerInterventionAction(formData: FormData): Promise<void> {
+  const user = await requireUser();
+  const id = String(formData.get("intervention_id") ?? "");
+  const answer = String(formData.get("answer") ?? "").trim().slice(0, 1000);
+  const row = one<{ id: string; application_id: string; question: string; status: string }>(
+    "SELECT id, application_id, question, status FROM application_interventions WHERE id = ?",
+    [id],
+  );
+  if (!row) redirect("/applications?error=Question+not+found");
+  if (row!.status !== "open") redirect(`/applications/${row!.application_id}?error=This+question+is+already+resolved`);
+  if (!answer) redirect(`/applications/${row!.application_id}?error=Enter+an+answer+first#questions`);
+  run("UPDATE application_interventions SET status = 'resolved', answer = ?, resolved_at = ? WHERE id = ?", [answer, nowIso(), id]);
+  run("UPDATE applications SET status = 'ready_to_submit', last_update = ? WHERE id = ?", [nowIso(), row!.application_id]);
+  audit({
+    action: "application.question_answered",
+    entity: "application",
+    entityId: row!.application_id,
+    detail: `${row!.question} — answer stored for this application only.`,
+    userId: user.id,
+  });
+  revalidatePath(`/applications/${row!.application_id}`);
+  revalidatePath("/recruitment");
+  redirect(`/applications/${row!.application_id}?ok=${encodeURIComponent("Answer saved. The next run may re-evaluate this application with the authorised answer.")}#questions`);
+}
+
 export async function updateApplicationStatusAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") ?? "");

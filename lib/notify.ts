@@ -1,18 +1,11 @@
 import { all, nowIso, one, run } from "./db";
-import { getSetting } from "./settings";
 
 /**
- * Records a notification. Delivery is in-app by default; an email provider can be
- * configured by the administrator. We never claim an email was sent unless a
- * provider confirmed it.
+ * Records an in-app notification. Email is an independent, explicit delivery
+ * path; connecting Gmail must never make this row claim that an email was sent.
  */
 export function notify(input: { userId?: string | null; kind: string; subject: string; body: string }): void {
-  const email = getSetting<{ connected: boolean; sender: string; account: string }>("email", {
-    connected: false,
-    sender: "",
-    account: "",
-  });
-  const channel = email.connected ? "in-app + email" : "in-app";
+  const channel = "in-app";
   run(
     "INSERT INTO notifications (user_id, kind, subject, body, channel, status, created_at) VALUES (?, ?, ?, ?, ?, 'unread', ?)",
     [input.userId ?? null, input.kind, input.subject, input.body, channel, nowIso()],

@@ -13,6 +13,7 @@ import { CoordinatorLiveVoice } from "./CoordinatorLiveVoice";
 const ownerNav = [
   { group: "Recruitment" },
   { href: "/dashboard", label: "Dashboard", icon: "dashboard" },
+  { href: "/recruitment", label: "Autonomous recruitment", icon: "agents" },
   { href: "/jobs", label: "Job discovery", icon: "jobs" },
   { href: "/applications", label: "Applications", icon: "applications" },
   { group: "Workspace" },

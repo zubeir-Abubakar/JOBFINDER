@@ -53,7 +53,7 @@ export function LoginForm() {
       <label className="flex items-center gap-2 text-[12.5px]" style={{ color: "var(--ink-soft)" }}>
         <input type="checkbox" name="remember" defaultChecked /> Keep me signed in on this device
       </label>
-      <SubmitButton pendingLabel="Signing in…" className="btn btn-primary w-full">
+      <SubmitButton trackDirty={false} pendingLabel="Signing in…" className="btn btn-primary w-full">
         Sign in
       </SubmitButton>
       <p className="text-center text-[11.5px]" style={{ color: "var(--muted)" }}>

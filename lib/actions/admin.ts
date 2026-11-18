@@ -77,9 +77,34 @@ export async function saveAiConfigAction(formData: FormData): Promise<void> {
   redirect("/admin/ai?saved=1");
 }
 
+export async function testOllamaAction(): Promise<void> {
+  const admin = await requireAdmin();
+  const { testOllamaConnection } = await import("@/lib/providers");
+  let ok = false;
+  let detail = "Ollama connection test failed.";
+  try {
+    const result = await testOllamaConnection();
+    ok = result.ok;
+    detail = result.detail;
+    audit({
+      action: result.ok ? "admin.ollama_test" : "admin.ollama_test_failed",
+      entity: "providers",
+      detail: `${result.base} · ${result.models.length} installed · ${result.detail}`,
+      userId: admin.id,
+    });
+  } catch (error) {
+    detail = error instanceof Error ? error.message : "Ollama connection test failed.";
+    audit({ action: "admin.ollama_test_failed", entity: "providers", detail, userId: admin.id });
+  }
+  revalidatePath("/admin/ai");
+  redirect(`/admin/ai?${ok ? "ok" : "error"}=${encodeURIComponent(detail)}`);
+}
+
 export async function testProvidersAction(): Promise<void> {
   const admin = await requireAdmin();
-  const { generateText } = await import("@/lib/providers");
+  const { generateText, scrubProviderError } = await import("@/lib/providers");
+  let ok = false;
+  let detail = "No provider responded.";
   try {
     const result = await generateText({
       agentKey: "coordinator",
@@ -89,15 +114,15 @@ export async function testProvidersAction(): Promise<void> {
       maxTokens: 12,
       temperature: 0,
     });
+    ok = true;
+    detail = `Provider responded via ${result.provider} (${result.model}).`;
     audit({ action: "admin.provider_test", entity: "providers", detail: `${result.provider}/${result.model}`, userId: admin.id });
-    revalidatePath("/admin/ai");
-    redirect(`/admin/ai?ok=${encodeURIComponent(`Provider responded via ${result.provider} (${result.model}).`)}`);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "No provider responded.";
-    audit({ action: "admin.provider_test_failed", entity: "providers", detail: message, userId: admin.id });
-    revalidatePath("/admin/ai");
-    redirect(`/admin/ai?error=${encodeURIComponent(message)}`);
+    detail = error instanceof Error ? scrubProviderError(error.message) : "No provider responded.";
+    audit({ action: "admin.provider_test_failed", entity: "providers", detail, userId: admin.id });
   }
+  revalidatePath("/admin/ai");
+  redirect(`/admin/ai?${ok ? "ok" : "error"}=${encodeURIComponent(detail)}`);
 }
 
 export async function saveEmailConfigAction(formData: FormData): Promise<void> {

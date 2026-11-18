@@ -47,6 +47,9 @@ export type ResearchResult = {
   inserted: number;
   duplicates: number;
   filteredOut: number;
+  requests: number;
+  responses: number;
+  fresh: number;
   pages: number;
   jobs: Array<{ id: string; title: string; company: string; location: string | null; remote: boolean }>;
   rejectionReasons: Record<string, number>;
@@ -92,6 +95,9 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
     inserted: 0,
     duplicates: 0,
     filteredOut: 0,
+    requests: 0,
+    responses: 0,
+    fresh: 0,
     pages: 0,
     jobs: [],
     rejectionReasons: {},
@@ -116,6 +122,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
 
   for (let page = 1; page <= pages; page += 1) {
     let payload: { data?: ArbeitnowJob[] };
+    result.requests += 1;
     try {
       const response = await fetch(`${baseUrl}?page=${page}`, {
         headers: { Accept: "application/json", "User-Agent": "AT-AI-Workforce/1.0 (personal job search)" },
@@ -123,6 +130,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
         signal: AbortSignal.timeout(15_000),
       });
       if (!response.ok) throw new Error(`Job source responded ${response.status}`);
+      result.responses += 1;
       payload = (await response.json()) as { data?: ArbeitnowJob[] };
     } catch (error) {
       result.error = error instanceof Error ? error.message : "Job source could not be reached.";
@@ -134,6 +142,8 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
 
     for (const item of batch) {
       if (result.inserted >= maxInserts) break;
+      const created = item.created_at ? new Date(item.created_at * 1000) : null;
+      if (!created || Date.now() - created.getTime() <= 7 * 86400_000) result.fresh += 1;
       const location = item.location ?? "";
       const remote = Boolean(item.remote);
       const isSwiss = SWISS.test(location) || SWISS.test(item.title) || SWISS.test(item.description?.slice(0, 1500) ?? "");

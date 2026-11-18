@@ -7,7 +7,7 @@ import { join } from "node:path";
 const dataDir = mkdtempSync(join(tmpdir(), "atw-runtime-"));
 process.env.DATA_DIR = dataDir;
 
-const { getDb, one, run, TEMP_DIR, UPLOAD_DIR } = await import("../lib/db.ts");
+const { getDb, one, run, SCHEMA_VERSION, TEMP_DIR, UPLOAD_DIR } = await import("../lib/db.ts");
 const { emitWorkflowEvent, listWorkflowEvents, subscribeWorkflowEvents } = await import("../lib/events.ts");
 const { cleanupTempObjects, registerTempObject, tempStorageStats } = await import("../lib/temp-store.ts");
 const { voiceCapabilities, voiceConfig } = await import("../lib/voice.ts");
@@ -17,7 +17,11 @@ test("workflow events and temp-object registry migrate additively", () => {
   const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name);
   assert.ok(tables.includes("workflow_events"));
   assert.ok(tables.includes("temp_objects"));
-  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, SCHEMA_VERSION);
+  const tablesAfterPhase2 = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map((row) => row.name);
+  for (const table of ["recruitment_runs", "recruitment_run_agents", "schedule_jobs", "submission_attempts", "application_events"]) {
+    assert.ok(tablesAfterPhase2.includes(table), `${table} must exist`);
+  }
 });
 
 test("workflow events persist in order and reach live subscribers", () => {

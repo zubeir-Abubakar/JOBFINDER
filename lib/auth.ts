@@ -31,6 +31,17 @@ export async function clientIp(): Promise<string> {
   return h.get("x-forwarded-for")?.split(",")[0]?.trim() || h.get("x-real-ip") || "local";
 }
 
+/** Do not mark the session cookie Secure when the app is served over plain
+ * localhost HTTP. Browsers reject Secure cookies on some local HTTP origins,
+ * which makes a successful login bounce straight back to /login. */
+function secureCookieForRequest(h: { get(name: string): string | null }): boolean {
+  const proto = h.get("x-forwarded-proto")?.split(",")[0]?.trim().toLowerCase();
+  if (proto) return proto === "https";
+  const host = (h.get("host") ?? "").toLowerCase();
+  const localHost = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(host);
+  return process.env.NODE_ENV === "production" && !localHost;
+}
+
 export function verifyLoginCredentials(
   email: string,
   password: string,
@@ -51,7 +62,8 @@ export async function login(
   const credential = verifyLoginCredentials(email, password);
   const normalised = email.trim().toLowerCase();
   const ip = await clientIp();
-  const userAgent = (await headers()).get("user-agent") ?? "";
+  const requestHeaders = await headers();
+  const userAgent = requestHeaders.get("user-agent") ?? "";
 
   if (!credential.ok) {
     const failedUser = one<{ id: string }>("SELECT id FROM users WHERE lower(email) = ?", [normalised]);
@@ -83,7 +95,7 @@ export async function login(
   jar.set(SESSION_COOKIE, token, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: secureCookieForRequest(requestHeaders),
     path: "/",
     expires,
   });

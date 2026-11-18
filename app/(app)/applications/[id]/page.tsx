@@ -5,7 +5,7 @@ import { all, one } from "@/lib/db";
 import { PageHead, Empty, Flash } from "@/components/ui";
 import { formatDate, formatDateTime, param } from "@/lib/format";
 import { statusLabel, statusClass, APPLICATION_STATUSES, isApplicationSubmitted } from "@/lib/application-status";
-import { approveApplicationAction, requestDocumentChangesAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
+import { answerInterventionAction, approveApplicationAction, requestDocumentChangesAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
 import { SubmissionForm } from "@/components/SubmissionForm";
 import { SubmitButton } from "@/components/SubmitButton";
 import { getSetting } from "@/lib/settings";
@@ -60,6 +60,10 @@ export default async function ApplicationDetailPage({
   );
   const timeline = all<{ action: string; detail: string | null; created_at: string }>(
     "SELECT action, detail, created_at FROM audit_logs WHERE entity = 'application' AND entity_id = ? ORDER BY id DESC LIMIT 20",
+    [id],
+  );
+  const interventions = all<{ id: string; field: string | null; question: string; reason: string; kind: string }>(
+    "SELECT id, field, question, reason, kind FROM application_interventions WHERE application_id = ? AND status = 'open' ORDER BY created_at",
     [id],
   );
   const approvalMode = getSetting<boolean>("approval_mode", true);
@@ -135,6 +139,24 @@ export default async function ApplicationDetailPage({
                 </div>
               ) : (
                 <div className="stack" style={{ gap: 14 }}>
+                  {interventions.length > 0 ? (
+                    <div className="card-quiet p-3" id="questions">
+                      <div className="label" style={{ marginBottom: 6 }}>The form needs your answer</div>
+                      <p className="hint" style={{ marginTop: 0 }}>
+                        The team stopped before sending because these answers are not in your verified profile. Answers are stored for this application only;
+                        they are never invented from model output.
+                      </p>
+                      {interventions.map((item) => (
+                        <form key={item.id} action={answerInterventionAction} className="stack mt-3" style={{ gap: 6 }}>
+                          <input type="hidden" name="intervention_id" value={item.id} />
+                          <div className="text-[12.5px] font-medium">{item.question}</div>
+                          <div className="text-[11px]" style={{ color: "var(--muted)" }}>{item.reason}</div>
+                          <input name="answer" className="input" maxLength={1000} placeholder="Your verified answer" required />
+                          <div><SubmitButton className="btn btn-sm btn-primary" pendingLabel="Saving…">Save answer</SubmitButton></div>
+                        </form>
+                      ))}
+                    </div>
+                  ) : null}
                   {!app.approved_at ? (
                     <form action={approveApplicationAction}>
                       <input type="hidden" name="id" value={app.id} />

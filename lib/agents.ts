@@ -108,7 +108,7 @@ export function markAgentThinking(agentKey: string): void {
   run("UPDATE agents SET status = 'thinking' WHERE key = ? AND status = 'working'", [agentKey]);
   const task = one<{ workflow_id: string | null }>("SELECT workflow_id FROM tasks WHERE agent_key = ? AND status = 'running' ORDER BY created_at DESC LIMIT 1", [agentKey]);
   if (task?.workflow_id) {
-    emitWorkflowEvent({ workflowId: task.workflow_id, type: "agent.progress", agentKey, message: `${agentIdentity(agentKey).shortName} is requesting inference from FreeLLMAPI.` });
+    emitWorkflowEvent({ workflowId: task.workflow_id, type: "agent.progress", agentKey, message: `${agentIdentity(agentKey).shortName} is requesting inference from the configured AI provider.` });
   }
 }
 

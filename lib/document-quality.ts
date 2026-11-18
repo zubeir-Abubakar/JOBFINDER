@@ -96,6 +96,25 @@ export function validateCvQuality(
   checks.push(check("All employment entries retained", missingRoles.length === 0, `${master.roles.length - missingRoles.length}/${master.roles.length} roles found in extracted PDF text`));
   if (missingRoles.length > 0) issues.push(issue("error", "missing_roles", `Missing roles: ${missingRoles.map((role) => `${role.title} at ${role.company}`).join("; ")}`));
 
+  const duplicateRoles = output.roles.filter((role, index) =>
+    output.roles.some(
+      (other, otherIndex) =>
+        otherIndex !== index &&
+        normalise(other.title) === normalise(role.title) &&
+        normalise(other.company) === normalise(role.company),
+    ),
+  );
+  checks.push(
+    check(
+      "No duplicated experience",
+      duplicateRoles.length === 0,
+      duplicateRoles.length ? `${duplicateRoles.length} repeated role(s)` : "Every role appears once",
+    ),
+  );
+  if (duplicateRoles.length > 0) {
+    issues.push(issue("error", "duplicate_roles", `Repeated employment entries: ${duplicateRoles.map((role) => `${role.title} at ${role.company}`).join("; ")}`));
+  }
+
   const keyMismatch = output.roles.filter((role) => !master.roles.some((item) => item.key === role.key));
   checks.push(check("No invented employment entries", keyMismatch.length === 0, keyMismatch.length ? `${keyMismatch.length} unrecognised roles` : "Every output role maps to the master CV"));
   if (keyMismatch.length > 0) issues.push(issue("error", "invented_roles", `Unrecognised roles: ${keyMismatch.map((role) => role.title).join("; ")}`));
@@ -144,6 +163,13 @@ export function validateCvQuality(
   checks.push(check("Multi-page layout retained", pages >= expectedPages, `${pages} page(s); expected at least ${expectedPages}`));
   if (pages < expectedPages) issues.push(issue("error", "page_loss", `The master needs at least ${expectedPages} pages; the generated PDF has ${pages}.`));
 
+  if (master.languages) {
+    const languageNames = master.languages.split(/[,;|]/).map((entry) => normalise(entry.replace(/[()\[\]]/g, " "))).filter(Boolean);
+    const languagesMissing = languageNames.filter((entry) => entry.split(/[^a-z]+/).filter((word) => word.length > 2).some((word) => !text.includes(word)));
+    checks.push(check("Language proficiency retained", languagesMissing.length === 0, languagesMissing.length ? `Missing: ${languagesMissing.join(", ")}` : "Recorded language levels are extractable"));
+    if (languagesMissing.length > 0) issues.push(issue("warning", "missing_languages", `Language evidence is missing from the PDF: ${languagesMissing.join("; ")}`));
+  }
+
   const certsMissing = master.certifications.filter((cert) => !text.includes(normalise(cert)));
   if (certsMissing.length > 0) issues.push(issue("error", "missing_certifications", `Missing certifications: ${certsMissing.join("; ")}`));
   const educationMissing = master.education.filter((item) => !text.includes(normalise(item.title)));
@@ -180,10 +206,17 @@ export function validateCoverQuality(
   const outputWords = words(letter);
 
   const hasName = text.includes(normalise(master.name));
-  const hasRole = text.includes(normalise(job.title)) || text.includes(normalise(job.company));
+  const roleTokens = normalise(job.title)
+    .split(/[^a-z0-9+#.]+/)
+    .filter((token) => token.length > 2 && !/^(the|and|for|with|senior|junior|m|f|d|w)$/.test(token));
+  const roleHits = roleTokens.filter((token) => text.includes(token)).length;
+  const hasRole = text.includes(normalise(job.company)) && (text.includes(normalise(job.title)) || (roleTokens.length > 0 && roleHits / roleTokens.length >= 0.6));
+  const hasDate = /\b(?:19|20)\d{2}\b/.test(extractedText);
   checks.push(check("Header and target role present", hasName && hasRole, hasName ? "Candidate header and target role are extractable" : "Candidate header is missing"));
   if (!hasName) issues.push(issue("error", "missing_header", "The cover letter header is missing the candidate name."));
-  if (!hasRole) issues.push(issue("error", "missing_target", "The cover letter does not identify the target role or employer."));
+  if (!hasRole) issues.push(issue("error", "missing_target", "The cover letter does not identify both the target role and the employer."));
+  checks.push(check("Dated letter", hasDate, hasDate ? "A four-digit year is present" : "No letter date is extractable"));
+  if (!hasDate) issues.push(issue("warning", "missing_date", "The cover letter has no extractable date."));
 
   checks.push(check("Letter length", outputWords >= 150 && outputWords <= 380, `${outputWords} words`));
   if (outputWords < 150) issues.push(issue("error", "too_short", "The cover letter is too short to present evidence."));

@@ -1,9 +1,9 @@
 import { requireAdmin } from "@/lib/auth";
 import { PageHead, Flash } from "@/components/ui";
 import { param, relativeTime } from "@/lib/format";
-import { aiCounterReconciliation, aiUsageBySource, freeLlmPolicyIssue, providerBudget, providerHealth, recentUsage, usageSummary } from "@/lib/providers";
+import { aiCounterReconciliation, aiUsageBySource, freeLlmConfigured, freeLlmPolicyIssue, gatewayCooldownStatus, ollamaEndpointLabel, providerBudget, providerHealth, recentUsage, usageSummary } from "@/lib/providers";
 import { one } from "@/lib/db";
-import { testProvidersAction } from "@/lib/actions/admin";
+import { testOllamaAction, testProvidersAction } from "@/lib/actions/admin";
 import { SubmitButton } from "@/components/SubmitButton";
 
 export const dynamic = "force-dynamic";
@@ -20,8 +20,24 @@ export default async function AdminAiPage({
   const usage = recentUsage(15);
   const budget = providerBudget();
   const gateway = health.find((provider) => provider.name === "freellmapi");
-  const legacy = health.filter((provider) => provider.name !== "freellmapi");
+  const ollama = health.find((provider) => provider.name === "ollama");
+  const legacy = health.filter((provider) => provider.name === "gemini" || provider.name === "openrouter");
+  const cooldown = gatewayCooldownStatus();
+  const lastSuccess = one<{ provider: string; model: string; created_at: string }>(
+    "SELECT provider, model, created_at FROM provider_usage WHERE status = 'ok' ORDER BY id DESC LIMIT 1",
+  );
+  const lastFailure = one<{ provider: string; error: string | null; created_at: string }>(
+    "SELECT provider, error, created_at FROM provider_usage WHERE status = 'error' ORDER BY id DESC LIMIT 1",
+  );
   const policyIssue = freeLlmPolicyIssue();
+  const policyBlocked = freeLlmConfigured() && Boolean(policyIssue);
+  const fallbackEnabled = Boolean(process.env.OLLAMA_ENABLED === "true" && process.env.OLLAMA_MODEL);
+  const activeProvider = policyBlocked
+    ? null
+    : cooldown.remainingMs > 0
+      ? ollama?.available ? ollama : null
+      : gateway?.available ? gateway : ollama?.available ? ollama : null;
+  const activeModel = activeProvider?.name === "ollama" ? process.env.OLLAMA_MODEL ?? "not set" : activeProvider?.model ?? "—";
   const aiCounts = one<{ ok: number; failed: number }>(
     "SELECT COALESCE(SUM(ai_success_count), 0) AS ok, COALESCE(SUM(ai_failure_count), 0) AS failed FROM agents",
   ) ?? { ok: 0, failed: 0 };
@@ -42,6 +58,9 @@ export default async function AdminAiPage({
     sequential: (process.env.AI_SEQUENTIAL_EXECUTION ?? "true") === "true",
     paidAllowed: (process.env.AI_ALLOW_PAID_MODELS ?? "false") === "true",
     ollamaEnabled: (process.env.OLLAMA_ENABLED ?? "false") === "true",
+    ollamaBase: ollamaEndpointLabel(),
+    ollamaModel: process.env.OLLAMA_MODEL ?? "not set",
+    ollamaCoderModel: process.env.OLLAMA_CODER_MODEL ?? "not set",
     openRouterEnabled: (process.env.OPENROUTER_ENABLED ?? "false") === "true",
     geminiLiveModel: process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live",
     geminiLiveVoice: process.env.GEMINI_LIVE_VOICE ?? "Charon",
@@ -58,11 +77,16 @@ export default async function AdminAiPage({
       <Flash ok={param(sp.ok)} error={param(sp.error)} saved={param(sp.saved)} />
       <PageHead
         title="AI provider health"
-        sub="FreeLLMAPI remains the only text-agent gateway. Gemini is used only by the separate real-time Live voice session; no text-agent fallback was added."
+        sub="FreeLLMAPI is primary. Ollama is the local fallback for recoverable outages and rate limits; Gemini Live remains a separate voice-only provider."
         actions={
-          <form action={testProvidersAction}>
-            <SubmitButton className="btn btn-primary" pendingLabel="Testing…">Test real generation</SubmitButton>
-          </form>
+          <>
+            <form action={testOllamaAction}>
+              <SubmitButton className="btn" pendingLabel="Probing Ollama…">Test Ollama connection</SubmitButton>
+            </form>
+            <form action={testProvidersAction}>
+              <SubmitButton className="btn btn-primary" pendingLabel="Testing…">Test real generation</SubmitButton>
+            </form>
+          </>
         }
       />
 
@@ -97,6 +121,33 @@ export default async function AdminAiPage({
             {drift
               ? "A counter does not match its recorded task calls. Restarting the server recomputes counters from provider_usage."
               : "Every task-bound model call is linked to a task id, and the roster counters equal those rows exactly."}
+          </div>
+        </div>
+      </section>
+
+      <section className="card mb-4">
+        <div className="card-head">
+          <div>
+            <h2>Inference routing</h2>
+            <p className="card-sub">Deterministic priority: FreeLLMAPI first; Ollama only for recoverable failures. A successful primary call clears the cooldown.</p>
+          </div>
+          <span className={`badge ${activeProvider ? "badge-good" : "badge-bad"}`}>{activeProvider ? "route ready" : policyBlocked ? "configuration blocked" : "no route"}</span>
+        </div>
+        <div className="card-body grid g2" style={{ gap: 12 }}>
+          <div className="stack" style={{ gap: 7 }}>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Active inference provider</span><span>{activeProvider?.label ?? "none"}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Active model</span><span className="num">{activeModel}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Fallback enabled</span><span className={`badge ${fallbackEnabled ? "badge-good" : "badge-warn"}`}>{fallbackEnabled ? "yes" : "no"}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Cooldown status</span><span>{cooldown.remainingMs > 0 ? `${Math.ceil(cooldown.remainingMs / 1000)}s remaining` : "none"}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Last successful inference</span><span>{lastSuccess ? `${lastSuccess.provider}/${lastSuccess.model} · ${relativeTime(lastSuccess.created_at)}` : "none"}</span></div>
+          </div>
+          <div className="stack" style={{ gap: 7 }}>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Last provider failure</span><span>{lastFailure ? `${lastFailure.provider} · ${relativeTime(lastFailure.created_at)}` : "none"}</span></div>
+            {lastFailure?.error ? <div className="text-[11px] leading-relaxed" style={{ color: "var(--danger)" }}>{lastFailure.error}</div> : null}
+            {cooldown.remainingMs > 0 ? <div className="text-[11px] leading-relaxed" style={{ color: "var(--warn)" }}>Cooling down until {cooldown.until ? relativeTime(cooldown.until) : "soon"}. Reason: {cooldown.reason ?? "provider failure"}.</div> : null}
+            <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+              Authentication/configuration errors fail closed; they never trigger a fallback. Ollama is contacted only for recoverable rate limits, outages, network errors and timeouts.
+            </div>
           </div>
         </div>
       </section>
@@ -139,6 +190,37 @@ export default async function AdminAiPage({
               {gateway.models.length > 8 ? <span className="chip">+{gateway.models.length - 8}</span> : null}
             </div>
           ) : null}
+        </div>
+      </section>
+
+      <section className="card mb-4">
+        <div className="card-head">
+          <div>
+            <h2>Ollama · local fallback</h2>
+            <p className="card-sub">{flags.ollamaBase} · general <span className="num">{flags.ollamaModel}</span> · coding <span className="num">{flags.ollamaCoderModel}</span></p>
+          </div>
+          <span className={`badge ${ollama?.available ? "badge-good" : ollama?.configured ? "badge-bad" : "badge-warn"}`}>
+            {ollama?.available ? "connected" : ollama?.configured ? "unavailable" : "not configured"}
+          </span>
+        </div>
+        <div className="card-body stack text-[12px]" style={{ gap: 8 }}>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Health check</span><span>{ollama?.detail ?? "No result."}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Last health check</span><span>{ollama?.checkedAt ? relativeTime(ollama.checkedAt) : "—"}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Enabled</span><span className={`badge ${flags.ollamaEnabled ? "badge-good" : "badge-warn"}`}>{flags.ollamaEnabled ? "yes" : "no"}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>General model installed</span><span className={`badge ${ollama?.models.includes(flags.ollamaModel) ? "badge-good" : "badge-bad"}`}>{ollama?.models.includes(flags.ollamaModel) ? "yes" : "no"}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Coding model installed</span><span className={`badge ${ollama?.models.includes(flags.ollamaCoderModel) ? "badge-good" : "badge-bad"}`}>{ollama?.models.includes(flags.ollamaCoderModel) ? "yes" : "no"}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Latency</span><span className="num">{ollama?.latencyMs == null ? "—" : `${ollama.latencyMs} ms`}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Installed models</span><span className="num">{ollama?.models.length ?? 0}</span></div>
+          {ollama && ollama.models.length > 0 ? (
+            <div className="flex flex-wrap gap-1">
+              {ollama.models.slice(0, 12).map((model) => <span key={model} className="chip">{model}</span>)}
+              {ollama.models.length > 12 ? <span className="chip">+{ollama.models.length - 12}</span> : null}
+            </div>
+          ) : null}
+          {ollama?.detail?.includes("ollama pull") ? (
+            <div className="alert alert-info"><code>{ollama.detail}</code></div>
+          ) : null}
+          <p className="hint">Local-only fallback. A remote deployment needs a separately reachable, authenticated Ollama endpoint; do not expose port 11434 publicly. No model is downloaded automatically.</p>
         </div>
       </section>
 
@@ -207,7 +289,8 @@ export default async function AdminAiPage({
             <div className="between"><span style={{ color: "var(--muted)" }}>FREELLMAPI_MODEL</span><span>{flags.freeLlmModel}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>FREELLMAPI_ALLOWED_MODELS</span><span style={{ textAlign: "right" }}>{flags.allowedModels || "none (nothing permitted)"}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Declared resolution aliases</span><span style={{ textAlign: "right" }}>{flags.modelAliases || "none (exact id only)"}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Ollama</span><span className={`badge ${flags.ollamaEnabled ? "badge-warn" : "badge-good"}`}>{flags.ollamaEnabled ? "enabled (unused)" : "disabled"}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Ollama fallback</span><span className={`badge ${fallbackEnabled ? "badge-good" : "badge-warn"}`}>{fallbackEnabled ? `enabled · ${flags.ollamaModel}` : "disabled"}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Ollama coder fallback</span><span className="num">{flags.ollamaCoderModel}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>OpenRouter</span><span className={`badge ${flags.openRouterEnabled ? "badge-warn" : "badge-good"}`}>{flags.openRouterEnabled ? "enabled (unused)" : "disabled"}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>GEMINI_API_KEY</span><span className={`badge ${keys.gemini ? "badge-good" : "badge-neutral"}`}>{keys.gemini ? "set (Live voice)" : "not set"}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>GEMINI_LIVE_MODEL</span><span className="num">{flags.geminiLiveModel}</span></div>
@@ -218,10 +301,10 @@ export default async function AdminAiPage({
               <code>auto</code> routing is refused because the upstream model is chosen after the request; a single catalogued model must be pinned in
               <code>FREELLMAPI_MODEL</code> and explicitly listed in <code>FREELLMAPI_ALLOWED_MODELS</code>. That allowlist can only narrow the permitted set — known
               billable vendor ids are refused even when listed ({flags.paidAllowed ? "AI_ALLOW_PAID_MODELS is currently true, which changes nothing" : "AI_ALLOW_PAID_MODELS is false"}).
-              A resolved id that is neither the pinned id nor a declared resolution alias is discarded. If the gateway is unavailable the workflow pauses; nothing falls back to Gemini, OpenRouter or Ollama.
+              A resolved id that is neither the pinned id nor a declared resolution alias is discarded. Recoverable outages and rate limits fall back to the configured local Ollama models; configuration, authentication and malformed-request failures fail closed.
               The Gemini key is used only by the separate real-time Live voice session; it does not change the shared text-agent model.
             </div>
-            <p className="hint">Ollama is disabled, so no local model is loaded and no local inference runs.</p>
+            <p className="hint">Ollama uses OLLAMA_MODEL for general inference and OLLAMA_CODER_MODEL only for coding-specific calls. Keep it on localhost or a secured private endpoint; never expose port 11434 publicly.</p>
           </div>
         </section>
       </div>

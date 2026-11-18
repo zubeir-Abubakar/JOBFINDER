@@ -4,15 +4,16 @@ import { getSetting, setSetting } from "./settings";
 /**
  * Shared AI provider service.
  *
- * FreeLLMAPI (local OpenAI-compatible gateway) is the primary and only
- * permitted inference path. When it is configured, no other provider is ever
- * tried — the service fails closed instead of silently falling back to a paid
- * or local model.
+ * FreeLLMAPI (local OpenAI-compatible gateway) is the primary inference path.
+ * When it is configured, a recoverable failure (rate limit, cooldown, network
+ * error, timeout or provider outage) can fall back to an explicitly enabled
+ * local Ollama instance. Non-recoverable request/configuration/auth failures
+ * fail closed and are never hidden by a fallback. Gemini/OpenRouter remain
+ * non-permitted for text inference; Gemini Live is a separate voice path.
  *
- * Gemini/OpenRouter/Ollama remain in the file only so an existing installation
- * that explicitly enabled them can still report health; they are never used as
- * a fallback while FreeLLMAPI is configured, and Ollama must be explicitly
- * enabled to run at all.
+ * A successful primary call clears the gateway cooldown, so the next request
+ * returns to FreeLLMAPI automatically. A fallback result is never cached as a
+ * permanent provider preference.
  *
  * Secrets are read from the environment on the server and never returned to the
  * client. Error messages are scrubbed before they are stored or shown.
@@ -99,11 +100,45 @@ export class AiRateLimitedError extends Error {
   }
 }
 
+/** A provider response that can safely be retried on another provider. */
+export class AiProviderError extends Error {
+  provider: ProviderName;
+  recoverable: boolean;
+  status: number | null;
+  constructor(provider: ProviderName, message: string, recoverable: boolean, status: number | null = null) {
+    super(message);
+    this.name = "AiProviderError";
+    this.provider = provider;
+    this.recoverable = recoverable;
+    this.status = status;
+  }
+}
+
+/** Invalid credentials, malformed requests or missing local configuration. */
+export class AiProviderConfigError extends AiProviderError {
+  constructor(provider: ProviderName, message: string) {
+    super(provider, message, false, null);
+    this.name = "AiProviderConfigError";
+  }
+}
+
 export function isTemporaryAiError(error: unknown): boolean {
   return (
     error instanceof AiRateLimitedError ||
     error instanceof ProvidersUnavailableError ||
+    (error instanceof AiProviderError && error.recoverable) ||
     (error instanceof Error && isRateLimitMessage(error.message))
+  );
+}
+
+/** Network, timeout and 5xx-style failures are safe to retry elsewhere. */
+export function isRecoverableProviderError(error: unknown): boolean {
+  if (error instanceof AiRateLimitedError) return true;
+  if (error instanceof AiProviderError) return error.recoverable;
+  if (error instanceof ProvidersUnavailableError) return true;
+  if (!(error instanceof Error)) return false;
+  return /fetch failed|econnrefused|econnreset|enotfound|eai_again|etimedout|network|socket|timed? ?out|timeout|aborted|http 5\d\d|\b50[234]\b/i.test(
+    error.message,
   );
 }
 
@@ -153,9 +188,10 @@ function config() {
     },
     ollama: {
       enabled: (env.OLLAMA_ENABLED ?? "false") === "true",
-      base: (env.OLLAMA_BASE_URL ?? "http://localhost:11434").replace(/\/$/, ""),
-      model: env.OLLAMA_MODEL ?? "llama3.2:3b",
-      coderModel: env.OLLAMA_CODER_MODEL ?? "qwen2.5-coder:1.5b",
+      base: (env.OLLAMA_BASE_URL ?? "http://localhost:11434").trim().replace(/\/+$/, ""),
+      model: (env.OLLAMA_MODEL ?? "").trim(),
+      coderModel: (env.OLLAMA_CODER_MODEL ?? "").trim(),
+      timeoutMs: Math.max(5_000, Math.min(180_000, Number(env.OLLAMA_TIMEOUT_MS ?? "60000") || 60_000)),
     },
   };
 }
@@ -397,14 +433,27 @@ export function freeLlmUsable(): boolean {
   return freeLlmConfigured() && freeLlmPolicyIssue() === null;
 }
 
-function legacyConfigured(): boolean {
-  const c = config();
-  return Boolean(c.gemini.key) || c.openrouter.enabled || c.ollama.enabled;
+export function ollamaConfigured(): boolean {
+  const c = config().ollama;
+  return c.enabled && Boolean(c.base) && Boolean(c.model);
 }
 
-/** One shared answer for the Coordinator and every specialist. */
+function legacyConfigured(): boolean {
+  const c = config();
+  return ollamaConfigured() || Boolean(c.gemini.key) || c.openrouter.enabled;
+}
+
+/**
+ * One shared answer for the Coordinator and every specialist.
+ *
+ * A configured-but-policy-invalid FreeLLMAPI is a configuration error, not a
+ * runtime outage: fail closed instead of silently moving every call to Ollama.
+ * If FreeLLMAPI is not configured at all, an enabled local Ollama can serve the
+ * text agents.
+ */
 export function providerConfigured(): boolean {
-  return freeLlmUsable() || legacyConfigured();
+  if (freeLlmConfigured()) return freeLlmUsable();
+  return legacyConfigured();
 }
 
 /** Synchronous view of the latest health check in this process, if any. */
@@ -414,37 +463,106 @@ export type ProviderSnapshot = {
   detail: string;
   model: string;
   checkedAt: string | null;
+  activeProvider?: ProviderName | null;
+  activeModel?: string | null;
+  fallbackEnabled?: boolean;
 };
 
 export function providerStatusSnapshot(): ProviderSnapshot {
   const cooling = gatewayCooldownStatus();
+  const cached = g.__atwProviderHealth;
+  const fl = cached?.items.find((item) => item.name === "freellmapi");
+  const ollama = cached?.items.find((item) => item.name === "ollama");
+  const fallbackEnabled = ollamaConfigured();
+  const checkedAt = cached ? new Date(cached.at).toISOString() : null;
+
+  // A policy/configuration fault is not a provider outage. Never advertise the
+  // local fallback as a way around missing FreeLLMAPI configuration.
+  if (freeLlmConfigured() && !freeLlmUsable()) {
+    return {
+      configured: false,
+      available: false,
+      detail: freeLlmPolicyIssue() ?? "FreeLLMAPI configuration is invalid.",
+      model: config().freellmapi.model,
+      checkedAt,
+      activeProvider: null,
+      activeModel: null,
+      fallbackEnabled,
+    };
+  }
+
   if (cooling.remainingMs > 0) {
+    if (ollama?.available) {
+      return {
+        configured: true,
+        available: true,
+        detail: `FreeLLMAPI cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s; Ollama fallback is ready. ${cooling.reason ?? ""}`.trim(),
+        model: ollama.model,
+        checkedAt: checkedAt ?? new Date().toISOString(),
+        activeProvider: "ollama",
+        activeModel: ollama.model,
+        fallbackEnabled,
+      };
+    }
     return {
       configured: freeLlmConfigured() || legacyConfigured(),
       available: false,
-      detail: `FreeLLMAPI is cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s. ${cooling.reason ?? ""}`.trim(),
+      detail: `FreeLLMAPI is cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s. Ollama fallback is ${fallbackEnabled ? (ollama?.detail ?? "not verified") : "disabled"}. ${cooling.reason ?? ""}`.trim(),
       model: config().freellmapi.model,
-      checkedAt: new Date().toISOString(),
+      checkedAt: checkedAt ?? new Date().toISOString(),
+      activeProvider: null,
+      activeModel: null,
+      fallbackEnabled,
     };
   }
-  const cached = g.__atwProviderHealth;
-  const fl = cached?.items.find((item) => item.name === "freellmapi");
+
   if (freeLlmConfigured()) {
+    if (fl?.available) {
+      return {
+        configured: true,
+        available: true,
+        detail: fl.detail,
+        model: fl.model,
+        checkedAt,
+        activeProvider: "freellmapi",
+        activeModel: fl.model,
+        fallbackEnabled,
+      };
+    }
+    if (ollama?.available) {
+      return {
+        configured: true,
+        available: true,
+        detail: `FreeLLMAPI is unavailable; Ollama fallback is ready. ${fl?.detail ?? ""}`.trim(),
+        model: ollama.model,
+        checkedAt: checkedAt ?? new Date().toISOString(),
+        activeProvider: "ollama",
+        activeModel: ollama.model,
+        fallbackEnabled,
+      };
+    }
     return {
       configured: true,
       available: fl ? fl.available : null,
       detail: fl?.detail ?? "Health has not been checked in this process yet.",
       model: fl?.model ?? config().freellmapi.model,
-      checkedAt: cached ? new Date(cached.at).toISOString() : null,
+      checkedAt,
+      activeProvider: null,
+      activeModel: null,
+      fallbackEnabled,
     };
   }
+
   const usable = cached ? cached.items.some((item) => item.enabled && item.available) : null;
   return {
     configured: legacyConfigured(),
     available: usable,
-    detail: fl?.detail ?? "FreeLLMAPI is not configured.",
-    model: fl?.model ?? config().freellmapi.model,
-    checkedAt: cached ? new Date(cached.at).toISOString() : null,
+    detail: ollama?.detail ?? fl?.detail ?? "FreeLLMAPI is not configured.",
+    model: ollama?.model ?? fl?.model ?? config().freellmapi.model,
+    checkedAt,
+    activeProvider: ollama?.available ? "ollama" : null,
+    activeModel: ollama?.available ? ollama.model : null,
+    fallbackEnabled,
   };
 }
 
@@ -635,21 +753,136 @@ async function openRouterHealth(): Promise<ProviderHealth> {
   return { ...base, detail: "Configured but not used: fallback to OpenRouter is disabled." };
 }
 
+function safeEndpoint(raw: string): string {
+  try {
+    const url = new URL(raw);
+    return `${url.protocol}//${url.host}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return "configured Ollama endpoint";
+  }
+}
+
+function modelNamesFromTags(payload: unknown): string[] {
+  const body = (payload ?? {}) as { models?: Array<{ name?: string; model?: string }> };
+  return (body.models ?? [])
+    .map((model) => String(model.name ?? model.model ?? "").trim())
+    .filter(Boolean);
+}
+
+function missingOllamaModel(model: string): string {
+  return `${model} is not installed. Run: ollama pull ${model}`;
+}
+
+/** Lightweight, secret-free connection probe used by admin health and the test action. */
+export type OllamaConnectionTest = {
+  ok: boolean;
+  enabled: boolean;
+  base: string;
+  generalModel: string;
+  coderModel: string;
+  generalInstalled: boolean;
+  coderInstalled: boolean;
+  models: string[];
+  latencyMs: number | null;
+  detail: string;
+};
+
+export function ollamaEndpointLabel(): string {
+  return safeEndpoint(config().ollama.base);
+}
+
+export async function testOllamaConnection(): Promise<OllamaConnectionTest> {
+  const c = config().ollama;
+  const result: OllamaConnectionTest = {
+    ok: false,
+    enabled: c.enabled,
+    base: safeEndpoint(c.base),
+    generalModel: c.model || "not configured",
+    coderModel: c.coderModel || "not configured",
+    generalInstalled: false,
+    coderInstalled: false,
+    models: [],
+    latencyMs: null,
+    detail: "",
+  };
+  if (!c.enabled) return { ...result, detail: "OLLAMA_ENABLED is false; no local request was made." };
+  if (!c.base) return { ...result, detail: "OLLAMA_BASE_URL is not set." };
+  if (!c.model) return { ...result, detail: "OLLAMA_MODEL is not set. No model was requested." };
+  if (!c.coderModel) return { ...result, detail: "OLLAMA_CODER_MODEL is not set. No model was requested." };
+  const started = Date.now();
+  try {
+    const response = await fetch(`${c.base}/api/tags`, { signal: timeout(5_000), cache: "no-store" });
+    result.latencyMs = Date.now() - started;
+    if (!response.ok) return { ...result, detail: `Ollama returned HTTP ${response.status}.` };
+    const payload = await response.json().catch(() => ({}));
+    result.models = modelNamesFromTags(payload);
+    result.generalInstalled = result.models.includes(c.model);
+    result.coderInstalled = result.models.includes(c.coderModel);
+    const missing: string[] = [];
+    if (!result.generalInstalled) missing.push(missingOllamaModel(c.model));
+    if (!result.coderInstalled) missing.push(missingOllamaModel(c.coderModel));
+    return {
+      ...result,
+      ok: missing.length === 0,
+      detail: missing.length === 0
+        ? `Ollama is reachable at ${result.base}; both configured models are installed.`
+        : `Ollama is reachable at ${result.base}, but ${missing.join(" ")}`,
+    };
+  } catch (error) {
+    result.latencyMs = Date.now() - started;
+    return {
+      ...result,
+      detail: `Ollama unreachable at ${result.base}: ${scrub(error instanceof Error ? error.message : "network error")}`,
+    };
+  }
+}
+
 async function ollamaHealth(): Promise<ProviderHealth> {
   const c = config().ollama;
   const base: ProviderHealth = {
     name: "ollama",
-    label: "Ollama (local inference)",
+    label: "Ollama (local fallback)",
     enabled: c.enabled,
-    configured: c.enabled,
+    configured: c.enabled && Boolean(c.base) && Boolean(c.model),
     available: false,
-    model: c.model,
+    model: c.model || "not configured",
     models: [],
     detail: "",
     latencyMs: null,
   };
   if (!c.enabled) return { ...base, detail: "OLLAMA_ENABLED is false. No local model is loaded or contacted." };
-  return { ...base, detail: "Explicitly enabled, but not used while FreeLLMAPI is configured." };
+  if (!c.base) return { ...base, detail: "OLLAMA_BASE_URL is not set." };
+  if (!c.model) return { ...base, detail: "OLLAMA_MODEL is not set." };
+  if (!c.coderModel) return { ...base, detail: "OLLAMA_CODER_MODEL is not set; coding-specific fallback is unavailable." };
+  const started = Date.now();
+  try {
+    const response = await fetch(`${c.base}/api/tags`, { signal: timeout(5_000), cache: "no-store" });
+    base.latencyMs = Date.now() - started;
+    if (!response.ok) {
+      return { ...base, detail: `Ollama returned HTTP ${response.status} at ${safeEndpoint(c.base)}.` };
+    }
+    const payload = await response.json().catch(() => ({}));
+    const models = modelNamesFromTags(payload);
+    base.models = models;
+    const generalInstalled = models.includes(c.model);
+    const coderInstalled = models.includes(c.coderModel);
+    if (!generalInstalled) {
+      return { ...base, detail: `Ollama is reachable at ${safeEndpoint(c.base)}, but ${missingOllamaModel(c.model)}.` };
+    }
+    return {
+      ...base,
+      available: true,
+      detail: coderInstalled
+        ? `${models.length} installed model(s). ${c.model} handles general inference and ${c.coderModel} handles coding-specific calls.`
+        : `${models.length} installed model(s). ${c.model} is ready for general fallback, but ${missingOllamaModel(c.coderModel)}; coding-specific fallback will fail clearly.`,
+    };
+  } catch (error) {
+    base.latencyMs = Date.now() - started;
+    return {
+      ...base,
+      detail: `Ollama unreachable at ${safeEndpoint(c.base)}: ${scrub(error instanceof Error ? error.message : "network error")}`,
+    };
+  }
 }
 
 export async function providerHealth(force = false): Promise<ProviderHealth[]> {
@@ -658,12 +891,14 @@ export async function providerHealth(force = false): Promise<ProviderHealth[]> {
   const items = await Promise.all([freeLlmHealth(), geminiHealth(), openRouterHealth(), ollamaHealth()]);
   const checkedAt = new Date().toISOString();
   const stamped = items.map((item) => ({ ...item, checkedAt }));
-  // Do not cache a rate-limited health result: once the advertised cooldown
-  // expires, the next call must be allowed to probe the gateway immediately.
+  // Do not cache a rate-limited FreeLLMAPI result: once the advertised cooldown
+  // expires, the next probe must be allowed to check it immediately. Cache the
+  // other providers, though, so fallback readiness remains visible in the UI.
   const rateLimited = stamped.some(
     (item) => item.name === "freellmapi" && /rate limited|cooldown/i.test(item.detail),
   );
-  if (!rateLimited) g.__atwProviderHealth = { at: Date.now(), items: stamped };
+  const cacheable = rateLimited ? stamped.filter((item) => item.name !== "freellmapi") : stamped;
+  g.__atwProviderHealth = { at: Date.now(), items: cacheable };
   return stamped;
 }
 
@@ -728,9 +963,36 @@ function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
+function providerHttpFailure(
+  provider: ProviderName,
+  status: number,
+  message: string,
+  headers?: Headers,
+  payload?: unknown,
+): Error {
+  if (status === 429 || isRateLimitMessage(message)) {
+    return new AiRateLimitedError(
+      message,
+      headers ? parseRetryAfter(headers, payload) : 30_000,
+      status,
+    );
+  }
+  if (status === 401 || status === 403) {
+    return new AiProviderConfigError(provider, `Authentication failed (HTTP ${status}): ${message}`);
+  }
+  if (status === 400 || status === 404 || status === 409 || status === 422) {
+    return new AiProviderConfigError(provider, `Request/model configuration failed (HTTP ${status}): ${message}`);
+  }
+  return new AiProviderError(provider, `Provider HTTP ${status}: ${message}`, status === 408 || status === 425 || status >= 500, status);
+}
+
 async function callFreeLlm(input: GenerateInput): Promise<GenerateResult> {
   const c = config().freellmapi;
-  assertPermittedModel(c.model);
+  try {
+    assertPermittedModel(c.model);
+  } catch (error) {
+    throw new AiProviderConfigError("freellmapi", error instanceof Error ? error.message : "FreeLLMAPI model policy rejected the request.");
+  }
   const started = Date.now();
   const response = await fetch(`${c.base}/chat/completions`, {
     method: "POST",
@@ -758,16 +1020,17 @@ async function callFreeLlm(input: GenerateInput): Promise<GenerateResult> {
   };
   if (!response.ok) {
     const message = payload.error?.message ?? `FreeLLMAPI HTTP ${response.status}`;
-    if (response.status === 429 || isRateLimitMessage(message)) {
-      throw new AiRateLimitedError(message, parseRetryAfter(response.headers, payload), response.status);
-    }
-    throw new Error(message);
+    throw providerHttpFailure("freellmapi", response.status, message, response.headers, payload);
   }
   const text = (payload.choices?.[0]?.message?.content ?? "").trim();
-  if (!text) throw new Error("FreeLLMAPI returned an empty completion.");
+  if (!text) throw new AiProviderError("freellmapi", "FreeLLMAPI returned an empty completion.", true);
   const model = String(payload.model ?? c.model);
   // Fail closed on any substitution (e.g. an alias rewritten to a provider id).
-  assertPinnedResolution(c.model, model);
+  try {
+    assertPinnedResolution(c.model, model);
+  } catch (error) {
+    throw new AiProviderConfigError("freellmapi", error instanceof Error ? error.message : "FreeLLMAPI returned an unpinned model.");
+  }
   const usage = {
     promptTokens: payload.usage?.prompt_tokens ?? estimateTokens(input.prompt),
     completionTokens: payload.usage?.completion_tokens ?? estimateTokens(text),
@@ -877,17 +1140,24 @@ async function callOpenRouter(input: GenerateInput, signal: AbortSignal): Promis
   };
 }
 
-async function callOllama(input: GenerateInput, health: ProviderHealth | undefined): Promise<GenerateResult> {
+function ollamaModelFor(input: GenerateInput): string {
   const c = config().ollama;
-  const installed = health?.models ?? [];
-  const preferred = input.technical ? c.coderModel : c.model;
-  const model = installed.includes(preferred) ? preferred : installed.includes(c.model) ? c.model : installed[0];
-  if (!model) throw new Error("No installed Ollama model is available.");
+  return input.technical ? c.coderModel : c.model;
+}
+
+async function callOllama(input: GenerateInput): Promise<GenerateResult> {
+  const c = config().ollama;
+  if (!c.enabled) throw new AiProviderConfigError("ollama", "Ollama fallback is disabled (OLLAMA_ENABLED is not true).");
+  if (!c.base) throw new AiProviderConfigError("ollama", "OLLAMA_BASE_URL is not set.");
+  const model = ollamaModelFor(input);
+  const configurationName = input.technical ? "OLLAMA_CODER_MODEL" : "OLLAMA_MODEL";
+  if (!model) throw new AiProviderConfigError("ollama", `${configurationName} is not set.`);
+
   const started = Date.now();
   const response = await fetch(`${c.base}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    signal: timeout(90_000),
+    signal: timeout(c.timeoutMs),
     body: JSON.stringify({
       model,
       stream: false,
@@ -904,14 +1174,24 @@ async function callOllama(input: GenerateInput, health: ProviderHealth | undefin
     }),
   });
   const payload = (await response.json().catch(() => ({}))) as {
+    model?: string;
     message?: { content?: string };
     prompt_eval_count?: number;
     eval_count?: number;
     error?: string;
   };
-  if (!response.ok) throw new Error(payload.error ?? `Ollama HTTP ${response.status}`);
+  if (!response.ok) {
+    const message = payload.error ?? `Ollama HTTP ${response.status}`;
+    if (response.status === 404 || /model.*not found|no such model/i.test(message)) {
+      throw new AiProviderConfigError("ollama", `${model} is not installed or could not be loaded. Run: ollama pull ${model}`);
+    }
+    if (response.status === 400 || response.status === 401 || response.status === 403 || response.status === 422) {
+      throw new AiProviderConfigError("ollama", `Request/model configuration failed (HTTP ${response.status}): ${message}`);
+    }
+    throw providerHttpFailure("ollama", response.status, message);
+  }
   const text = (payload.message?.content ?? "").trim();
-  if (!text) throw new Error("Ollama returned an empty completion.");
+  if (!text) throw new AiProviderError("ollama", "Ollama returned an empty completion.", true);
   return {
     text,
     provider: "ollama",
@@ -928,55 +1208,96 @@ async function callOllama(input: GenerateInput, health: ProviderHealth | undefin
   };
 }
 
+function recordProviderFailure(input: GenerateInput, provider: ProviderName, model: string, started: number, message: string): void {
+  recordUsage({
+    provider,
+    model,
+    agentKey: input.agentKey,
+    workflowId: input.workflowId,
+    taskId: input.taskId,
+    source: input.source,
+    usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+    latencyMs: Date.now() - started,
+    status: "error",
+    error: message,
+  });
+}
+
 export async function generateText(input: GenerateInput): Promise<GenerateResult> {
   const attempts = config().maxRetries + 1;
 
-  // Primary path: FreeLLMAPI only. No fallback of any kind.
+  // Primary route: FreeLLMAPI. The fallback lives inside this one call, so a
+  // caller executes its own tool or database side effect exactly once after a
+  // successful result. Provider retries never invoke caller-side work.
   if (freeLlmConfigured()) {
     const release = await acquireAiSlot(input.priority ?? 1, input.maxWaitMs ?? 60_000);
     try {
+      const fallbackEnabled = ollamaConfigured();
+      const errors: string[] = [];
+      let primaryError: unknown = null;
       const cooling = gatewayCooldownStatus();
+
       if (cooling.remainingMs > 0) {
-        throw new AiRateLimitedError(
-          `FreeLLMAPI is cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s. ${cooling.reason ?? ""}`.trim(),
-          cooling.remainingMs,
-          429,
+        const message = `FreeLLMAPI is cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s. ${cooling.reason ?? ""}`.trim();
+        primaryError = new AiRateLimitedError(message, cooling.remainingMs, 429);
+        errors.push(message);
+      } else {
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+          const started = Date.now();
+          try {
+            const result = await callFreeLlm(input);
+            clearGatewayCooldown();
+            recordUsage({
+              provider: result.provider,
+              model: result.model,
+              agentKey: input.agentKey,
+              workflowId: input.workflowId,
+              taskId: input.taskId,
+              source: input.source,
+              usage: result.usage,
+              latencyMs: result.latencyMs,
+              status: "ok",
+              routedVia: result.routedVia,
+            });
+            return result;
+          } catch (error) {
+            const message = scrub(error instanceof Error ? error.message : "gateway failure");
+            recordProviderFailure(input, "freellmapi", config().freellmapi.model, started, message);
+            errors.push(`FreeLLMAPI attempt ${attempt}: ${message}`);
+
+            if (error instanceof AiRateLimitedError) {
+              setGatewayCooldown(error.retryAfterMs, message);
+              primaryError = error;
+              break;
+            }
+            if (!isRecoverableProviderError(error)) {
+              if (error instanceof AiProviderError) throw error;
+              throw new AiProviderConfigError("freellmapi", message);
+            }
+            primaryError = error;
+            if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+          }
+        }
+
+        // A transient outage should not make every agent message wait on a
+        // dead primary. A short cooldown lets the next calls use Ollama, then
+        // automatically retries FreeLLMAPI when it expires.
+        if (primaryError && !(primaryError instanceof AiRateLimitedError) && isRecoverableProviderError(primaryError)) {
+          setGatewayCooldown(15_000, `FreeLLMAPI recoverable failure: ${errors[errors.length - 1] ?? "provider unavailable"}`);
+        }
+      }
+
+      if (!fallbackEnabled) {
+        if (primaryError instanceof AiRateLimitedError) throw primaryError;
+        throw new ProvidersUnavailableError(
+          `FreeLLMAPI failed and Ollama fallback is disabled. ${errors.slice(-2).join(" · ")}`.trim(),
         );
       }
-      const health = await providerHealth();
-      const coolingAfterHealth = gatewayCooldownStatus();
-      if (coolingAfterHealth.remainingMs > 0) {
-        throw new AiRateLimitedError(
-          `FreeLLMAPI is cooling down for ${Math.ceil(coolingAfterHealth.remainingMs / 1000)}s. ${coolingAfterHealth.reason ?? ""}`.trim(),
-          coolingAfterHealth.remainingMs,
-          429,
-        );
-      }
-      const gateway = health.find((item) => item.name === "freellmapi");
-    if (!gateway?.available) {
-      const detail = `FreeLLMAPI is unavailable: ${gateway?.detail ?? "no health result"}. No fallback provider was attempted.`;
-      // A pre-flight failure is still an AI execution attempt. Recording it keeps
-      // the roster counters aligned with the calls the agents actually tried.
-      recordUsage({
-        provider: "freellmapi",
-        model: config().freellmapi.model,
-        agentKey: input.agentKey,
-        workflowId: input.workflowId,
-        taskId: input.taskId,
-        source: input.source,
-        usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-        latencyMs: 0,
-        status: "error",
-        error: detail,
-      });
-      throw new ProvidersUnavailableError(detail);
-    }
-    const errors: string[] = [];
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      const started = Date.now();
+
+      const fallbackStarted = Date.now();
+      const fallbackModel = ollamaModelFor(input) || config().ollama.model || "not configured";
       try {
-        const result = await callFreeLlm(input);
-        clearGatewayCooldown();
+        const result = await callOllama(input);
         recordUsage({
           provider: result.provider,
           model: result.model,
@@ -991,39 +1312,52 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
         });
         return result;
       } catch (error) {
-        const message = scrub(error instanceof Error ? error.message : "gateway failure");
-        recordUsage({
-          provider: "freellmapi",
-          model: config().freellmapi.model,
-          agentKey: input.agentKey,
-          workflowId: input.workflowId,
-          taskId: input.taskId,
-          source: input.source,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-          latencyMs: Date.now() - started,
-          status: "error",
-          error: message,
-        });
-        if (error instanceof AiRateLimitedError) {
-          setGatewayCooldown(error.retryAfterMs, message);
-          throw error;
-        }
-        errors.push(`attempt ${attempt}: ${message}`);
-        const permanent = /refused|blocked|insufficient|401|403|404|empty|not offered|credit|abort|timed? ?out|high demand/i.test(message);
-        if (permanent) break;
-        if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 400 * attempt));
+        const message = scrub(error instanceof Error ? error.message : "local provider failure");
+        recordProviderFailure(input, "ollama", fallbackModel, fallbackStarted, message);
+        const detail = `FreeLLMAPI failed (${errors.slice(-2).join(" · ")}). Ollama fallback failed: ${message}`.trim();
+        if (error instanceof AiProviderConfigError) throw new AiProviderConfigError("ollama", detail);
+        throw new ProvidersUnavailableError(detail);
       }
-    }
-    throw new ProvidersUnavailableError(`FreeLLMAPI failed and no fallback is permitted. ${errors.slice(-2).join(" · ")}`);
     } finally {
       release();
     }
   }
 
-  // Legacy path, reached only when FreeLLMAPI is NOT configured and a provider
-  // was explicitly enabled. Never used as a fallback from the primary gateway.
+  // FreeLLMAPI is not configured. An explicitly enabled local Ollama can still
+  // serve text agents without pretending the primary exists.
+  if (ollamaConfigured()) {
+    const release = await acquireAiSlot(input.priority ?? 1, input.maxWaitMs ?? 60_000);
+    const started = Date.now();
+    try {
+      const result = await callOllama(input);
+      recordUsage({
+        provider: result.provider,
+        model: result.model,
+        agentKey: input.agentKey,
+        workflowId: input.workflowId,
+        taskId: input.taskId,
+        source: input.source,
+        usage: result.usage,
+        latencyMs: result.latencyMs,
+        status: "ok",
+        routedVia: result.routedVia,
+      });
+      return result;
+    } catch (error) {
+      const message = scrub(error instanceof Error ? error.message : "local provider failure");
+      recordProviderFailure(input, "ollama", ollamaModelFor(input) || config().ollama.model || "not configured", started, message);
+      if (error instanceof AiProviderConfigError) throw error;
+      throw new ProvidersUnavailableError(`Ollama failed: ${message}`);
+    } finally {
+      release();
+    }
+  }
+
+  // Legacy path, reached only when both FreeLLMAPI and Ollama are unconfigured.
+  // Gemini/OpenRouter are retained for backwards-compatible installations; the
+  // dedicated Gemini Live voice path never enters this function.
   const health = await providerHealth();
-  const order: ProviderHealth[] = ["gemini", "openrouter", "ollama"]
+  const order: ProviderHealth[] = ["gemini", "openrouter"]
     .map((name) => health.find((item) => item.name === name))
     .filter((item): item is ProviderHealth => Boolean(item && item.enabled));
 
@@ -1039,9 +1373,7 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
         const result =
           provider.name === "gemini"
             ? await callGemini(input, timeout(20_000))
-            : provider.name === "openrouter"
-              ? await callOpenRouter(input, timeout(20_000))
-              : await callOllama(input, provider);
+            : await callOpenRouter(input, timeout(20_000));
         recordUsage({
           provider: result.provider,
           model: result.model,
@@ -1057,18 +1389,7 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
         return result;
       } catch (error) {
         const message = scrub(error instanceof Error ? error.message : "provider failure");
-        recordUsage({
-          provider: provider.name,
-          model: provider.model,
-          agentKey: input.agentKey,
-          workflowId: input.workflowId,
-          taskId: input.taskId,
-          source: input.source,
-          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-          latencyMs: Date.now() - started,
-          status: "error",
-          error: message,
-        });
+        recordProviderFailure(input, provider.name, provider.model, started, message);
         errors.push(`${provider.name} attempt ${attempt}: ${message}`);
         const permanent = /blocked|insufficient|401|403|404|empty|not offered|credit|abort|timed? ?out|high demand/i.test(message);
         if (permanent) break;
@@ -1077,7 +1398,7 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
     }
   }
   throw new ProvidersUnavailableError(
-    `All AI providers failed. ${errors.slice(-3).join(" · ")}`.trim(),
+    `No AI provider is configured or available. ${errors.slice(-3).join(" · ")}`.trim(),
   );
 }
 

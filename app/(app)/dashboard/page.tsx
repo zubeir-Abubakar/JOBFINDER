@@ -86,6 +86,8 @@ export default async function DashboardPage({
   const active = activeWorkflow();
   const health = await providerHealth();
   const gateway = health.find((item) => item.name === "freellmapi");
+  const ollama = health.find((item) => item.name === "ollama");
+  const fallbackEnabled = (process.env.OLLAMA_ENABLED ?? "false") === "true" && Boolean(process.env.OLLAMA_MODEL);
   const policyIssue = freeLlmPolicyIssue();
   const lastAi = all<{ ai_outcome: string | null; provider: string | null; model: string | null; created_at: string }>(
     "SELECT ai_outcome, provider, model, created_at FROM tasks WHERE execution_mode = 'ai' ORDER BY created_at DESC LIMIT 1",
@@ -213,8 +215,8 @@ export default async function DashboardPage({
             <span className="system-details-title">System health &amp; AI gateway</span>
             <span className="system-details-sub">Inference route, queue telemetry and model policy. Kept out of the main workflow view.</span>
           </span>
-          <span className={`badge ${gateway?.available ? "badge-good" : gateway?.configured ? "badge-bad" : "badge-warn"}`}>
-            {gateway?.available ? "connected" : gateway?.configured ? "unreachable" : "not configured"}
+          <span className={`badge ${gateway?.available ? "badge-good" : ollama?.available ? "badge-good" : gateway?.configured ? "badge-bad" : "badge-warn"}`}>
+            {gateway?.available ? "primary connected" : ollama?.available ? "fallback ready" : gateway?.configured ? "unreachable" : "not configured"}
           </span>
           <span className="system-details-chevron" aria-hidden="true"><Icon name="chevron" size={15} /></span>
         </summary>
@@ -223,10 +225,10 @@ export default async function DashboardPage({
             <div className="card-head">
               <div>
                 <h2>AI gateway</h2>
-                <p className="card-sub">FreeLLMAPI is the primary and only permitted inference path. There is no fallback provider.</p>
+                <p className="card-sub">FreeLLMAPI is primary. Ollama is the local fallback for recoverable failures; configuration and auth errors fail closed.</p>
               </div>
-              <span className={`badge ${gateway?.available ? "badge-good" : gateway?.configured ? "badge-bad" : "badge-warn"}`}>
-                {gateway?.available ? "connected" : gateway?.configured ? "unreachable" : "not configured"}
+              <span className={`badge ${gateway?.available ? "badge-good" : ollama?.available ? "badge-good" : gateway?.configured ? "badge-bad" : "badge-warn"}`}>
+                {gateway?.available ? "primary connected" : ollama?.available ? "fallback ready" : gateway?.configured ? "unreachable" : "not configured"}
               </span>
             </div>
             <div className="card-body grid g2" style={{ gap: 12 }}>
@@ -235,6 +237,8 @@ export default async function DashboardPage({
                 <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Model policy</span><span className="num">{gateway?.model ?? "—"}</span></div>
                 <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Latency</span><span className="num">{gateway?.latencyMs == null ? "—" : `${gateway.latencyMs} ms`}</span></div>
                 <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Catalogue</span><span className="num">{gateway?.models.length ?? 0} models</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Fallback</span><span className={`badge ${fallbackEnabled ? "badge-good" : "badge-warn"}`}>{fallbackEnabled ? "Ollama enabled" : "disabled"}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Fallback status</span><span>{ollama?.available ? `connected · ${ollama.model}` : ollama?.detail ?? "not checked"}</span></div>
               </div>
               <div className="stack" style={{ gap: 6 }}>
                 <div className="between text-[12px]">
@@ -249,12 +253,13 @@ export default async function DashboardPage({
                   <span style={{ color: "var(--muted)" }}>Last AI attempt</span>
                   <span>{lastAi ? `${lastAi.ai_outcome === "ok" ? "succeeded" : "failed"} · ${lastAi.provider ?? "—"}` : "none yet"}</span>
                 </div>
-                <div className="text-[11.5px] leading-relaxed" style={{ color: gateway?.available ? "var(--muted)" : "var(--danger)" }}>
+                <div className="text-[11.5px] leading-relaxed" style={{ color: gateway?.available || ollama?.available ? "var(--muted)" : "var(--danger)" }}>
                   {gateway?.detail ?? "No health result yet."}
+                  {ollama && !gateway?.available ? ` Fallback: ${ollama.detail}` : ""}
                 </div>
                 {policyIssue ? <div className="text-[11px] leading-relaxed" style={{ color: "var(--danger)" }}>{policyIssue}</div> : null}
                 <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
-                  Fallback: none — Gemini, OpenRouter and Ollama are disabled by configuration. AI-backed task successes: {aiTotals.ok}
+                  Fallback: {fallbackEnabled ? "Ollama local models for recoverable FreeLLMAPI failures" : "disabled"}; Gemini Live is voice-only. AI-backed task successes: {aiTotals.ok}
                   {aiTotals.failed ? ` · failed model calls: ${aiTotals.failed}` : ""}.
                 </div>
               </div>

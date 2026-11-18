@@ -21,7 +21,9 @@ import {
   testEmailAction,
 } from "@/lib/actions/settings";
 import { tempStorageStats } from "@/lib/temp-store";
+import { effectiveMinMatchScore } from "@/lib/scoring";
 import { relativeTime } from "@/lib/format";
+import type { GmailTestResult } from "@/lib/gmail";
 
 export const dynamic = "force-dynamic";
 
@@ -38,6 +40,10 @@ export default async function SettingsPage({
   const ai = settings.ai ?? {};
   const security = settings.security ?? { session_days: 7, remember_days: 30, max_login_attempts: 8 };
   const emailConfig = settings.email ?? { connected: false, provider: "gmail", sender: "", account: "" };
+  const emailTest =
+    settings.email_test_last && typeof settings.email_test_last === "object"
+      ? (settings.email_test_last as GmailTestResult)
+      : null;
   const stats = storageStats();
   const cache = tempStorageStats();
   const account = one<{ created_at: string; last_login_at: string | null }>("SELECT created_at, last_login_at FROM users WHERE id = ?", [user.id]);
@@ -165,24 +171,25 @@ export default async function SettingsPage({
         <div className="card-head">
           <div>
             <h2>Automation & approval</h2>
-            <p className="card-sub">Approval mode is on by default. Autonomous submission requires a configured portal adapter and never bypasses security controls.</p>
+            <p className="card-sub">Standing authorisation is managed on the Recruitment page. The policy defaults to automatic submission, but real submissions stay off until you explicitly activate it there.</p>
           </div>
         </div>
         <div className="card-body">
           <form action={saveAutomationAction} className="grid g2" style={{ gap: 12 }}>
             <label className="flex items-center gap-2 text-[12.5px]">
-              <input type="checkbox" name="approval_mode" defaultChecked={settings.approval_mode !== false} /> Require my approval before submission
+              <input type="checkbox" name="approval_mode" defaultChecked={settings.approval_mode === true} /> Require my approval before each submission
             </label>
             <label className="flex items-center gap-2 text-[12.5px]">
               <input type="checkbox" name="autonomous_submission" defaultChecked={settings.autonomous_submission === true} /> Allow autonomous submission when every condition passes
             </label>
             <div>
               <label className="label" htmlFor="min_match_score">Minimum match score to prepare documents</label>
-              <input id="min_match_score" name="min_match_score" type="number" min={0} max={100} className="input" defaultValue={settings.min_match_score ?? 60} />
+              <input id="min_match_score" name="min_match_score" type="number" min={effectiveMinMatchScore(settings.min_match_score)} max={100} className="input" defaultValue={effectiveMinMatchScore(settings.min_match_score)} />
+              <p className="hint">The scoring engine enforces {effectiveMinMatchScore(settings.min_match_score)}%: the value can be raised but never set below that floor.</p>
             </div>
             <div>
               <label className="label" htmlFor="max_applications_per_day">Maximum applications per day</label>
-              <input id="max_applications_per_day" name="max_applications_per_day" type="number" min={1} max={50} className="input" defaultValue={settings.max_applications_per_day ?? 5} />
+              <input id="max_applications_per_day" name="max_applications_per_day" type="number" min={1} max={10} className="input" defaultValue={settings.max_applications_per_day ?? 3} />
             </div>
             <div>
               <label className="label" htmlFor="search_frequency">Search frequency</label>
@@ -198,8 +205,8 @@ export default async function SettingsPage({
               <input type="checkbox" name="duplicate_detection" defaultChecked={settings.duplicate_detection !== false} /> Block duplicate vacancies and applications
             </label>
             <div className="alert alert-info" style={{ gridColumn: "1 / -1" }}>
-              Portal automation is not connected in this deployment. Nothing is submitted automatically, and no application is marked submitted without an employer
-              confirmation reference. AI provider: {ai.provider ?? "rules"} · {ai.model ?? "at-rules-v1"}.
+              A candidate-facing form can be completed only when every answer is in your verified profile. CAPTCHAs, MFA, logins, payments and legal declarations are never
+              bypassed; an unknown essential answer queues the application. No application is counted as submitted without employer confirmation. AI provider: {ai.provider ?? "rules"} · {ai.model ?? "at-rules-v1"}.
             </div>
             <div className="flex items-end">
               <SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save automation</SubmitButton>
@@ -255,7 +262,13 @@ export default async function SettingsPage({
               <div>
                 <label className="label" htmlFor="email">Notification email</label>
                 <input id="email" name="email" type="email" className="input" defaultValue={profile.profile.email ?? user.email} />
-                <p className="hint">Currently {emailConfig.connected ? `delivery via ${emailConfig.provider}` : "in-app only — no email provider connected"}.</p>
+                <p className="hint">
+                  Currently{" "}
+                  {emailConfig.connected
+                    ? "Gmail is connected for explicit test delivery. In-app notifications are recorded independently."
+                    : "in-app only — no email provider connected"}
+                  . The test uses this saved address; save Notifications before testing.
+                </p>
               </div>
               {[
                 ["notify_daily_report", "Daily report", settings.notify_daily_report !== false],
@@ -271,8 +284,38 @@ export default async function SettingsPage({
               <SubmitButton className="btn btn-primary">Save notifications</SubmitButton>
             </form>
             <form action={testEmailAction} className="mt-2">
-              <SubmitButton className="btn btn-sm">Send test email</SubmitButton>
+              <SubmitButton className="btn btn-sm" pendingLabel="Sending…">Send test email</SubmitButton>
             </form>
+            {emailTest ? (
+              <div
+                className={`alert ${emailTest.status === "accepted" ? "alert-ok" : emailTest.status === "unverified" ? "alert-warn" : "alert-error"} mt-3`}
+              >
+                <strong>
+                  {emailTest.status === "accepted"
+                    ? "Gmail accepted the test message."
+                    : emailTest.status === "unverified"
+                      ? "Gmail response was not conclusive."
+                      : emailTest.status === "authentication_failed"
+                        ? "Gmail authentication failed."
+                        : emailTest.status === "missing_configuration"
+                          ? "Gmail is not configured."
+                          : emailTest.status === "invalid_recipient"
+                            ? "Notification recipient is invalid."
+                            : emailTest.status === "permission_denied"
+                              ? "Gmail permission is missing."
+                              : "Gmail API error."}
+                </strong>
+                <div className="mt-1">{emailTest.detail}</div>
+                <div className="mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
+                  Provider: Gmail · Recipient: {emailTest.recipientMasked || "not configured"}
+                  {emailTest.messageId ? <> · Gmail message ID: {emailTest.messageId}</> : null}
+                  {emailTest.delivery === "unverified" ? " · Delivery unverified" : null}
+                  {emailTest.at ? <> · {relativeTime(emailTest.at)}</> : null}
+                </div>
+              </div>
+            ) : (
+              <p className="hint mt-2">Only the saved notification recipient is used. The app never sends a test to an employer.</p>
+            )}
           </div>
         </section>
       </div>

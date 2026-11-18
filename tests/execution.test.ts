@@ -121,13 +121,14 @@ test("migration adds execution metadata without rewriting historical rows", () =
   assert.equal(row?.ai_outcome, null);
 });
 
-test("provider usage cost/routing metadata migrates", () => {
+test("provider usage cost/routing metadata migrates", async () => {
+  const { SCHEMA_VERSION } = await import("../lib/db.ts");
   const db = getDb();
   const usageColumns = (db.prepare("PRAGMA table_info(provider_usage)").all() as Array<{ name: string }>).map((row) => row.name);
   for (const column of ["cost_status", "routed_platform", "routed_model", "task_id", "source"]) {
     assert.ok(usageColumns.includes(column), `provider_usage.${column} missing`);
   }
-  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+  assert.equal((db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, SCHEMA_VERSION);
 });
 
 test("dashboard, agents and admin queries run against the migrated schema", () => {
@@ -200,7 +201,8 @@ test("repeated migration is idempotent and preserves data", () => {
   assert.equal(row?.status, "completed");
 });
 
-test("a handle cached before the migration is upgraded instead of crashing", () => {
+test("a handle cached before the migration is upgraded instead of crashing", async () => {
+  const { SCHEMA_VERSION } = await import("../lib/db.ts");
   const dir = mkdtempSync(join(tmpdir(), "atw-stale-handle-"));
   const dbFile = join(dir, "at-ai-workforce.db");
   const scriptFile = join(dir, "stale.mjs");
@@ -231,5 +233,5 @@ console.log(JSON.stringify({
   });
   assert.equal(result.status, 0, result.stderr);
   const payload = JSON.parse(result.stdout.trim().split("\n").pop() as string);
-  assert.deepEqual(payload, { sameHandle: true, executionMode: true, aiOutcome: true, aiSuccess: true, aiFailure: true, version: 7 });
+  assert.deepEqual(payload, { sameHandle: true, executionMode: true, aiOutcome: true, aiSuccess: true, aiFailure: true, version: SCHEMA_VERSION });
 });

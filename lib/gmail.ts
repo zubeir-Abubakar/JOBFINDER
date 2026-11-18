@@ -3,15 +3,16 @@ import { all, nowIso, one, run } from "./db";
 import { setSetting } from "./settings";
 import { randomId } from "./security";
 import { notify } from "./notify";
-import { GMAIL_IDENTITY_SCOPES, REQUIRED_GMAIL_SCOPES, gmailApiError, missingGrantedScopes, parseGmailProfile } from "./gmail-profile";
+import { audit } from "./audit";
+import { GMAIL_IDENTITY_SCOPES, REQUIRED_GMAIL_SCOPES, GmailProfileError, gmailApiError, missingGrantedScopes, parseGmailProfile } from "./gmail-profile";
 import { generateText, type AiCallSource } from "./providers";
 import { enqueueAiJob, isQueueableAiError } from "./ai-queue";
 
 /**
  * Gmail OAuth and mailbox integration.
  * Tokens are encrypted at rest with AES-256-GCM derived from APP_SECRET_KEY.
- * Nothing is ever sent without an explicit approval action; this module only
- * creates drafts until `sendApprovedDraft` is called by a user action.
+ * Workflows only create drafts until `sendApprovedDraft` is called by a user
+ * action. The only other send path is the explicit Settings test message.
  */
 
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -28,6 +29,38 @@ export type GmailAccount = {
   connected_at: string;
   last_sync_at: string | null;
 };
+
+export type GmailTestStatus =
+  | "accepted"
+  | "unverified"
+  | "missing_configuration"
+  | "authentication_failed"
+  | "permission_denied"
+  | "invalid_recipient"
+  | "api_error";
+
+export type GmailTestResult = {
+  status: GmailTestStatus;
+  provider: "gmail";
+  recipientMasked: string;
+  messageId: string | null;
+  threadId: string | null;
+  delivery: "unverified" | null;
+  detail: string;
+  at: string;
+};
+
+/** Keep addresses out of logs and UI summaries without hiding the domain. */
+export function maskEmail(value: string): string {
+  const email = value.trim();
+  const at = email.lastIndexOf("@");
+  if (at < 1) return email ? "***" : "not configured";
+  return `${email[0]}***${email.slice(at)}`;
+}
+
+function validRecipient(value: string): boolean {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+}
 
 export function gmailConfig() {
   const scopes = new Set(
@@ -497,6 +530,106 @@ function draftEmail(to: string, subject: string, body: string) {
   return Buffer.from(message, "utf8").toString("base64url");
 }
 
+/**
+ * Send one explicitly requested test message through the connected Gmail
+ * account. Gmail's message id proves acceptance by the API; it does not prove
+ * inbox delivery, so that distinction is carried in `delivery` and `detail`.
+ */
+export async function sendGmailTestEmail(to: string): Promise<GmailTestResult> {
+  const recipient = to.trim();
+  const base = {
+    provider: "gmail" as const,
+    recipientMasked: maskEmail(recipient),
+    messageId: null,
+    threadId: null,
+    delivery: null,
+    at: nowIso(),
+  };
+  const fail = (status: GmailTestStatus, detail: string): GmailTestResult => ({ ...base, status, detail });
+
+  if (!validRecipient(recipient)) {
+    return fail("invalid_recipient", "Enter a valid notification email address, then save Notifications before testing.");
+  }
+
+  const missing = gmailMissing();
+  if (missing.length > 0) {
+    return fail("missing_configuration", `Gmail is not ready: ${missing.join(" ")}`);
+  }
+
+  const account = accountStatus();
+  if (!account.connected) {
+    return fail("missing_configuration", "Gmail is not connected. Connect the mailbox from Admin → Email before testing.");
+  }
+  if (account.needsReconnect) {
+    return fail(
+      "permission_denied",
+      `Gmail is missing required permissions: ${account.missingScopes.map((scope) => scope.split("/").pop()).join(", ")}. Reconnect Gmail and approve read, draft and send access.`,
+    );
+  }
+
+  const at = new Date().toISOString();
+  const body = [
+    "This is a test message from Towfiq AI Agents.",
+    "",
+    `Requested at ${at}.`,
+    "If you received this, Gmail accepted the send request from the connected mailbox.",
+    "The application can confirm API acceptance but cannot independently verify inbox delivery.",
+  ].join("\n");
+
+  try {
+    const sent = await gmailFetch<{ id?: string; threadId?: string }>("/messages/send", {
+      method: "POST",
+      body: JSON.stringify({ raw: draftEmail(recipient, "Towfiq AI Agents — Gmail test", body) }),
+    });
+    if (!sent?.id) {
+      return fail("unverified", "Gmail returned a successful response without a message ID. Delivery cannot be confirmed.");
+    }
+    return {
+      ...base,
+      status: "accepted",
+      messageId: sent.id,
+      threadId: sent.threadId ?? null,
+      delivery: "unverified",
+      detail: "Gmail accepted the test message. Delivery to the mailbox is not independently verified by the application.",
+    };
+  } catch (cause) {
+    if (cause instanceof GmailProfileError) {
+      if (cause.kind === "expired") return fail("authentication_failed", cause.message);
+      if (cause.kind === "scope") return fail("permission_denied", cause.message);
+      if (cause.kind === "api_disabled") return fail("missing_configuration", cause.message);
+      return fail("api_error", cause.message);
+    }
+    const message = cause instanceof Error ? cause.message : "Gmail send failed.";
+    if (/invalid_grant|expired|revoked|refresh token|authorisation|decrypt|unable to authenticate|stored gmail token/i.test(message)) {
+      return fail("authentication_failed", message.slice(0, 500));
+    }
+    return fail("api_error", message.slice(0, 500));
+  }
+}
+
+/** Persist and audit the result so the Settings card shows the last real outcome. */
+export async function runGmailTestEmail(to: string, userId?: string | null): Promise<GmailTestResult> {
+  const result = await sendGmailTestEmail(to);
+  setSetting("email_test_last", result);
+  audit({
+    userId: userId ?? null,
+    action: `email.test_${result.status}`,
+    entity: "email",
+    detail: [
+      "provider=gmail",
+      `recipient=${result.recipientMasked}`,
+      `status=${result.status}`,
+      `delivery=${result.delivery ?? "not-applicable"}`,
+      `messageId=${result.messageId ?? "none"}`,
+      result.detail,
+    ]
+      .join(" · ")
+      .replace(/\s+/g, " ")
+      .slice(0, 1000),
+  });
+  return result;
+}
+
 export async function createDraft(emailId: string, draftBody: string): Promise<void> {
   const message = one<{ id: string; sender: string | null; subject: string; body_text: string | null }>(
     "SELECT id, sender, subject, body_text FROM email_messages WHERE id = ?",
@@ -523,6 +656,7 @@ export async function sendApprovedDraft(emailId: string): Promise<void> {
 }
 
 export function disconnectGmail(): void {
+  setSetting("email_test_last", null);
   run("DELETE FROM gmail_accounts WHERE id = 1");
   setSetting("email", { provider: "gmail", connected: false, sender: "", account: "" });
 }

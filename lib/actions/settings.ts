@@ -6,9 +6,11 @@ import { nowIso, run } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { getProfileData } from "@/lib/profile";
-import { getSetting, setSetting } from "@/lib/settings";
+import { setSetting } from "@/lib/settings";
+import { maskEmail, runGmailTestEmail } from "@/lib/gmail";
 import { cleanupExpiredDocuments } from "@/lib/retention";
 import { cleanupTempObjects } from "@/lib/temp-store";
+import { effectiveMinMatchScore } from "@/lib/scoring";
 
 const list = (value: FormDataEntryValue | null) =>
   String(value ?? "")
@@ -41,8 +43,10 @@ export async function saveAutomationAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   setSetting("approval_mode", formData.get("approval_mode") === "on");
   setSetting("autonomous_submission", formData.get("autonomous_submission") === "on");
-  setSetting("min_match_score", Math.min(100, Math.max(0, Number(formData.get("min_match_score") ?? 60))));
-  setSetting("max_applications_per_day", Math.min(50, Math.max(1, Number(formData.get("max_applications_per_day") ?? 5))));
+  // The floor is enforced here as well as in the scoring engine: a stored value
+  // below 85% would otherwise be displayed as if it were the active threshold.
+  setSetting("min_match_score", effectiveMinMatchScore(formData.get("min_match_score")));
+  setSetting("max_applications_per_day", Math.min(10, Math.max(1, Number(formData.get("max_applications_per_day") ?? 3))));
   setSetting("search_frequency", String(formData.get("search_frequency") ?? "daily"));
   setSetting("duplicate_detection", formData.get("duplicate_detection") === "on");
   audit({ action: "settings.automation", entity: "settings", detail: `Approval mode: ${formData.get("approval_mode") === "on"}`, userId: user.id });
@@ -93,10 +97,18 @@ export async function cleanTempCacheAction(): Promise<void> {
 
 export async function testEmailAction(): Promise<void> {
   const user = await requireUser();
-  const email = getSetting<{ connected: boolean; sender: string }>("email", { connected: false, sender: "" });
-  audit({ action: "email.test_requested", entity: "email", detail: email.connected ? "Provider marked connected" : "No provider configured", userId: user.id });
-  if (!email.connected) {
-    redirect("/settings?error=Email+delivery+is+not+configured.+The+administrator+must+connect+a+provider+first.#notifications");
-  }
-  redirect("/settings?error=The+configured+provider+has+not+been+exercised+by+this+deployment+yet.+Check+Admin+%E2%86%92+Email.#notifications");
+  const profile = getProfileData();
+  // This is exactly the address shown and saved in Notifications. The test
+  // never accepts a recipient from the request, so it cannot be aimed at an
+  // employer or arbitrary third party.
+  const recipient = String(profile.profile.email || user.email || "").trim();
+  audit({
+    action: "email.test_requested",
+    entity: "email",
+    detail: recipient ? `Requested test for ${maskEmail(recipient)}` : "No notification recipient saved",
+    userId: user.id,
+  });
+  const result = await runGmailTestEmail(recipient, user.id);
+  revalidatePath("/settings");
+  redirect(`/settings?email_test=${encodeURIComponent(result.status)}#notifications`);
 }

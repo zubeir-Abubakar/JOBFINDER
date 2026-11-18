@@ -1,8 +1,29 @@
 import type { ProfileData, Skill } from "./profile";
+import { classifyVacancy } from "./vacancy-classification";
 
 export type MatchFlag = "strong" | "possible" | "weak" | "not_suitable";
 
 export type Dimension = "technical" | "experience" | "seniority" | "language" | "location" | "salary";
+
+export type AnalysisCriterionKey =
+  | "technical"
+  | "testing_domain"
+  | "seniority"
+  | "industry"
+  | "location_authorisation"
+  | "language"
+  | "responsibilities"
+  | "mandatory";
+
+/** One explainable row of the stored assessment. */
+export type AnalysisCriterion = {
+  key: AnalysisCriterionKey;
+  label: string;
+  score: number;
+  weight: number;
+  evidence: string;
+  mandatory: boolean;
+};
 
 export type JobAnalysis = {
   score: number;
@@ -19,6 +40,17 @@ export type JobAnalysis = {
   yearsRequired: number | null;
   languages: string[];
   workPermitNote: string | null;
+  /** Eight-part explainable assessment; the weighted score above is unchanged. */
+  criteria: AnalysisCriterion[];
+  mandatoryBlockers: string[];
+  preferences: string[];
+  classification: {
+    category: string;
+    label: string;
+    isQa: boolean;
+    testingIntensity: number;
+    responsibilities: string[];
+  };
   engine: string;
   generatedAt: string;
 };
@@ -233,6 +265,7 @@ export function analyseJob(
   const description = htmlToText(job.description ?? "");
   const combined = `${job.title}\n${job.company}\n${job.location ?? ""}\n${description}${(job.tags ?? []).join(" ")}`;
   const lower = combined.toLowerCase();
+  const classification = classifyVacancy({ title: job.title, company: job.company, location: job.location, description });
 
   const matched = detectMatchedSkills(combined, profile);
   const allMissing = detectMissingSkills(combined, matched, profile);
@@ -335,6 +368,130 @@ export function analyseJob(
     workPermitNote = "Work authorisation is required but not recorded in the profile.";
   }
 
+  // Mandatory qualifications are stored separately from weighted preferences.
+  // They are never averaged into the score and can veto an otherwise high match.
+  const certificationEvidence = [
+    ...profile.items.filter((entry) => /cert/i.test(entry.kind)).map((entry) => entry.title),
+    ...profile.skills.map((entry) => entry.name),
+    ...profile.items.map((entry) => entry.detail ?? ""),
+  ]
+    .join(" ")
+    .toLowerCase();
+  const frenchLevel = profile.languageEntries.find((entry) => /french|français|francais/i.test(entry.name))?.level ?? null;
+  const mandatoryBlockers: string[] = [];
+  for (const requirement of classification.mandatory) {
+    if (requirement.kind === "language" && requirement.language === "German") {
+      mandatoryBlockers.push(`German${requirement.level ? ` ${requirement.level}` : ""} is mandatory and is not evidenced in the profile.`);
+    } else if (requirement.kind === "language" && requirement.language === "French") {
+      if (!/^(b2|c1|c2|native|fluent)$/i.test(frenchLevel ?? "")) {
+        mandatoryBlockers.push(`French${requirement.level ? ` ${requirement.level}` : ""} is mandatory; the profile does not evidence B2 or higher.`);
+      }
+    } else if (requirement.kind === "authorisation") {
+      mandatoryBlockers.push(requirement.detail);
+    } else if (requirement.kind === "certification") {
+      const name = requirement.detail.split(" is stated")[0].trim().toLowerCase();
+      if (name && !certificationEvidence.includes(name)) mandatoryBlockers.push(requirement.detail);
+    } else if (requirement.kind === "onsite" && !isSwiss) {
+      mandatoryBlockers.push(`${requirement.detail} The vacancy is outside Switzerland.`);
+    }
+  }
+
+  const industryPreference = (profile.preferences.industries ?? []).find((industry) =>
+    lower.includes(industry.toLowerCase()),
+  );
+  const fintech = FINTECH_SIGNALS.find((signal) => lower.includes(signal));
+  const industryScore = industryPreference ? 100 : fintech ? 85 : 70;
+  const responsibilitiesScore = classification.isQa
+    ? classification.category === "qa_leadership" || classification.category === "test_management"
+      ? /lead|manager|head|director/i.test(profile.profile.headline ?? "")
+        ? 95
+        : 65
+      : classification.category === "test_automation" || classification.category === "sdet_infrastructure"
+        ? /automation|sdet|test/i.test(`${profile.profile.headline ?? ""} ${profile.skills.map((entry) => entry.name).join(" ")}`)
+          ? 95
+          : 75
+        : 90
+    : 15;
+
+  const criteria: AnalysisCriterion[] = [
+    {
+      key: "technical",
+      label: "Technical skills match",
+      score: Math.round(technical * 100),
+      weight: WEIGHTS.technical,
+      evidence: matched.length
+        ? `Matched profile evidence: ${matched.join(", ")}.${missing.length ? ` Required/unverified gaps: ${missing.join(", ")}.` : ""}${preferred.length ? ` Optional technologies: ${preferred.join(", ")}.` : ""}`
+        : `No verified stack match found in the source text.${missing.length ? ` Required/unverified gaps: ${missing.slice(0, 5).join(", ")}.` : ""}`,
+      mandatory: false,
+    },
+    {
+      key: "testing_domain",
+      label: "Testing-domain match",
+      score: classification.isQa ? 100 : 15,
+      weight: 0,
+      evidence: `Classified as ${classification.label} with testing intensity ${Math.round(classification.testingIntensity * 100)}%.`,
+      mandatory: false,
+    },
+    {
+      key: "seniority",
+      label: "Seniority match",
+      score: Math.round(seniority * 100),
+      weight: WEIGHTS.seniority,
+      evidence: `The source title reads as ${seniorityLabel}; the profile headline is Senior QA Engineer.`,
+      mandatory: false,
+    },
+    {
+      key: "industry",
+      label: "Industry/domain relevance",
+      score: industryScore,
+      weight: 0,
+      evidence: industryPreference
+        ? `The posting matches the preferred industry "${industryPreference}".`
+        : fintech
+          ? `Financial-services context detected (${fintech}); no explicit industry preference is recorded.`
+          : "No preferred or financial-services domain signal was detected; treated as neutral.",
+      mandatory: false,
+    },
+    {
+      key: "location_authorisation",
+      label: "Location and work-authorisation compatibility",
+      score: Math.round(location * 100),
+      weight: WEIGHTS.location,
+      evidence: `${job.location ?? "Location not stated"}${remote ? " · remote" : ""}. ${workPermitNote ?? (isSwiss ? "Swiss location; no permit restriction detected." : "Location needs manual review.")}`,
+      mandatory: false,
+    },
+    {
+      key: "language",
+      label: "Language compatibility",
+      score: Math.round(language * 100),
+      weight: WEIGHTS.language,
+      evidence: [
+        english.required ? `English${english.level ? ` ${english.level}` : ""} is required and is recorded in the profile.` : "No mandatory English requirement was detected.",
+        german.required ? `German${german.level ? ` ${german.level}` : ""} is required and is not evidenced in the profile.` : "German is not stated as mandatory.",
+        french.required ? `French${french.level ? ` ${french.level}` : ""} is requested; confirm your level.` : "French is not stated as mandatory.",
+      ].join(" "),
+      mandatory: false,
+    },
+    {
+      key: "responsibilities",
+      label: "Responsibilities match",
+      score: responsibilitiesScore,
+      weight: 0,
+      evidence: classification.responsibilities[0]
+        ? `The posting assigns: "${classification.responsibilities[0]}". Profile headline: ${profile.profile.headline ?? "not recorded"}.`
+        : `The posting states no explicit testing responsibility; classification is ${classification.label}.`,
+      mandatory: false,
+    },
+    {
+      key: "mandatory",
+      label: "Missing mandatory qualifications",
+      score: mandatoryBlockers.length === 0 ? 100 : 0,
+      weight: 0,
+      evidence: mandatoryBlockers.length > 0 ? mandatoryBlockers.join(" ") : "No mandatory qualification gap was detected.",
+      mandatory: true,
+    },
+  ];
+
   const breakdown: Record<Dimension, number> = { technical, experience, seniority, language, location, salary };
   const score = Math.round(
     (Object.keys(WEIGHTS) as Dimension[]).reduce((total, key) => total + breakdown[key] * WEIGHTS[key], 0),
@@ -389,9 +546,58 @@ export function analyseJob(
     yearsRequired,
     languages,
     workPermitNote,
-    engine: "at-rules-v2",
+    criteria,
+    mandatoryBlockers,
+    preferences: classification.preferences,
+    classification: {
+      category: classification.category,
+      label: classification.label,
+      isQa: classification.isQa,
+      testingIntensity: classification.testingIntensity,
+      responsibilities: classification.responsibilities,
+    },
+    engine: "at-rules-v3",
     generatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Automatic submission is limited to vacancies at or above this threshold. The
+ * value is never lowered at runtime to reach a daily target: a run that finds
+ * fewer qualifying vacancies submits fewer applications and says so.
+ */
+export const QUALIFYING_MATCH_SCORE = 85;
+
+/**
+ * The single effective threshold used by the scoring engine and by every UI
+ * surface. A stored value below the floor is clamped up, never honoured, so the
+ * dashboard cannot display a number the engine would not apply.
+ */
+export function effectiveMinMatchScore(configured: unknown, floor: number = QUALIFYING_MATCH_SCORE): number {
+  const value = Number(configured);
+  if (!Number.isFinite(value)) return floor;
+  return Math.min(100, Math.max(floor, Math.round(value)));
+}
+
+/**
+ * Hard blockers that a numeric score must never override. These mirror the
+ * eligibility rules: a mandatory German requirement cannot be applied around,
+ * and a citizenship-only posting is not an application the candidate can make.
+ */
+export function autoApplyBlockers(analysis: { score: number; concerns?: string[] }): string[] {
+  const blockers: string[] = [];
+  if (analysis.score < QUALIFYING_MATCH_SCORE) {
+    blockers.push(`Match score ${analysis.score}% is below the ${QUALIFYING_MATCH_SCORE}% threshold.`);
+  }
+  for (const concern of analysis.concerns ?? []) {
+    if (/German(?:\s+[A-C][12])?[^.]*required/i.test(concern)) blockers.push(concern);
+    if (/citizenship or sponsorship restriction/i.test(concern)) blockers.push(concern);
+  }
+  return blockers;
+}
+
+export function qualifiesForAutoApply(analysis: { score: number; concerns?: string[] }): boolean {
+  return autoApplyBlockers(analysis).length === 0;
 }
 
 export function flagLabel(flag: string | null | undefined): string {
