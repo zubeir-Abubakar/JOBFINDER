@@ -83,6 +83,7 @@ export async function testProvidersAction(): Promise<void> {
   try {
     const result = await generateText({
       agentKey: "coordinator",
+      source: "admin_test",
       system: "You are a health-check endpoint. Reply with the single word OK.",
       prompt: "Health check. Reply OK.",
       maxTokens: 12,

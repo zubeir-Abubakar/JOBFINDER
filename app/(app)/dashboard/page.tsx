@@ -6,13 +6,18 @@ import { jobPipeline } from "@/lib/jobs";
 import { getSetting } from "@/lib/settings";
 import { unreadNotifications } from "@/lib/notify";
 import { cleanupExpiredDocuments } from "@/lib/retention";
-import { PageHead, Stat, Empty, Flash, Progress } from "@/components/ui";
+import { PageHead, HeroStat, Stat, Empty, Flash, Progress } from "@/components/ui";
 import { relativeTime, formatDateTime, formatDate, param } from "@/lib/format";
 import { pauseAllAction, resumeAllAction, startWorkflowAction } from "@/lib/actions/agents";
 import { SubmitButton } from "@/components/SubmitButton";
 import { Icon } from "@/components/icons";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
 import { agentAvailability, effectiveAgentStatus } from "@/lib/agent-availability";
+import { taskExecutionMeta } from "@/lib/agent-status";
+import { freeLlmPolicyIssue, providerHealth } from "@/lib/providers";
+import { WorkflowFlow } from "@/components/WorkflowFlow";
+import { AiQueuePanel } from "@/components/AiQueuePanel";
+import { activeWorkflow } from "@/lib/workflow";
 
 export const dynamic = "force-dynamic";
 
@@ -38,6 +43,7 @@ export default async function DashboardPage({
     total: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs")?.c ?? 0,
     analysed: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NOT NULL")?.c ?? 0,
     suitable: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_flag IN ('strong','possible')")?.c ?? 0,
+    strong: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_flag = 'strong'")?.c ?? 0,
   };
   const docTotals = {
     cv: one<{ c: number }>("SELECT COUNT(*) AS c FROM documents WHERE kind = 'tailored_cv' AND deleted_at IS NULL")?.c ?? 0,
@@ -51,8 +57,20 @@ export default async function DashboardPage({
     pending: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('submitted','acknowledged')")?.c ?? 0,
   };
 
-  const agents = all<{ key: string; name: string; role: string; status: string; current_task: string | null; last_run_at: string | null; run_count: number; failure_count: number; enabled: number }>(
-    "SELECT key, name, role, status, current_task, last_run_at, run_count, failure_count, enabled FROM agents ORDER BY sort",
+  const agents = all<{
+    key: string;
+    name: string;
+    role: string;
+    status: string;
+    current_task: string | null;
+    last_run_at: string | null;
+    run_count: number;
+    failure_count: number;
+    ai_success_count: number;
+    ai_failure_count: number;
+    enabled: number;
+  }>(
+    "SELECT key, name, role, status, current_task, last_run_at, run_count, failure_count, ai_success_count, ai_failure_count, enabled FROM agents ORDER BY sort",
   );
   const activity = all<{ action: string; detail: string | null; created_at: string; actor: string | null }>(
     "SELECT action, detail, created_at, actor FROM audit_logs ORDER BY id DESC LIMIT 10",
@@ -65,6 +83,22 @@ export default async function DashboardPage({
     "SELECT label, status, summary, finished_at FROM workflows ORDER BY created_at DESC LIMIT 1",
   );
   const paused = agents.filter((a) => a.status === "paused").length;
+  const active = activeWorkflow();
+  const health = await providerHealth();
+  const gateway = health.find((item) => item.name === "freellmapi");
+  const policyIssue = freeLlmPolicyIssue();
+  const lastAi = all<{ ai_outcome: string | null; provider: string | null; model: string | null; created_at: string }>(
+    "SELECT ai_outcome, provider, model, created_at FROM tasks WHERE execution_mode = 'ai' ORDER BY created_at DESC LIMIT 1",
+  )[0] ?? null;
+  const lastTasks = all<{ agent_key: string; execution_mode: string | null; ai_outcome: string | null; provider: string | null; model: string | null }>(
+    "SELECT agent_key, execution_mode, ai_outcome, provider, model FROM tasks ORDER BY created_at DESC LIMIT 80",
+  );
+  const lastExecution = new Map<string, { execution_mode: string | null; ai_outcome: string | null; provider: string | null; model: string | null }>();
+  for (const task of lastTasks) if (!lastExecution.has(task.agent_key)) lastExecution.set(task.agent_key, task);
+  const aiTotals = agents.reduce(
+    (total, agent) => ({ ok: total.ok + agent.ai_success_count, failed: total.failed + agent.ai_failure_count }),
+    { ok: 0, failed: 0 },
+  );
 
   return (
     <>
@@ -88,16 +122,48 @@ export default async function DashboardPage({
         }
       />
 
-      <section className="stats mb-4">
-        <Stat href="/jobs#vacancies" label="Jobs discovered" value={jobTotals.total} note={`${pipeline.new} awaiting analysis`} />
+      <section className="kpi-hero" aria-label="Primary recruitment metrics">
+        <HeroStat
+          href="/jobs#vacancies"
+          label="Jobs discovered"
+          value={jobTotals.total}
+          note={`${pipeline.new} waiting for analysis`}
+          icon="jobs"
+          tone="cyan"
+        />
+        <HeroStat
+          href="/jobs?flag=strong&sort=score#vacancies"
+          label="Strong matches"
+          value={jobTotals.strong}
+          note={`${jobTotals.suitable} suitable across ${jobTotals.analysed} analysed`}
+          icon="target"
+          tone="accent"
+        />
+        <HeroStat
+          href="/applications?group=interviews#applications"
+          label="Interviews"
+          value={appTotals.interviews}
+          note="Invited or completed"
+          icon="users"
+          tone="violet"
+        />
+        <HeroStat
+          href="/applications?status=awaiting_approval#applications"
+          label="Awaiting approval"
+          value={appTotals.awaiting}
+          note={appTotals.awaiting ? "Review before anything is sent" : "Nothing needs your review"}
+          icon="shield"
+          tone="amber"
+        />
+      </section>
+
+      <section className="stats stats-secondary mb-4" aria-label="Supporting recruitment metrics">
         <Stat href="/jobs?analysed=1&sort=score#vacancies" label="Jobs analysed" value={jobTotals.analysed} note={`${jobTotals.suitable} suitable`} />
-        <Stat href="/documents?kind=tailored_cv#tailored-documents" label="CVs generated" value={docTotals.cv} note="Tailored, per vacancy" />
+        <Stat href="/documents?kind=tailored_cv#tailored-documents" label="CVs generated" value={docTotals.cv} note="Tailored per vacancy" />
         <Stat href="/documents?kind=cover_letter#tailored-documents" label="Cover letters" value={docTotals.cover} note="Generated" />
         <Stat href="/applications?group=sent#applications" label="Applications sent" value={appTotals.submitted} note="Confirmed submissions" tone="good" />
-        <Stat href="/applications?status=awaiting_approval#applications" label="Awaiting approval" value={appTotals.awaiting} note="Needs your review" tone={appTotals.awaiting ? "warn" : undefined} />
-        <Stat href="/applications?group=pending#applications" label="Awaiting response" value={appTotals.pending} note="Submitted, no reply yet" />
-        <Stat href="/applications?group=interviews#applications" label="Interviews" value={appTotals.interviews} note="Invited or completed" tone={appTotals.interviews ? "good" : undefined} />
-        <Stat href="/applications?status=rejected#applications" label="Rejected" value={appTotals.rejected} note="Employer rejections" tone={appTotals.rejected ? "bad" : undefined} />
+        <Stat href="/applications?group=pending#applications" label="Awaiting response" value={appTotals.pending} note="No reply yet" />
+        <Stat href="/applications?status=rejected#applications" label="Rejected" value={appTotals.rejected} note="Employer decisions" tone={appTotals.rejected ? "bad" : undefined} />
         <Stat href="/profile" label="Profile complete" value={`${completeness}%`} note={completeness < 100 ? "Finish your profile" : "Verified profile"} tone={completeness >= 80 ? "good" : "warn"} />
       </section>
 
@@ -122,7 +188,7 @@ export default async function DashboardPage({
             {[
               ["New opportunities", pipeline.new],
               ["Under analysis", pipeline.analysing],
-              ["Strong matches", jobTotals.suitable],
+              ["Strong matches", jobTotals.strong],
               ["Documents prepared", pipeline.documents],
               ["Awaiting approval", pipeline.awaiting],
               ["Submitted", pipeline.submitted],
@@ -138,14 +204,78 @@ export default async function DashboardPage({
         </div>
       </section>
 
+      <WorkflowFlow />
+
+      <details className="card system-details mb-4" id="system-health">
+        <summary className="system-details-summary">
+          <span className="system-details-mark"><Icon name="settings" size={16} /></span>
+          <span className="system-details-copy">
+            <span className="system-details-title">System health &amp; AI gateway</span>
+            <span className="system-details-sub">Inference route, queue telemetry and model policy. Kept out of the main workflow view.</span>
+          </span>
+          <span className={`badge ${gateway?.available ? "badge-good" : gateway?.configured ? "badge-bad" : "badge-warn"}`}>
+            {gateway?.available ? "connected" : gateway?.configured ? "unreachable" : "not configured"}
+          </span>
+          <span className="system-details-chevron" aria-hidden="true"><Icon name="chevron" size={15} /></span>
+        </summary>
+        <div className="system-details-body">
+          <section className="card system-inner">
+            <div className="card-head">
+              <div>
+                <h2>AI gateway</h2>
+                <p className="card-sub">FreeLLMAPI is the primary and only permitted inference path. There is no fallback provider.</p>
+              </div>
+              <span className={`badge ${gateway?.available ? "badge-good" : gateway?.configured ? "badge-bad" : "badge-warn"}`}>
+                {gateway?.available ? "connected" : gateway?.configured ? "unreachable" : "not configured"}
+              </span>
+            </div>
+            <div className="card-body grid g2" style={{ gap: 12 }}>
+              <div className="stack" style={{ gap: 6 }}>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Primary gateway</span><span>FreeLLMAPI</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Model policy</span><span className="num">{gateway?.model ?? "—"}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Latency</span><span className="num">{gateway?.latencyMs == null ? "—" : `${gateway.latencyMs} ms`}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Catalogue</span><span className="num">{gateway?.models.length ?? 0} models</span></div>
+              </div>
+              <div className="stack" style={{ gap: 6 }}>
+                <div className="between text-[12px]">
+                  <span style={{ color: "var(--muted)" }}>Model policy</span>
+                  <span className={`badge ${policyIssue ? "badge-bad" : "badge-good"}`}>{policyIssue ? "blocked" : "permitted"}</span>
+                </div>
+                <div className="between text-[12px]">
+                  <span style={{ color: "var(--muted)" }}>Upstream pricing</span>
+                  <span className="badge badge-warn">unverified</span>
+                </div>
+                <div className="between text-[12px]">
+                  <span style={{ color: "var(--muted)" }}>Last AI attempt</span>
+                  <span>{lastAi ? `${lastAi.ai_outcome === "ok" ? "succeeded" : "failed"} · ${lastAi.provider ?? "—"}` : "none yet"}</span>
+                </div>
+                <div className="text-[11.5px] leading-relaxed" style={{ color: gateway?.available ? "var(--muted)" : "var(--danger)" }}>
+                  {gateway?.detail ?? "No health result yet."}
+                </div>
+                {policyIssue ? <div className="text-[11px] leading-relaxed" style={{ color: "var(--danger)" }}>{policyIssue}</div> : null}
+                <div className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+                  Fallback: none — Gemini, OpenRouter and Ollama are disabled by configuration. AI-backed task successes: {aiTotals.ok}
+                  {aiTotals.failed ? ` · failed model calls: ${aiTotals.failed}` : ""}.
+                </div>
+              </div>
+            </div>
+          </section>
+          <AiQueuePanel embedded />
+        </div>
+      </details>
+
       <div className="split mb-4">
         <section className="card">
           <div className="card-head">
             <div>
               <h2>Agent activity</h2>
               <p className="card-sub">
-                {paused > 0 ? `${paused} agent(s) paused` : "Coordinator and specialists"} ·{" "}
-                {workflow ? `Last workflow: ${workflow.status} ${workflow.finished_at ? relativeTime(workflow.finished_at) : ""}` : "No workflow has run yet"}
+                {active
+                  ? `Live workflow: ${active.label}`
+                  : workflow
+                    ? `No workflow is running · last run ${workflow.status} ${workflow.finished_at ? relativeTime(workflow.finished_at) : ""} (historical)`
+                    : "No workflow has run yet"}
+                {paused > 0 ? ` · ${paused} agent(s) paused` : ""}
               </p>
             </div>
             <div className="row">
@@ -161,6 +291,7 @@ export default async function DashboardPage({
             {agents.map((agent) => {
               const availability = agentAvailability(agent.key);
               const displayStatus = effectiveAgentStatus(agent.status, agent.enabled === 1, availability);
+              const exec = taskExecutionMeta(lastExecution.get(agent.key) ?? {});
               return (
                 <div key={agent.key} className="agent-card">
                   <div className="between" style={{ alignItems: "flex-start", gap: 10 }}>
@@ -174,13 +305,26 @@ export default async function DashboardPage({
                     <AgentStatusBadge status={displayStatus} enabled={agent.enabled === 1} />
                   </div>
                   <div className="desc">{agent.current_task ?? (displayStatus === "idle" ? "Idle — ready for a task" : agent.role)}</div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className={`badge ${exec.tone}`} title={exec.detail} style={{ fontSize: 9.5 }}>
+                      {exec.label}
+                    </span>
+                    {!active ? (
+                      <span className="badge badge-neutral" title="No workflow is running; this is the last recorded state." style={{ fontSize: 9.5 }}>
+                        historical
+                      </span>
+                    ) : null}
+                  </div>
                   {!availability.available ? (
                     <div className="text-[10.5px] leading-relaxed" style={{ color: "var(--danger)" }}>
                       {availability.dependency}: {availability.reason}
                     </div>
                   ) : null}
                   <div className="flex items-center justify-between text-[11px]" style={{ color: "var(--muted)" }}>
-                    <span>{agent.run_count} runs{agent.failure_count ? ` · ${agent.failure_count} failed` : ""}</span>
+                    <span>
+                      {agent.run_count} tasks{agent.failure_count ? ` · ${agent.failure_count} failed` : ""} · AI calls {agent.ai_success_count} ok
+                      {agent.ai_failure_count ? ` / ${agent.ai_failure_count} failed` : ""}
+                    </span>
                     <span>{relativeTime(agent.last_run_at)}</span>
                   </div>
                 </div>

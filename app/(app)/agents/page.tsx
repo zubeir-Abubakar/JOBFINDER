@@ -17,11 +17,12 @@ import {
 import { SubmitButton } from "@/components/SubmitButton";
 import { Icon } from "@/components/icons";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
-import { AutoRefresh } from "@/components/AutoRefresh";
+import { WorkflowFlow } from "@/components/WorkflowFlow";
 import { activeWorkflow, latestPausedWorkflow, recoverInterruptedRuns } from "@/lib/workflow";
-import { statusMeta } from "@/lib/agent-status";
+import { statusMeta, taskExecutionMeta } from "@/lib/agent-status";
 import { agentIdentity } from "@/lib/agent-identity";
 import { agentAvailability, effectiveAgentStatus } from "@/lib/agent-availability";
+import { providerHealth } from "@/lib/providers";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +38,8 @@ type AgentRow = {
   run_count: number;
   success_count: number;
   failure_count: number;
+  ai_success_count?: number;
+  ai_failure_count?: number;
 };
 type TaskRow = {
   id: string;
@@ -50,6 +53,8 @@ type TaskRow = {
   model: string | null;
   created_at: string;
   finished_at: string | null;
+  execution_mode: string | null;
+  ai_outcome: string | null;
 };
 type WorkflowRow = {
   id: string;
@@ -73,7 +78,7 @@ export default async function AgentsPage({
   const focus = param(sp.agent);
   const agents = all<AgentRow>("SELECT * FROM agents ORDER BY sort");
   const tasks = all<TaskRow>(
-    "SELECT id, workflow_id, agent_key, title, status, output, error, provider, model, created_at, finished_at FROM tasks ORDER BY created_at DESC LIMIT 80",
+    "SELECT id, workflow_id, agent_key, title, status, output, error, provider, model, created_at, finished_at, execution_mode, ai_outcome FROM tasks ORDER BY created_at DESC LIMIT 80",
   );
   const workflows = all<WorkflowRow>(
     "SELECT id, kind, label, status, summary, error, created_at, finished_at FROM workflows ORDER BY created_at DESC LIMIT 10",
@@ -82,6 +87,8 @@ export default async function AgentsPage({
   for (const task of tasks) if (!latestByAgent.has(task.agent_key)) latestByAgent.set(task.agent_key, task);
   const active = activeWorkflow();
   const paused = latestPausedWorkflow();
+  const health = await providerHealth();
+  const gateway = health.find((item) => item.name === "freellmapi");
   const pending = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NULL")?.c ?? 0;
   const filteredTasks = focus ? tasks.filter((task) => task.agent_key === focus) : tasks.slice(0, 30);
   const focusedAgent = focus ? agents.find((agent) => agent.key === focus) : null;
@@ -97,7 +104,7 @@ export default async function AgentsPage({
   return (
     <>
       <Flash ok={param(sp.ok)} error={param(sp.error)} />
-      <AutoRefresh active={anyActive} />
+      <WorkflowFlow autoFocus={Boolean(param(sp.ok) || param(sp.error))} />
       <PageHead
         title="AI agents"
         sub="One coordinator, seven specialists. Execution is sequential and runs in the background, so the dashboard stays responsive."
@@ -131,7 +138,13 @@ export default async function AgentsPage({
         ) : (
           <>All agents are idle. “Start all agents” runs research → analysis → CV → ATS → cover letter → application preparation → inbox tracking.</>
         )}{" "}
-        {pending > 0 ? `${pending} vacancy(ies) still need analysis. ` : ""}Provider order: Gemini → OpenRouter free → Ollama. Spending limit CHF 0.
+        {pending > 0 ? `${pending} vacancy(ies) still need analysis. ` : ""}
+        {gateway?.available
+          ? `AI gateway: FreeLLMAPI connected (${gateway.model}).`
+          : gateway?.configured
+            ? `AI gateway: FreeLLMAPI configured but unreachable — ${gateway.detail}`
+            : "AI gateway: FreeLLMAPI is not configured."}{" "}
+        No fallback provider is permitted. Spending limit CHF 0.
       </div>
 
       <section className="card mb-4">
@@ -178,7 +191,10 @@ export default async function AgentsPage({
                   <strong>{relativeTime(agent.last_run_at)}</strong>
                 </div>
                 <div className="flex items-center justify-between text-[11px]" style={{ color: "var(--muted)" }}>
-                  <span className="num">{agent.run_count} runs · {agent.success_count} ok · {agent.failure_count} failed</span>
+                  <span className="num">
+                    {agent.run_count} tasks · {agent.success_count} ok · {agent.failure_count} failed · AI calls {agent.ai_success_count ?? 0} ok
+                    {agent.ai_failure_count ? ` / ${agent.ai_failure_count} failed` : ""}
+                  </span>
                   <Link href={`/agents?agent=${agent.key}#activity`} className="btn btn-sm">Activity</Link>
                 </div>
               </div>
@@ -204,7 +220,7 @@ export default async function AgentsPage({
             ) : (
               <table className="data">
                 <thead>
-                  <tr><th>Task</th><th>Agent</th><th>Status</th><th>Result</th><th>When</th></tr>
+                  <tr><th>Task</th><th>Agent</th><th>Status</th><th>Execution</th><th>Result</th><th>When</th></tr>
                 </thead>
                 <tbody>
                   {filteredTasks.map((task) => (
@@ -220,6 +236,11 @@ export default async function AgentsPage({
                         </div>
                       </td>
                       <td><span className={`badge ${task.status === "completed" ? "badge-good" : task.status === "failed" ? "badge-bad" : task.status === "running" || task.status === "working" ? "badge-info" : "badge-neutral"}`}>{task.status}</span></td>
+                      <td>
+                        <span className={`badge ${taskExecutionMeta(task).tone}`} title={taskExecutionMeta(task).detail}>
+                          {taskExecutionMeta(task).label}
+                        </span>
+                      </td>
                       <td className="cell-sub" style={{ maxWidth: 300 }}>{task.error ?? task.output ?? "—"}</td>
                       <td className="cell-sub">{formatDateTime(task.created_at)}</td>
                     </tr>

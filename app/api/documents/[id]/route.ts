@@ -3,7 +3,7 @@ import path from "node:path";
 import { currentUser } from "@/lib/auth";
 import { one, UPLOAD_DIR } from "@/lib/db";
 
-export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) {
+export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const user = await currentUser();
   if (!user) return new Response("Unauthorised", { status: 401 });
   const { id } = await context.params;
@@ -20,7 +20,7 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     return new Response(new Uint8Array(bytes), {
       headers: {
         "Content-Type": doc.mime || "application/octet-stream",
-        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`,
+        "Content-Disposition": `${new URL(request.url).searchParams.get("inline") === "1" ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`,
         "Cache-Control": "private, no-store",
       },
     });

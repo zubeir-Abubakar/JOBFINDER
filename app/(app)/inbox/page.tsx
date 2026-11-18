@@ -136,7 +136,17 @@ export default async function InboxPage({
                       <div className="cell-title">{message.subject}</div>
                       <div className="cell-sub">{message.sender ?? "unknown sender"} · {message.received_at ? relativeTime(message.received_at) : "unknown date"}</div>
                     </div>
-                    <span className={`badge ${category.badge}`}>{category.label}</span>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className={`badge ${category.badge}`}>{category.label}</span>
+                      {message.ai_category ? (
+                        <span
+                          className="badge badge-neutral"
+                          title="Advisory only. Application status changes use the deterministic rules, never the model label."
+                        >
+                          AI: {CATEGORY[message.ai_category]?.label ?? message.ai_category}
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
                   <p className="text-[12px] leading-relaxed" style={{ color: "var(--muted)" }}>{message.snippet}</p>
                   {message.application_id ? (

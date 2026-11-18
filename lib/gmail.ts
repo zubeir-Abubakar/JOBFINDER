@@ -4,6 +4,8 @@ import { setSetting } from "./settings";
 import { randomId } from "./security";
 import { notify } from "./notify";
 import { GMAIL_IDENTITY_SCOPES, REQUIRED_GMAIL_SCOPES, gmailApiError, missingGrantedScopes, parseGmailProfile } from "./gmail-profile";
+import { generateText, type AiCallSource } from "./providers";
+import { enqueueAiJob, isQueueableAiError } from "./ai-queue";
 
 /**
  * Gmail OAuth and mailbox integration.
@@ -274,7 +276,83 @@ function matchApplication(subject: string, body: string): { id: string; company:
   return rows.find((row) => row.company && row.company.length > 2 && haystack.includes(row.company.toLowerCase())) ?? null;
 }
 
-export async function syncInbox(limit = 20) {
+const AI_CATEGORIES = new Set([
+  "interview_invitation",
+  "rejection",
+  "recruiter_question",
+  "acknowledgement",
+  "unrelated",
+]);
+
+/** Bounded per sync so a mailbox scan cannot turn into an unbounded AI run. */
+const AI_CLASSIFY_LIMIT = 3;
+
+type InboxContext = {
+  workflowId?: string | null;
+  taskId?: string | null;
+  source?: Exclude<AiCallSource, "legacy">;
+};
+
+/**
+ * Advisory classification. It never changes `email_messages.category` and is
+ * never read by the status-update rules below; those remain deterministic.
+ */
+async function classifyWithAi(
+  subject: string,
+  body: string,
+  messageRowId: string,
+  gmailId: string,
+  context: InboxContext,
+): Promise<{ category: string | null; provider: string | null; model: string | null; queued?: boolean }> {
+  try {
+    const result = await generateText({
+      agentKey: "email",
+      workflowId: context.workflowId ?? null,
+      taskId: context.taskId ?? null,
+      source: context.source ?? (context.taskId ? "task" : "manual"),
+      system:
+        "You classify recruitment email. Reply with exactly one label and nothing else: interview_invitation, rejection, recruiter_question, acknowledgement, or unrelated. Never guess when the message is ambiguous; use unrelated.",
+      prompt: `Subject: ${subject.slice(0, 300)}\n\nMessage: ${body.slice(0, 1200)}`,
+      maxTokens: 8,
+      temperature: 0,
+    });
+    const label = result.text.toLowerCase().replace(/[^a-z_]/g, "").trim();
+    return {
+      category: AI_CATEGORIES.has(label) ? label : null,
+      provider: result.provider,
+      model: result.model,
+    };
+  } catch (error) {
+    // A rate-limited advisory classification is queued, never discarded. The
+    // deterministic category and every application status change already ran.
+    if (isQueueableAiError(error)) {
+      try {
+        enqueueAiJob({
+          kind: "email_classification",
+          dedupeKey: `email:${gmailId}`,
+          agentKey: "email",
+          workflowId: context.workflowId ?? null,
+          taskId: context.taskId ?? null,
+          source: context.source === "task" || context.taskId ? "task" : "manual",
+          priority: 2,
+          payload: {
+            messageId: messageRowId,
+            subject: subject.slice(0, 300),
+            body: body.slice(0, 1200),
+          },
+        });
+        return { category: null, provider: null, model: null, queued: true };
+      } catch {
+        // Fall through to the normal non-blocking failure below.
+      }
+    }
+    // A failed advisory classification is recorded by the provider layer and
+    // must not break the mailbox sync.
+    return { category: null, provider: null, model: null };
+  }
+}
+
+export async function syncInbox(limit = 20, context: InboxContext = {}) {
   const account = one<GmailAccount>("SELECT * FROM gmail_accounts WHERE id = 1");
   if (!account) throw new Error("Gmail is not connected.");
   const list = await gmailFetch<{ messages?: Array<{ id: string }> }>(
@@ -283,6 +361,13 @@ export async function syncInbox(limit = 20) {
   let inserted = 0;
   let matched = 0;
   let drafts = 0;
+  let aiChecked = 0;
+  let aiClassified = 0;
+  let aiQueued = 0;
+  let aiFailed = 0;
+  let aiProvider: string | null = null;
+  let aiModel: string | null = null;
+  const aiCandidates: Array<{ id: string; gmailId: string; subject: string; body: string }> = [];
   for (const item of list.messages ?? []) {
     const message = await gmailFetch<GmailMessage>(`/messages/${item.id}?format=full`);
     const sender = header(message.payload, "From");
@@ -300,11 +385,12 @@ export async function syncInbox(limit = 20) {
         existing.id,
       ]);
     } else {
+      const messageRowId = `mail_${randomId()}`;
       run(
         `INSERT INTO email_messages (id, gmail_id, thread_id, application_id, sender, subject, snippet, category, body_text, received_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
-          `mail_${randomId()}`,
+          messageRowId,
           message.id,
           message.threadId ?? null,
           application?.id ?? null,
@@ -318,6 +404,9 @@ export async function syncInbox(limit = 20) {
         ],
       );
       inserted += 1;
+      // Classification is deferred until every deterministic status update has
+      // been applied, so an AI timeout can never delay a status change.
+      aiCandidates.push({ id: messageRowId, gmailId: message.id, subject, body });
     }
     if (application) {
       matched += 1;
@@ -335,8 +424,38 @@ export async function syncInbox(limit = 20) {
       drafts += 1;
     }
   }
+  // Advisory review of new mail, capped per sync and run only after the
+  // deterministic category has already driven every status update.
+  for (const candidate of aiCandidates.slice(0, AI_CLASSIFY_LIMIT)) {
+    aiChecked += 1;
+    const advisory = await classifyWithAi(candidate.subject, candidate.body, candidate.id, candidate.gmailId, context);
+    aiProvider = advisory.provider ?? aiProvider;
+    aiModel = advisory.model ?? aiModel;
+    if (advisory.category) {
+      run("UPDATE email_messages SET ai_category = ?, ai_classified_at = ? WHERE id = ?", [
+        advisory.category,
+        nowIso(),
+        candidate.id,
+      ]);
+      aiClassified += 1;
+    } else if (advisory.queued) {
+      aiQueued += 1;
+    } else {
+      aiFailed += 1;
+    }
+  }
+
+  // The email task is marked AI-assisted only when an advisory call actually
+  // ran inline. Queued work marks the same task when it completes.
+  const aiExecuted = aiClassified + aiFailed;
+  if (context.taskId && aiExecuted > 0) {
+    run(
+      "UPDATE tasks SET execution_mode = 'ai', ai_outcome = ?, provider = COALESCE(?, provider), model = COALESCE(?, model), attempts = attempts + ? WHERE id = ?",
+      [aiClassified > 0 ? "ok" : "failed", aiProvider, aiModel, aiExecuted, context.taskId],
+    );
+  }
   run("UPDATE gmail_accounts SET last_sync_at = ? WHERE id = 1", [nowIso()]);
-  return { inserted, matched, drafts, scanned: list.messages?.length ?? 0 };
+  return { inserted, matched, drafts, scanned: list.messages?.length ?? 0, aiChecked, aiClassified, aiQueued, aiFailed };
 }
 
 export function inboxMessages(limit = 40) {
@@ -346,13 +465,14 @@ export function inboxMessages(limit = 40) {
     subject: string;
     snippet: string;
     category: string;
+    ai_category: string | null;
     application_id: string | null;
     draft_id: string | null;
     draft_body: string | null;
     draft_status: string;
     received_at: string | null;
   }>(
-    `SELECT id, sender, subject, snippet, category, application_id, draft_id, draft_body, draft_status, received_at
+    `SELECT id, sender, subject, snippet, category, ai_category, application_id, draft_id, draft_body, draft_status, received_at
      FROM email_messages ORDER BY received_at DESC LIMIT ?`,
     [limit],
   );

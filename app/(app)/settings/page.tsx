@@ -17,8 +17,11 @@ import {
   saveDocumentSettingsAction,
   saveNotificationSettingsAction,
   clearExpiredDocumentsAction,
+  cleanTempCacheAction,
   testEmailAction,
 } from "@/lib/actions/settings";
+import { tempStorageStats } from "@/lib/temp-store";
+import { relativeTime } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 
@@ -36,6 +39,7 @@ export default async function SettingsPage({
   const security = settings.security ?? { session_days: 7, remember_days: 30, max_login_attempts: 8 };
   const emailConfig = settings.email ?? { connected: false, provider: "gmail", sender: "", account: "" };
   const stats = storageStats();
+  const cache = tempStorageStats();
   const account = one<{ created_at: string; last_login_at: string | null }>("SELECT created_at, last_login_at FROM users WHERE id = ?", [user.id]);
   const sessions = countSessions(user.id);
   const avatarUrl = avatarUrlFor(user);
@@ -59,10 +63,39 @@ export default async function SettingsPage({
         <a className="tab active" href="#professional">Professional</a>
         <a className="tab" href="#automation">Automation</a>
         <a className="tab" href="#documents">Documents</a>
+        <a className="tab" href="#cache">Cache</a>
         <a className="tab" href="#notifications">Notifications</a>
         <a className="tab" href="#account">Account</a>
         <a className="tab" href="#security">Security</a>
       </div>
+
+      <section className="card mb-4" id="cache">
+        <div className="card-head">
+          <div>
+            <h2>Temporary cache</h2>
+            <p className="card-sub">Registered temporary objects only. Permanent documents, the original CV, uploads and workflow history are never eligible.</p>
+          </div>
+          <span className="badge badge-neutral">{formatBytes(cache.activeBytes)}</span>
+        </div>
+        <div className="card-body">
+          <div className="grid g2" style={{ gap: 10 }}>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Temporary objects</span><span className="num">{cache.activeCount}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Spoken audio cache</span><span className="num">{formatBytes(cache.ttsBytes)}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Transcripts</span><span className="num">{formatBytes(cache.transcriptBytes)}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Preview artefacts</span><span className="num">{formatBytes(cache.previewBytes)}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Temporary uploads</span><span className="num">{formatBytes(cache.uploadBytes)}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Last cleanup</span><span>{cache.lastCleanupAt ? relativeTime(cache.lastCleanupAt) : "not run yet"}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Next scheduled cleanup</span><span>{cache.nextCleanupAt ? relativeTime(cache.nextCleanupAt).replace(" ago", "") : "disabled"}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Last reclaimed</span><span>{cache.lastRemoved} file(s) · {formatBytes(cache.lastBytes)}</span></div>
+          </div>
+          <form action={cleanTempCacheAction} className="mt-3">
+            <SubmitButton className="btn" confirm="Delete expired temporary cache entries now? Permanent CVs, cover letters and records are not touched.">
+              Clean temporary cache now
+            </SubmitButton>
+          </form>
+          <p className="hint">Default retention is 24 hours, cleaned at startup and every 6 hours. Only rows in the temp-object registry inside ./data/temp are removed.</p>
+        </div>
+      </section>
 
       <section className="card mb-4" id="professional">
         <div className="card-head">

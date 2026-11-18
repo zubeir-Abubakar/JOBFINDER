@@ -62,6 +62,42 @@ export function Stat({
   return <div className="stat">{body}</div>;
 }
 
+export function HeroStat({
+  label,
+  value,
+  note,
+  href,
+  icon,
+  tone = "accent",
+}: {
+  label: string;
+  value: number | string;
+  note?: string;
+  href?: string;
+  icon: string;
+  tone?: "accent" | "cyan" | "violet" | "amber";
+}) {
+  const body = (
+    <>
+      <div className="kpi-top">
+        <span className={`kpi-icon kpi-icon-${tone}`}><Icon name={icon} size={17} /></span>
+        <span className="kpi-open" aria-hidden="true"><Icon name="arrow" size={14} /></span>
+      </div>
+      <div className="kpi-value num">{value}</div>
+      <div className="kpi-label">{label}</div>
+      {note ? <div className="kpi-note">{note}</div> : null}
+    </>
+  );
+  if (href) {
+    return (
+      <Link href={href} className={`kpi-card kpi-card-${tone}`} aria-label={`${label}: ${value}${note ? `, ${note}` : ""}. Open details.`}>
+        {body}
+      </Link>
+    );
+  }
+  return <div className={`kpi-card kpi-card-${tone}`}>{body}</div>;
+}
+
 export function Empty({ title, children }: { title: string; children?: React.ReactNode }) {
   return (
     <div className="empty">
@@ -97,7 +133,7 @@ export function Flash({
       {ok ? <div className="alert alert-ok mb-4">{ok}</div> : null}
       {error ? <div className="alert alert-error mb-4">{error}</div> : null}
       {denied === "admin" ? <div className="alert alert-error mb-4">Administrator access is required for that area.</div> : null}
-      {saved ? <div className="alert alert-ok mb-4">Changes saved.</div> : null}
+      {saved ? <div className="alert alert-ok mb-4">{saved === "added" ? "Successfully added." : saved === "deleted" ? "Successfully removed." : "Successfully updated."}</div> : null}
       {deleted ? <div className="alert alert-ok mb-4">Document deleted. The database record is retained for audit purposes.</div> : null}
       {discarded ? <div className="alert alert-info mb-4">Extraction dismissed. Your profile was not changed.</div> : null}
       {cleanup !== undefined && cleanup !== "" ? (

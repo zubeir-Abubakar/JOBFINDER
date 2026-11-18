@@ -21,6 +21,16 @@ const icons: Record<string, string> = {
   plus: "M12 5v14M5 12h14",
   arrow: "M5 12h14M13 6l6 6-6 6",
   database: "M12 3c4.4 0 8 1.3 8 3s-3.6 3-8 3-8-1.3-8-3 3.6-3 8-3zM4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6",
+  trash: "M4 7h16M9 7V4h6v3M6 7l1 14h10l1-14M10 11v6M14 11v6",
+  filter: "M4 6h16M7 12h10M10 18h4",
+  search: "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM20 20l-4-4",
+  check: "M5 12l4 4L19 6",
+  close: "M6 6l12 12M18 6L6 18",
+  target: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 16a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM12 2v3M12 19v3M2 12h3M19 12h3",
+  clock: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 7v5l3 2",
+  sparkles: "M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8zM5 3l.6 1.7L7.3 5l-1.7.6L5 7.3l-.6-1.7L2.7 5l1.7-.3z",
+  chevron: "M6 9l6 6 6-6",
+  external: "M14 4h6v6M20 4l-9 9M18 14v6H4V6h6",
 };
 
 export function Icon({ name, size = 15 }: { name: keyof typeof icons | string; size?: number }) {

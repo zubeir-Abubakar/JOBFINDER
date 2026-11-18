@@ -8,6 +8,7 @@ import { ThemeToggle } from "./ThemeToggle";
 import { AgentAvatar } from "./AgentAvatar";
 import { UserAvatar } from "./UserAvatar";
 import { logoutAction } from "@/lib/actions/session";
+import { CoordinatorLiveVoice } from "./CoordinatorLiveVoice";
 
 const ownerNav = [
   { group: "Recruitment" },
@@ -40,11 +41,13 @@ export function AppShell({
   user,
   variant = "app",
   unreadCount = 0,
+  assistantMessages = [],
 }: {
   children: React.ReactNode;
   user: { name: string; email: string; role: string; avatarUrl?: string | null };
   variant?: "app" | "admin";
   unreadCount?: number;
+  assistantMessages?: Array<{ id: number; role: string; content: string; created_at: string }>;
 }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
@@ -118,6 +121,7 @@ export function AppShell({
             </span>
           </div>
           <div className="header-actions">
+            {variant === "app" ? <CoordinatorLiveVoice initialMessages={assistantMessages} /> : null}
             {variant === "admin" ? (
               <Link href="/dashboard" className="btn btn-ghost btn-sm">
                 Owner workspace

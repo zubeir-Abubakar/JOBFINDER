@@ -34,7 +34,7 @@ function keywords(text: string): string[] {
     .map(([word]) => word);
 }
 
-export function assessAts(text: string, jobDescription: string, profile: ProfileData): AtsReport {
+export function assessAts(text: string, jobDescription: string, profile: ProfileData, sourceText = "", sourceRoleCount?: number): AtsReport {
   const lower = text.toLowerCase();
   const words = text.split(/\s+/).filter(Boolean);
   const jobKeywords = keywords(htmlToText(jobDescription));
@@ -51,12 +51,14 @@ export function assessAts(text: string, jobDescription: string, profile: Profile
   push("Professional summary", /professional summary|profile/i.test(text) && text.length > 200, "Summary section detected", 10);
   push("Skills section", /core skills|technical skills|skills/i.test(text), "Skills section detected", 10);
   push("Experience section", /professional experience|work experience|experience/i.test(text), "Experience section detected", 10);
-  push("Employment history", profile.experiences.length > 0, profile.experiences.length ? `${profile.experiences.length} roles carried over from the master profile` : "No experience recorded in the profile", 10);
-  push("Dates present", /(19|20)\d{2}|present|date to confirm/i.test(text), "Dates are rendered from the master profile; confirm any 'Date to confirm' entries", 8);
+  const roleCount = sourceRoleCount ?? profile.experiences.length;
+  push("Employment history", roleCount > 0, roleCount ? `${roleCount} roles carried over from the master CV` : "No experience recorded in the profile", 10);
+  push("Dates present", /(19|20)\d{2}|present|date to confirm/i.test(text), "Dates are rendered from the master CV; confirm any 'Date to confirm' entries", 8);
   push("Readable length", words.length >= 260 && words.length <= 1050, `${words.length} words — single-column, no tables or graphics`, 10);
   push("Keyword coverage", keywordCoverage >= 55, `${keywordCoverage}% of the vacancy's most frequent terms appear in the document`, 15);
 
   const ownedSkills = new Set(profile.skills.map((s) => s.name.toLowerCase()));
+  const sourceLower = sourceText.toLowerCase();
   const techTokens = [
     "Cucumber",
     "Robot Framework",
@@ -73,8 +75,10 @@ export function assessAts(text: string, jobDescription: string, profile: Profile
     "Zephyr",
     "BrowserStack",
   ];
-  const unknownClaims = techTokens.filter((tech) => lower.includes(tech.toLowerCase()) && !ownedSkills.has(tech.toLowerCase()));
-  push("No unsupported claims", unknownClaims.length === 0, unknownClaims.length ? `Document mentions unverified technologies: ${unknownClaims.join(", ")}` : "Every technology mentioned maps to the verified profile", 20);
+  const unknownClaims = techTokens.filter(
+    (tech) => lower.includes(tech.toLowerCase()) && !ownedSkills.has(tech.toLowerCase()) && !sourceLower.includes(tech.toLowerCase()),
+  );
+  push("No unsupported claims", unknownClaims.length === 0, unknownClaims.length ? `Document mentions unverified technologies: ${unknownClaims.join(", ")}` : "Every technology mentioned maps to the verified master CV", 20);
 
   const totalWeight = checks.reduce((sum, c) => sum + c.weight, 0);
   const earned = checks.filter((c) => c.ok).reduce((sum, c) => sum + c.weight, 0);
@@ -84,7 +88,7 @@ export function assessAts(text: string, jobDescription: string, profile: Profile
   if (missingKeywords.length) warnings.push(`Not present in the document: ${missingKeywords.slice(0, 6).join(", ")}.`);
   if (!hasEmail) warnings.push("Add an email address to the master profile so every generated document carries contact details.");
   if (!hasPhone) warnings.push("Add a phone number to the master profile.");
-  if (profile.experiences.some((e) => !e.start_date)) warnings.push("One or more roles have no dates. Dates are not invented — pull them from your original CV.");
+  if (sourceRoleCount === undefined && profile.experiences.some((e) => !e.start_date)) warnings.push("One or more roles have no dates. Dates are not invented — pull them from your original CV.");
   if (unknownClaims.length) warnings.push("The document references technologies the profile does not support. Regenerate after correcting the profile.");
 
   return {

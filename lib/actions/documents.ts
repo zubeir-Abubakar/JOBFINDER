@@ -104,15 +104,26 @@ export async function applyExtractionAction(formData: FormData): Promise<void> {
 
   let added = 0;
   if (includeSkills && Array.isArray(fields.skills)) {
-    const existing = new Set(all<{ name: string }>("SELECT name FROM skills").map((s) => s.name.toLowerCase()));
+    const existing = new Map(all<{ id: number; name: string; source: string; deleted_at: string | null }>("SELECT id, name, source, deleted_at FROM skills").map((s) => [s.name.toLowerCase(), s]));
     for (const skill of fields.skills) {
-      if (!existing.has(skill.toLowerCase())) {
-        run(
-          "INSERT INTO skills (name, category, level, verified, source, sort) VALUES (?, 'From CV', 'working', 1, 'cv', (SELECT COALESCE(MAX(sort),0)+1 FROM skills))",
-          [skill],
-        );
-        added += 1;
+      const previous = existing.get(skill.toLowerCase());
+      if (previous && previous.source !== "seed") {
+        if (previous.deleted_at) {
+          run("UPDATE skills SET deleted_at = NULL, verified = 1, source = 'cv' WHERE id = ?", [previous.id]);
+          added += 1;
+        }
+        continue;
       }
+      if (previous) {
+        run("UPDATE skills SET category = 'From CV', level = 'unspecified', verified = 1, source = 'cv', deleted_at = NULL WHERE id = ?", [previous.id]);
+        added += 1;
+        continue;
+      }
+      run(
+        "INSERT INTO skills (name, category, level, verified, source, sort) VALUES (?, 'From CV', 'unspecified', 1, 'cv', (SELECT COALESCE(MAX(sort),0)+1 FROM skills))",
+        [skill],
+      );
+      added += 1;
     }
   }
   run("UPDATE profiles SET source_cv_id = ?, updated_at = ? WHERE id = 1", [pending.documentId, nowIso()]);

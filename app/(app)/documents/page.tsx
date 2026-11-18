@@ -8,8 +8,10 @@ import { PageHead, Empty, Flash, Progress } from "@/components/ui";
 import { formatBytes, formatDate, formatDateTime, param } from "@/lib/format";
 import { UploadForm } from "@/components/UploadForm";
 import { SubmitButton } from "@/components/SubmitButton";
-import { applyExtractionAction, discardExtractionAction, deleteDocumentAction, togglePinAction } from "@/lib/actions/documents";
+import { applyExtractionAction, discardExtractionAction } from "@/lib/actions/documents";
 import { Icon } from "@/components/icons";
+import { DocumentDeleteButton } from "@/components/DocumentDeleteButton";
+import { DocumentsBulkTable } from "@/components/DocumentsBulkTable";
 
 export const dynamic = "force-dynamic";
 
@@ -24,6 +26,8 @@ type DocRow = {
   status: string;
   pinned: number;
   ats_score: number | null;
+  quality_status: string | null;
+  quality_score: number | null;
   created_at: string;
   expires_at: string | null;
   company: string | null;
@@ -49,11 +53,11 @@ export default async function DocumentsPage({
 
   const documents = all<DocRow>(
     `SELECT d.id, d.kind, d.display_name, d.file_name, d.mime, d.size_bytes, d.version, d.status, d.pinned, d.ats_score,
-            d.created_at, d.expires_at, j.company, j.title, d.job_id
+            d.quality_status, d.quality_score, d.created_at, d.expires_at, j.company, j.title, d.job_id
      FROM documents d LEFT JOIN jobs j ON j.id = d.job_id
      WHERE d.user_id = ? AND d.deleted_at IS NULL ORDER BY d.created_at DESC`,
     [user.id],
-  );
+  ).map((doc) => ({ ...doc }));
   const kindParam = param(sp.kind);
   const kindFilter = kindParam === "tailored_cv" || kindParam === "cover_letter" ? kindParam : null;
   const originals = documents.filter((d) => d.kind === "original_cv");
@@ -123,7 +127,7 @@ export default async function DocumentsPage({
                   </label>
                 </div>
                 <div className="row">
-                  <SubmitButton className="btn btn-primary" pendingLabel="Applying…">Apply to profile</SubmitButton>
+                  <SubmitButton className="btn btn-primary" pendingLabel="Applying…" trackDirty={false}>Apply to profile</SubmitButton>
                 </div>
               </form>
               <div>
@@ -167,11 +171,9 @@ export default async function DocumentsPage({
                         </div>
                       </div>
                       <div className="row">
+                        <Link href={`/documents/${doc.id}`} className="btn btn-sm">Preview</Link>
                         <a href={`/api/documents/${doc.id}`} className="btn btn-sm">Download</a>
-                        <form action={deleteDocumentAction}>
-                          <input type="hidden" name="id" value={doc.id} />
-                          <SubmitButton className="btn btn-sm btn-danger" confirm="Delete this CV file? This cannot be undone.">Delete</SubmitButton>
-                        </form>
+                        <DocumentDeleteButton id={doc.id} documentName={doc.display_name} />
                       </div>
                     </div>
                   </div>
@@ -217,67 +219,15 @@ export default async function DocumentsPage({
             <Link href="/jobs" className="btn btn-sm"><Icon name="jobs" /> Find a vacancy</Link>
           </div>
         </div>
-        <div className="table-wrap">
-          {generated.length === 0 ? (
-            <Empty title={kindFilter ? `No ${kindFilter === "tailored_cv" ? "tailored CVs" : "cover letters"} yet` : "No tailored documents yet"}>
-              Open a vacancy and generate a package. The CV agent will only use facts from your master profile.
-            </Empty>
-          ) : (
-            <table className="data">
-              <thead>
-                <tr>
-                  <th>Document</th>
-                  <th>Vacancy</th>
-                  <th>Version</th>
-                  <th>ATS</th>
-                  <th>Status</th>
-                  <th>Created</th>
-                  <th>Expires</th>
-                  <th />
-                </tr>
-              </thead>
-              <tbody>
-                {generated.map((doc) => (
-                  <tr key={doc.id}>
-                    <td>
-                      <div className="cell-title">{doc.kind === "tailored_cv" ? "Tailored CV" : "Cover letter"} · {doc.mime.includes("pdf") ? "PDF" : "DOCX"}</div>
-                      <div className="cell-sub">{formatBytes(doc.size_bytes)} · {doc.display_name.split("·")[0].trim()}</div>
-                    </td>
-                    <td>
-                      {doc.job_id ? (
-                        <Link href={`/jobs/${doc.job_id}`}>
-                          <span className="cell-title">{doc.title}</span>
-                          <span className="cell-sub block">{doc.company}</span>
-                        </Link>
-                      ) : "—"}
-                    </td>
-                    <td className="num">v{doc.version}</td>
-                    <td className="num">{doc.ats_score ?? "—"}/100</td>
-                    <td>
-                      <span className="badge badge-neutral">{doc.status}</span>
-                      {doc.pinned ? <span className="badge badge-warn ml-1">Pinned</span> : null}
-                    </td>
-                    <td className="cell-sub">{formatDate(doc.created_at)}</td>
-                    <td className="cell-sub">{doc.expires_at ? formatDate(doc.expires_at) : "No expiry"}</td>
-                    <td>
-                      <div className="row justify-end" style={{ gap: 4 }}>
-                        <a href={`/api/documents/${doc.id}`} className="btn btn-sm">Download</a>
-                        <form action={togglePinAction}>
-                          <input type="hidden" name="id" value={doc.id} />
-                          <SubmitButton className="btn btn-sm">{doc.pinned ? "Unpin" : "Pin"}</SubmitButton>
-                        </form>
-                        <form action={deleteDocumentAction}>
-                          <input type="hidden" name="id" value={doc.id} />
-                          <SubmitButton className="btn btn-sm btn-danger" confirm="Delete this generated document?">Delete</SubmitButton>
-                        </form>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+        {generated.length === 0 ? (
+          <Empty title={kindFilter ? `No ${kindFilter === "tailored_cv" ? "tailored CVs" : "cover letters"} yet` : "No tailored documents yet"}>
+            Open a vacancy and generate a package. The CV agent will only use facts from your master profile.
+          </Empty>
+        ) : (
+          <div className="card-body documents-table-body">
+            <DocumentsBulkTable documents={generated} />
+          </div>
+        )}
       </section>
     </>
   );

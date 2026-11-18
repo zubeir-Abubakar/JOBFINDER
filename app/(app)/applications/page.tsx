@@ -65,6 +65,7 @@ export default async function ApplicationsPage({
     rejected: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'rejected'")?.c ?? 0,
   };
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const activeFilters = (search ? 1 : 0) + (status !== "all" ? 1 : 0) + (group ? 1 : 0);
 
   return (
     <>
@@ -88,23 +89,40 @@ export default async function ApplicationsPage({
         <Stat label="Rejected" value={counts.rejected} tone={counts.rejected ? "bad" : undefined} />
       </section>
 
-      <form method="get" className="card mb-4">
-        <div className="card-body flex flex-wrap items-end gap-2" style={{ paddingTop: 16 }}>
-          <div style={{ flex: 1, minWidth: 200 }}>
-            <label className="label" htmlFor="q">Search</label>
-            <input id="q" name="q" className="input" defaultValue={search} placeholder="Employer, role or notes" />
+      <details className="card filter-shell mb-4">
+        <summary className="filter-summary">
+          <span className="filter-summary-icon"><Icon name="filter" size={15} /></span>
+          <span className="filter-summary-copy">
+            <span className="filter-summary-title">Track applications</span>
+            <span className="filter-summary-sub">{activeFilters ? `${activeFilters} filter${activeFilters === 1 ? "" : "s"} applied` : "Search by employer, role or status"}</span>
+          </span>
+          <span className="filter-pill-row" aria-hidden="true">
+            {search ? <span className="filter-pill">{search}</span> : null}
+            {group ? <span className="filter-pill">{group.label}</span> : null}
+            {status !== "all" ? <span className="filter-pill">{statusLabel(status)}</span> : null}
+          </span>
+          <span className="filter-chevron" aria-hidden="true"><Icon name="chevron" size={15} /></span>
+        </summary>
+        <form method="get" className="filter-panel">
+          <div className="filter-grid filter-grid-compact">
+            <div className="filter-grow">
+              <label className="label" htmlFor="q">Search</label>
+              <input id="q" name="q" className="input" defaultValue={search} placeholder="Employer, role or notes" />
+            </div>
+            <div>
+              <label className="label" htmlFor="status">Status</label>
+              <select id="status" name="status" className="select" defaultValue={status}>
+                <option value="all">All statuses</option>
+                {APPLICATION_STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}
+              </select>
+            </div>
+            <div className="filter-actions">
+              <button type="submit" className="btn btn-primary">Apply filters</button>
+              <Link href="/applications" className="btn">Reset</Link>
+            </div>
           </div>
-          <div>
-            <label className="label" htmlFor="status">Status</label>
-            <select id="status" name="status" className="select" defaultValue={status} style={{ width: 190 }}>
-              <option value="all">All statuses</option>
-              {APPLICATION_STATUSES.map((s) => <option key={s} value={s}>{statusLabel(s)}</option>)}
-            </select>
-          </div>
-          <button type="submit" className="btn btn-primary">Filter</button>
-          <Link href="/applications" className="btn">Reset</Link>
-        </div>
-      </form>
+        </form>
+      </details>
 
       <section className="card" id="applications">
         {group ? (
@@ -124,7 +142,7 @@ export default async function ApplicationsPage({
               Generate a package for a shortlisted vacancy. Approval mode is on by default, so nothing is submitted without you.
             </Empty>
           ) : (
-            <table className="data">
+            <table className="data application-table">
               <thead>
                 <tr>
                   <th>Employer / role</th>

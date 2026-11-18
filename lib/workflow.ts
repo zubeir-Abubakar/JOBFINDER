@@ -1,6 +1,7 @@
 import { all, nowIso, one, run } from "./db";
 import {
   analysePendingJobs,
+  annotateAnalysis,
   completeTask,
   createWorkflow,
   failTask,
@@ -15,6 +16,7 @@ import { ProvidersUnavailableError } from "./providers";
 import { getSetting } from "./settings";
 import { notify } from "./notify";
 import { audit } from "./audit";
+import { emitWorkflowEvent } from "./events";
 
 /**
  * Sequential workflow runner. One recruitment workflow executes at a time so an
@@ -211,7 +213,14 @@ async function runRecruitment(userId: string, workflowId: string, pages: number,
     // recorded and reported above.
     const scored = research.inserted > 0 ? analysePendingJobs(research.jobs.map((j) => j.id)) : analysePendingJobs();
     const top = topVacancy();
-    completeTask(analysisTask, "analysis", `${scored} vacancies scored deterministically. Best match: ${top ? `${top.title} at ${top.company} (${top.match_score}%)` : "none yet"}. Evidence is stored with the vacancy.`);
+    // Advisory narrative only. The weighted score and evidence stay
+    // deterministic and no downstream decision reads the model text.
+    const analysisNote = top ? await annotateAnalysis({ workflowId, taskId: analysisTask, jobId: top.id }) : null;
+    completeTask(
+      analysisTask,
+      "analysis",
+      `${scored} vacancies scored deterministically. Best match: ${top ? `${top.title} at ${top.company} (${top.match_score}%)` : "none yet"}. Evidence is stored with the vacancy.${analysisNote?.ok ? ` AI assessment — ${analysisNote.note}` : analysisNote?.queued ? " AI narrative queued; deterministic evidence remains authoritative." : analysisNote ? " AI narrative unavailable; the deterministic evidence remains authoritative." : ""}`,
+    );
     if (researchProblem && !top) {
       finishWorkflow(workflowId, "failed", researchProblem);
       return;
@@ -238,6 +247,13 @@ async function runRecruitment(userId: string, workflowId: string, pages: number,
       notify({ userId, kind: "workflow_paused", subject: "Workflow paused during documents", body: pkg.message });
       return;
     }
+    emitWorkflowEvent({
+      workflowId,
+      type: "approval.required",
+      agentKey: "application",
+      message: `Package ready for ${top.title} at ${top.company}. Human approval is required before any submission.`,
+      meta: { applicationId: pkg.applicationId ?? null },
+    });
     control(workflowId);
 
     // 7. Application agent prepares the checklist — never submits. The checklist
@@ -256,8 +272,8 @@ async function runRecruitment(userId: string, workflowId: string, pages: number,
     if (email.connected) {
       try {
         const { syncInbox } = await import("./gmail");
-        const result = await syncInbox(15);
-        tracking = `Scanned ${result.scanned} message(s); ${result.inserted} new, ${result.matched} matched to applications.`;
+        const result = await syncInbox(15, { workflowId, taskId: emailTask, source: "task" });
+        tracking = `Scanned ${result.scanned} message(s); ${result.inserted} new, ${result.matched} matched to applications. AI classified ${result.aiClassified}/${result.aiChecked} new message(s)${result.aiQueued ? ` (${result.aiQueued} queued)` : ""}${result.aiFailed ? ` (${result.aiFailed} failed)` : ""}; application statuses still use the deterministic rules only.`;
         completeTask(emailTask, "email", tracking);
       } catch (error) {
         tracking = `Email tracking failed: ${error instanceof Error ? error.message : "Gmail sync failed."}`;
@@ -274,11 +290,13 @@ async function runRecruitment(userId: string, workflowId: string, pages: number,
   } catch (error) {
     if (error instanceof PauseSignal) {
       run("UPDATE workflows SET status = 'paused', pause_requested = 0, summary = ? WHERE id = ?", ["Paused at a safe checkpoint.", workflowId]);
+      emitWorkflowEvent({ workflowId, type: "workflow.paused", agentKey: "coordinator", message: "Workflow paused at a safe checkpoint. Resume when ready." });
       notify({ userId, kind: "workflow_paused", subject: "Workflow paused", body: "Agents stopped at a safe checkpoint. Resume when ready." });
       return;
     }
     if (error instanceof StopSignal) {
       run("UPDATE workflows SET status = 'stopped', stop_requested = 0, summary = ? WHERE id = ?", ["Stopped by the user.", workflowId]);
+      emitWorkflowEvent({ workflowId, type: "workflow.cancelled", agentKey: "coordinator", message: "Workflow cancelled by the owner. Remaining stages were not executed." });
       return;
     }
     const message = error instanceof ProvidersUnavailableError ? error.message : error instanceof Error ? error.message : "Unknown workflow error";

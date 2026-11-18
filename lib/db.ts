@@ -1,11 +1,12 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import { hashPassword, randomId } from "./security";
+import { hashPassword, randomId } from "./security.ts";
 
 /** Data location is configurable so a verification run can use an isolated database. */
 export const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), "data");
 export const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+export const TEMP_DIR = path.join(DATA_DIR, "temp");
 
 /** Established administrator identity. The legacy address is migrated once. */
 export const ADMIN_EMAIL = "abubakar@admin.com";
@@ -135,6 +136,9 @@ CREATE TABLE IF NOT EXISTS documents (
   pinned INTEGER NOT NULL DEFAULT 0,
   ats_score INTEGER,
   ats_report TEXT,
+  quality_status TEXT,
+  quality_score INTEGER,
+  quality_report TEXT,
   text_content TEXT,
   created_at TEXT NOT NULL,
   expires_at TEXT,
@@ -233,6 +237,8 @@ CREATE TABLE IF NOT EXISTS provider_usage (
   model TEXT NOT NULL,
   agent_key TEXT NOT NULL,
   workflow_id TEXT,
+  task_id TEXT,
+  source TEXT,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens INTEGER NOT NULL DEFAULT 0,
@@ -243,6 +249,28 @@ CREATE TABLE IF NOT EXISTS provider_usage (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_provider_usage_created ON provider_usage(created_at);
+CREATE TABLE IF NOT EXISTS ai_jobs (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  kind TEXT NOT NULL,
+  agent_key TEXT NOT NULL,
+  workflow_id TEXT,
+  task_id TEXT,
+  source TEXT NOT NULL DEFAULT 'task',
+  priority INTEGER NOT NULL DEFAULT 2,
+  status TEXT NOT NULL DEFAULT 'queued',
+  payload TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT NOT NULL,
+  last_error TEXT,
+  provider TEXT,
+  model TEXT,
+  result TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ai_jobs_due ON ai_jobs(status, available_at);
 CREATE TABLE IF NOT EXISTS gmail_accounts (
   id INTEGER PRIMARY KEY,
   email TEXT NOT NULL,
@@ -267,25 +295,70 @@ CREATE TABLE IF NOT EXISTS email_messages (
   draft_body TEXT,
   draft_status TEXT NOT NULL DEFAULT 'none',
   received_at TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  ai_category TEXT,
+  ai_classified_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_email_messages_received ON email_messages(received_at);
+CREATE TABLE IF NOT EXISTS workflow_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  workflow_id TEXT NOT NULL,
+  agent_key TEXT,
+  type TEXT NOT NULL,
+  message TEXT,
+  meta TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_events_run ON workflow_events(workflow_id, id);
+CREATE TABLE IF NOT EXISTS temp_objects (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  relative_path TEXT,
+  size_bytes INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active',
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  meta TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_temp_objects_expiry ON temp_objects(status, expires_at);
 `;
 
 type GlobalWithDb = typeof globalThis & { __atwDb?: DatabaseSync };
 const g = globalThis as GlobalWithDb;
 
+/**
+ * Module-scoped (not global) so a hot-reloaded module re-verifies the cached
+ * handle. A dev server can keep `globalThis.__atwDb` from a build that predates
+ * a new column; returning early would leave that handle unmigrated and every
+ * query touching the new schema would crash.
+ */
+let schemaReady = false;
+
 export function getDb(): DatabaseSync {
-  if (g.__atwDb) return g.__atwDb;
+  if (g.__atwDb) {
+    if (!schemaReady) {
+      ensureSchema(g.__atwDb);
+      schemaReady = true;
+    }
+    return g.__atwDb;
+  }
   mkdirSync(UPLOAD_DIR, { recursive: true });
+  mkdirSync(TEMP_DIR, { recursive: true });
   const db = new DatabaseSync(path.join(DATA_DIR, "at-ai-workforce.db"));
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
-  db.exec(SCHEMA);
+  ensureSchema(db);
   migrate(db);
   seed(db);
   g.__atwDb = db;
+  schemaReady = true;
   return db;
+}
+
+/** Per-request helper so callers can assert the schema is current. */
+export function schemaVersion(): number {
+  const row = getDb().prepare("PRAGMA user_version").get() as { user_version?: number } | undefined;
+  return row?.user_version ?? 0;
 }
 
 export function all<T = Record<string, unknown>>(sql: string, params: unknown[] = []): T[] {
@@ -423,7 +496,15 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-function migrate(db: DatabaseSync) {
+export const SCHEMA_VERSION = 7;
+
+/**
+ * Idempotent schema enforcement. Safe to run on every open and on a cached
+ * handle: CREATE TABLE IF NOT EXISTS plus ADD COLUMN only. No table is dropped,
+ * rebuilt or rewritten, and existing rows are preserved verbatim.
+ */
+function ensureSchema(db: DatabaseSync): void {
+  db.exec(SCHEMA);
   ensureColumn(db, "tasks", "provider", "provider TEXT");
   ensureColumn(db, "tasks", "model", "model TEXT");
   ensureColumn(db, "tasks", "attempts", "attempts INTEGER NOT NULL DEFAULT 0");
@@ -432,12 +513,111 @@ function migrate(db: DatabaseSync) {
   ensureColumn(db, "workflows", "pause_requested", "pause_requested INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "workflows", "stop_requested", "stop_requested INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "workflows", "started_by", "started_by TEXT");
+  // Execution integrity: distinguish model-backed work from deterministic work.
+  // Historical rows stay NULL (unknown), so no past record is rewritten.
+  ensureColumn(db, "tasks", "execution_mode", "execution_mode TEXT");
+  ensureColumn(db, "tasks", "ai_outcome", "ai_outcome TEXT");
+  ensureColumn(db, "agents", "ai_success_count", "ai_success_count INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "agents", "ai_failure_count", "ai_failure_count INTEGER NOT NULL DEFAULT 0");
+  // Cost is not verifiable: the gateway publishes no pricing metadata. Historical
+  // rows keep NULL (unknown) rather than being relabelled as verified zero cost.
+  ensureColumn(db, "provider_usage", "cost_status", "cost_status TEXT");
+  ensureColumn(db, "provider_usage", "routed_platform", "routed_platform TEXT");
+  ensureColumn(db, "provider_usage", "routed_model", "routed_model TEXT");
+  // Attribution: task-bound calls link to the task that caused them, while
+  // assistant/admin/manual calls carry an explicit source and no task id.
+  ensureColumn(db, "provider_usage", "task_id", "task_id TEXT");
+  ensureColumn(db, "provider_usage", "source", "source TEXT");
+  ensureColumn(db, "email_messages", "ai_category", "ai_category TEXT");
+  ensureColumn(db, "email_messages", "ai_classified_at", "ai_classified_at TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_provider_usage_task ON provider_usage(task_id)");
   ensureColumn(db, "users", "must_change_password", "must_change_password INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "users", "avatar_path", "avatar_path TEXT");
   ensureColumn(db, "users", "avatar_mime", "avatar_mime TEXT");
   ensureColumn(db, "users", "avatar_updated_at", "avatar_updated_at TEXT");
   ensureColumn(db, "jobs", "ai_note", "ai_note TEXT");
+  // Document quality is stored per file so the UI can show the same gate that
+  // accepted or rejected the PDF, rather than a post-hoc advisory note.
+  ensureColumn(db, "documents", "quality_status", "quality_status TEXT");
+  ensureColumn(db, "documents", "quality_score", "quality_score INTEGER");
+  ensureColumn(db, "documents", "quality_report", "quality_report TEXT");
+  // CV editor: rich role content is stored beside the plain-text fields used by
+  // tailoring and quality gates. Soft deletes keep an explicit removal from
+  // being resurrected on the next CV import; they never alter the upload.
+  ensureColumn(db, "skills", "deleted_at", "deleted_at TEXT");
+  ensureColumn(db, "profiles", "languages_synced_at", "languages_synced_at TEXT");
+  ensureColumn(db, "profiles", "cv_synced_source", "cv_synced_source TEXT");
+  ensureColumn(db, "experiences", "projects", "projects TEXT");
+  ensureColumn(db, "experiences", "responsibilities_html", "responsibilities_html TEXT");
+  ensureColumn(db, "experiences", "achievements_html", "achievements_html TEXT");
+  ensureColumn(db, "experiences", "projects_html", "projects_html TEXT");
+  ensureColumn(db, "experiences", "source_key", "source_key TEXT");
+  ensureColumn(db, "experiences", "edited_at", "edited_at TEXT");
+  ensureColumn(db, "experiences", "deleted_at", "deleted_at TEXT");
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+}
 
+/**
+ * Links pre-v4 usage rows to the AI task that produced them when the match is
+ * unambiguous (same agent, provider, model and a timestamp within five
+ * minutes). Rows that cannot be matched are labelled `legacy` rather than
+ * guessed into a task. No financial or task record is rewritten.
+ */
+function backfillUsageAttribution(db: DatabaseSync): void {
+  const proximity = `ABS(
+      CAST(strftime('%s', COALESCE(t.finished_at, t.started_at, t.created_at)) AS INTEGER)
+      - CAST(strftime('%s', provider_usage.created_at) AS INTEGER)
+    )`;
+  db.exec(`
+    UPDATE provider_usage
+    SET task_id = (
+      SELECT t.id FROM tasks t
+      WHERE t.agent_key = provider_usage.agent_key
+        AND t.provider = provider_usage.provider
+        AND t.model = provider_usage.model
+        AND t.execution_mode = 'ai'
+        AND ${proximity} <= 300
+      ORDER BY ${proximity} ASC
+      LIMIT 1
+    )
+    WHERE task_id IS NULL
+      AND EXISTS (
+        SELECT 1 FROM tasks t
+        WHERE t.agent_key = provider_usage.agent_key
+          AND t.provider = provider_usage.provider
+          AND t.model = provider_usage.model
+          AND t.execution_mode = 'ai'
+          AND ${proximity} <= 300
+      )
+  `);
+  db.exec("UPDATE provider_usage SET source = 'task' WHERE task_id IS NOT NULL AND source IS NULL");
+  db.exec("UPDATE provider_usage SET source = 'legacy' WHERE source IS NULL");
+}
+
+/**
+ * Counters are a projection of task-bound usage rows. Recomputing them here
+ * makes the roster reconcile with provider_usage instead of drifting from it.
+ * Assistant/admin/manual calls are deliberately excluded: they are not task
+ * executions and are shown separately in the admin view.
+ */
+function reconcileAgentAiCounters(db: DatabaseSync): void {
+  db.exec(`
+    UPDATE agents SET
+      ai_success_count = (
+        SELECT COUNT(*) FROM provider_usage u
+        WHERE u.agent_key = agents.key AND u.source = 'task' AND u.status = 'ok'
+      ),
+      ai_failure_count = (
+        SELECT COUNT(*) FROM provider_usage u
+        WHERE u.agent_key = agents.key AND u.source = 'task' AND u.status = 'error'
+      )
+  `);
+}
+
+/** Data-only migrations. Runs once per process, after the schema is current. */
+function migrate(db: DatabaseSync) {
+  backfillUsageAttribution(db);
+  reconcileAgentAiCounters(db);
   // Keep the legacy generated advisory separate from deterministic scoring.
   const analysed = db.prepare("SELECT id, analysis FROM jobs WHERE analysis IS NOT NULL").all() as Array<{ id: string; analysis: string }>;
   for (const row of analysed) {
@@ -459,6 +639,7 @@ function migrate(db: DatabaseSync) {
 
   // Normalise legacy statuses written by earlier builds.
   db.exec("UPDATE agents SET status = 'working' WHERE status = 'running'");
+
   db.exec("UPDATE agents SET status = 'failed' WHERE status = 'error'");
 
   // Align the stored analysis weights with the requested scoring model, but only

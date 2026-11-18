@@ -7,7 +7,8 @@ import { requireUser } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { notify } from "@/lib/notify";
 import { getSetting } from "@/lib/settings";
-import { APPLICATION_STATUSES, statusLabel } from "@/lib/application-status";
+import { APPLICATION_STATUSES, statusLabel, submissionBlockedReason } from "@/lib/application-status";
+import { emitWorkflowEvent } from "@/lib/events";
 
 export async function approveApplicationAction(formData: FormData): Promise<void> {
   const user = await requireUser();
@@ -17,12 +18,46 @@ export async function approveApplicationAction(formData: FormData): Promise<void
   if (app.status !== "awaiting_approval") redirect("/applications?error=Only+packages+awaiting+approval+can+be+approved");
   run("UPDATE applications SET approved_at = ?, last_update = ? WHERE id = ?", [nowIso(), nowIso(), id]);
   audit({ action: "application.approved", entity: "application", entityId: id, detail: `Job ${app.job_id}`, userId: user.id });
+  const workflow = one<{ id: string }>("SELECT id FROM workflows ORDER BY created_at DESC LIMIT 1");
+  if (workflow) {
+    emitWorkflowEvent({
+      workflowId: workflow.id,
+      type: "approval.granted",
+      agentKey: "application",
+      message: "Owner approved the package. Submission is still recorded manually with an employer reference.",
+      meta: { applicationId: id },
+    });
+  }
   revalidatePath("/applications");
   revalidatePath("/dashboard");
   redirect(`/applications/${id}?ok=${encodeURIComponent("Approved. Submit through the employer channel, then record the confirmation reference.")}`);
 }
 
 export type SubmissionState = { error?: string; ok?: string };
+
+/**
+ * Sends a package back for document changes. Approval is cleared so the owner
+ * must review the regenerated CV and cover letter again before any submission.
+ */
+export async function requestDocumentChangesAction(formData: FormData): Promise<void> {
+  const user = await requireUser();
+  const id = String(formData.get("id") ?? "");
+  const request = String(formData.get("request") ?? "").trim().slice(0, 500);
+  const app = one<{ id: string; notes: string | null; status: string }>("SELECT id, notes, status FROM applications WHERE id = ?", [id]);
+  if (!app) redirect("/applications?error=Application+not+found");
+  if (app.status === "submitted") redirect(`/applications/${id}?error=Submitted+applications+cannot+be+sent+back+for+changes`);
+  const note = `Document changes requested ${nowIso()}: ${request || "regenerate the CV and cover letter, then re-review"}`;
+  run("UPDATE applications SET status = 'documents_preparing', approved_at = NULL, notes = ?, last_update = ? WHERE id = ?", [
+    app.notes ? `${app.notes}\n${note}` : note,
+    nowIso(),
+    id,
+  ]);
+  audit({ action: "application.changes_requested", entity: "application", entityId: id, detail: note, userId: user.id });
+  revalidatePath("/applications");
+  revalidatePath("/dashboard");
+  redirect(`/applications/${id}?ok=${encodeURIComponent("Document changes recorded. Approval was cleared; regenerate the package from the vacancy, then review it again.")}`);
+}
+
 
 /**
  * Records a submission that has already been confirmed by the employer's portal
@@ -38,11 +73,14 @@ export async function recordSubmissionAction(_prev: SubmissionState | undefined,
     [id],
   );
   if (!app) return { error: "Application not found." };
-  if (getSetting<boolean>("approval_mode", true) && !app.approved_at) {
-    return { error: "Approval mode is on. Approve the package before recording a submission." };
-  }
-  if (!confirmation) return { error: "Enter the confirmation reference or message shown by the employer portal." };
-  if (app.status === "submitted") return { error: "This application is already recorded as submitted." };
+  const blocked = submissionBlockedReason({
+    found: true,
+    approvalMode: getSetting<boolean>("approval_mode", true),
+    approvedAt: app.approved_at,
+    confirmation,
+    status: app.status,
+  });
+  if (blocked) return { error: blocked };
 
   const job = one<{ title: string; company: string }>("SELECT title, company FROM jobs WHERE id = ?", [app.job_id]);
   const submittedAt = nowIso();

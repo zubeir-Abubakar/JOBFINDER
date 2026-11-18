@@ -24,8 +24,8 @@ export async function disconnectGmailAction(): Promise<void> {
 export async function syncGmailAction(): Promise<void> {
   const user = await requireUser();
   try {
-    const result = await syncInbox(20);
-    audit({ action: "gmail.synced", entity: "email", detail: `${result.scanned} scanned, ${result.inserted} new`, userId: user.id });
+    const result = await syncInbox(20, { source: "manual" });
+    audit({ action: "gmail.synced", entity: "email", detail: `${result.scanned} scanned, ${result.inserted} new, ${result.aiClassified} AI-reviewed`, userId: user.id });
     revalidatePath("/inbox");
     redirect(`/inbox?ok=${encodeURIComponent(`Scanned ${result.scanned} message(s), ${result.inserted} new, ${result.matched} matched.`)}`);
   } catch (error) {

@@ -140,6 +140,11 @@ async function conversationalReply(userId: string, message: string): Promise<str
   try {
     const result = await generateText({
       agentKey: "coordinator",
+      // Conversation is not a workflow task, so it is attributed separately
+      // instead of inflating the coordinator's task counters.
+      source: "assistant",
+      priority: 0,
+      maxWaitMs: 8000,
       system:
         "You are the Chief Coordinator of a recruitment workspace. You may converse naturally, but every factual statement must be copied from the supplied workspace facts; do not infer or add state changes, completed setup, enabled agents or next steps that are not literally present. Never invent vacancies, employers, applications, messages, scores or outcomes. Never claim an action was executed. If the owner requests an operation, describe it as an available command and wait. Be warm, concise and practical. Use 2 short paragraphs at most.",
       prompt: `Owner message: ${message}\n\nWorkspace facts:\n${workspaceFacts()}\n\nRecent conversation:\n${context}`,

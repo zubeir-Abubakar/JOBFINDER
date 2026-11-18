@@ -8,6 +8,7 @@ import { audit } from "@/lib/audit";
 import { getProfileData } from "@/lib/profile";
 import { getSetting, setSetting } from "@/lib/settings";
 import { cleanupExpiredDocuments } from "@/lib/retention";
+import { cleanupTempObjects } from "@/lib/temp-store";
 
 const list = (value: FormDataEntryValue | null) =>
   String(value ?? "")
@@ -81,6 +82,13 @@ export async function clearExpiredDocumentsAction(): Promise<void> {
   revalidatePath("/settings");
   revalidatePath("/admin/storage");
   redirect(`/settings?cleanup=${result.deleted}&freed=${result.bytes}#documents`);
+}
+
+export async function cleanTempCacheAction(): Promise<void> {
+  const user = await requireUser();
+  const result = await cleanupTempObjects(user.email);
+  revalidatePath("/settings");
+  redirect(`/settings?cleanup=${result.removed}&freed=${result.bytes}#cache`);
 }
 
 export async function testEmailAction(): Promise<void> {

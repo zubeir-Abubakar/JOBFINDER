@@ -4,12 +4,13 @@ import { requireUser } from "@/lib/auth";
 import { all, one } from "@/lib/db";
 import { PageHead, Empty, Flash } from "@/components/ui";
 import { formatDate, formatDateTime, param } from "@/lib/format";
-import { statusLabel, statusClass, APPLICATION_STATUSES } from "@/lib/application-status";
-import { approveApplicationAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
+import { statusLabel, statusClass, APPLICATION_STATUSES, isApplicationSubmitted } from "@/lib/application-status";
+import { approveApplicationAction, requestDocumentChangesAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
 import { SubmissionForm } from "@/components/SubmissionForm";
 import { SubmitButton } from "@/components/SubmitButton";
 import { getSetting } from "@/lib/settings";
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { DocumentWorkspace } from "@/components/DocumentWorkspace";
 
 export const dynamic = "force-dynamic";
 
@@ -51,10 +52,10 @@ export default async function ApplicationDetailPage({
   );
   if (!app) notFound();
 
-  const cv = app.cv_document_id ? one<{ id: string; display_name: string; ats_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, version, kind FROM documents WHERE id = ?", [app.cv_document_id]) : null;
-  const cover = app.cover_letter_id ? one<{ id: string; display_name: string; ats_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, version, kind FROM documents WHERE id = ?", [app.cover_letter_id]) : null;
-  const siblings = all<{ id: string; display_name: string; mime: string; ats_score: number | null; version: string | null }>(
-    "SELECT id, display_name, mime, ats_score, version FROM documents WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
+  const cv = app.cv_document_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cv_document_id]) : null;
+  const cover = app.cover_letter_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cover_letter_id]) : null;
+  const siblings = all<{ id: string; display_name: string; mime: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null }>(
+    "SELECT id, display_name, mime, ats_score, quality_status, quality_score, version FROM documents WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
     [app.job_id],
   );
   const timeline = all<{ action: string; detail: string | null; created_at: string }>(
@@ -62,6 +63,18 @@ export default async function ApplicationDetailPage({
     [id],
   );
   const approvalMode = getSetting<boolean>("approval_mode", true);
+  const reviewDocs = siblings
+    .filter((doc) => doc.id === app.cv_document_id || doc.id === app.cover_letter_id)
+    .sort((a, b) => (a.id === app.cv_document_id ? -1 : b.id === app.cv_document_id ? 1 : 0))
+    .map((doc) => ({
+      id: doc.id,
+      label: doc.id === app.cv_document_id ? "Tailored CV" : "Cover letter",
+      mime: doc.mime,
+      ats: doc.ats_score,
+      version: doc.version,
+      quality: doc.quality_status,
+      qualityScore: doc.quality_score,
+    }));
 
   return (
     <>
@@ -81,6 +94,22 @@ export default async function ApplicationDetailPage({
         }
       />
 
+      <section className="card mb-4" id="review-workspace">
+        <div className="card-head">
+          <div>
+            <h2>Document review workspace</h2>
+            <p className="card-sub">
+              {app.title} at {app.company} · {app.match_score ?? "—"}% match · ATS {cv?.ats_score ?? "—"}/100 · Quality {cv?.quality_status ?? "not checked"}{cv?.quality_score !== null && cv?.quality_score !== undefined ? ` (${cv.quality_score}/100)` : ""}. Review the CV and cover letter here before approving.
+            </p>
+          </div>
+          <div className="row">
+            <span className={`badge ${statusClass(app.status)}`}>{statusLabel(app.status)}</span>
+            <Link href={`/jobs/${app.job_id}`} className="btn btn-sm">Vacancy evidence</Link>
+          </div>
+        </div>
+        <DocumentWorkspace documents={reviewDocs} />
+      </section>
+
       <div className="split">
         <div className="stack">
           <section className="card">
@@ -98,7 +127,7 @@ export default async function ApplicationDetailPage({
               </div>
             </div>
             <div className="card-body">
-              {app.submitted_at ? (
+              {isApplicationSubmitted(app) ? (
                 <div className="card-quiet p-3">
                   <div className="label" style={{ marginBottom: 2 }}>Employer confirmation</div>
                   <div className="text-[13px]">{app.confirmation ?? "No reference stored"}</div>
@@ -114,6 +143,22 @@ export default async function ApplicationDetailPage({
                   ) : (
                     <div className="alert alert-ok">Approved {formatDateTime(app.approved_at)}. Submit through the employer channel, then record the confirmation.</div>
                   )}
+                  <div className="decision-row">
+                    <form action={updateApplicationStatusAction}>
+                      <input type="hidden" name="id" value={app.id} />
+                      <input type="hidden" name="status" value="rejected" />
+                      <SubmitButton className="btn btn-sm btn-danger" confirm="Mark this application as rejected? Nothing is sent to the employer.">Reject application</SubmitButton>
+                    </form>
+                    <details className="decision-changes">
+                      <summary className="btn btn-sm">Request document changes</summary>
+                      <form action={requestDocumentChangesAction} className="stack mt-2" style={{ gap: 6 }}>
+                        <input type="hidden" name="id" value={app.id} />
+                        <input name="request" className="input" maxLength={500} placeholder="What should change? e.g. emphasise test automation leadership" />
+                        <SubmitButton className="btn btn-sm" confirm="Send this package back for document changes? Approval will be cleared until you approve the new version.">Record change request</SubmitButton>
+                      </form>
+                    </details>
+                  </div>
+
                   <div className="card-quiet p-3">
                     <div className="label" style={{ marginBottom: 6 }}>Record a confirmed submission</div>
                     <SubmissionForm applicationId={app.id} approved={Boolean(app.approved_at)} />
@@ -144,7 +189,9 @@ export default async function ApplicationDetailPage({
                   <div key={doc!.id} className="between card-quiet p-3">
                     <div>
                       <div className="text-[12.5px] font-medium">{doc!.kind === "tailored_cv" ? "Tailored CV" : "Cover letter"} · v{doc!.version}</div>
-                      <div className="text-[11px]" style={{ color: "var(--muted)" }}>ATS self-check {doc!.ats_score ?? "—"}/100</div>
+                      <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                        ATS self-check {doc!.ats_score ?? "—"}/100 · quality {doc!.quality_status ?? "not checked"}{doc!.quality_score !== null ? ` (${doc!.quality_score}/100)` : ""}
+                      </div>
                     </div>
                     <a href={`/api/documents/${doc!.id}`} className="btn btn-sm">Download</a>
                   </div>
@@ -156,7 +203,7 @@ export default async function ApplicationDetailPage({
                   <div className="stack mt-2" style={{ gap: 6 }}>
                     {siblings.map((doc) => (
                       <div key={doc.id} className="between card-quiet px-3 py-2">
-                        <span className="text-[11.5px]">{doc.display_name}</span>
+                        <span className="text-[11.5px]">{doc.display_name}{doc.quality_status ? ` · ${doc.quality_status}` : ""}</span>
                         <a href={`/api/documents/${doc.id}`} className="btn btn-sm">Download</a>
                       </div>
                     ))}
