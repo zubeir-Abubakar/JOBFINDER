@@ -5,6 +5,8 @@ import { cleanupExpiredDocuments } from "./retention";
 import { statusLabel } from "./application-status";
 import { agentIdentity } from "./agent-identity";
 import { generateText } from "./providers";
+import { runGmailTestEmail } from "./gmail";
+import { answerFromOperations, getOperationalSnapshot, operationsBrief } from "./operations";
 
 export type AssistantPendingAction = "cleanup_expired";
 export type AssistantResult = { reply: string; taskIds: string[]; agentKeys?: string[]; pendingAction?: AssistantPendingAction };
@@ -20,6 +22,8 @@ const HELP = `I can talk through your workspace and act on it. Try:
 • "Generate a tailored CV for <company or job title>"
 • "Review application packages"
 • "Show recruiter messages"
+• "Transfer me to the research agent" / "Take me back to the coordinator"
+• "How many tokens did we use today?" / "Is the system healthy?"
 • "Pause the research agent" / "Resume all agents"
 • "Prioritise Lausanne and Geneva"
 • "Daily report"`;
@@ -135,8 +139,9 @@ function localGreeting(userId: string): string {
   return `Good ${part}, ${ownerName(userId).split(" ")[0]}. ${working.length ? `${working.length} agent(s) are currently active.` : "No agent is executing right now."} I can answer questions about the workspace or run a supported recruitment action. What would you like to do?`;
 }
 
-async function conversationalReply(userId: string, message: string): Promise<string> {
+async function conversationalReply(userId: string, message: string, snapshot?: Awaited<ReturnType<typeof getOperationalSnapshot>>, sessionId?: string | null): Promise<string> {
   const context = recentContext(userId, message);
+  const live = snapshot ?? await getOperationalSnapshot();
   try {
     const result = await generateText({
       agentKey: "coordinator",
@@ -145,16 +150,17 @@ async function conversationalReply(userId: string, message: string): Promise<str
       source: "assistant",
       priority: 0,
       maxWaitMs: 8000,
+      sessionId: sessionId ?? null,
       system:
-        "You are the Chief Coordinator of a recruitment workspace. You may converse naturally, but every factual statement must be copied from the supplied workspace facts; do not infer or add state changes, completed setup, enabled agents or next steps that are not literally present. Never invent vacancies, employers, applications, messages, scores or outcomes. Never claim an action was executed. If the owner requests an operation, describe it as an available command and wait. Be warm, concise and practical. Use 2 short paragraphs at most.",
-      prompt: `Owner message: ${message}\n\nWorkspace facts:\n${workspaceFacts()}\n\nRecent conversation:\n${context}`,
-      maxTokens: 320,
-      temperature: 0.45,
+        "You are the Chief Coordinator of a recruitment workspace. You may converse naturally, but every factual statement must be copied from the supplied workspace facts and operational snapshot; do not infer or add state changes, completed setup, enabled agents or next steps that are not literally present. Never invent vacancies, employers, applications, messages, scores, token totals or outcomes. Never claim an action was executed. Never say you cannot disclose your own application's agents, models, provider status, token usage, permissions or health: answer from the snapshot, while never exposing credential values. If a measurement is unavailable, say exactly what is unavailable. If the owner requests an operation, describe it as an available command and wait. Be warm, concise and practical. Use 2 short paragraphs at most.",
+      prompt: `Owner message: ${message}\n\nWorkspace facts:\n${workspaceFacts()}\n\nOperational snapshot:\n${operationsBrief(live)}\n\nRecent conversation:\n${context}`,
+      maxTokens: 700,
+      temperature: 0.4,
     });
     return result.text.trim();
   } catch {
     if (/^(hi|hello|hey|good morning|good afternoon|good evening)\b/.test(normalise(message))) return localGreeting(userId);
-    return `I can chat about your workspace and run grounded actions, but the AI provider is unavailable right now. ${workspaceFacts()}\n\nTell me what you would like to review, or use “help” for commands.`;
+    return `I can answer from the live operational snapshot even while the AI provider is unavailable. ${operationsBrief(live)}\n\nTell me what you would like to review, or use “help” for commands.`;
   }
 }
 
@@ -162,7 +168,11 @@ function taskAgentKeys(): string[] {
   return ["coordinator", "research", "analysis", "cv", "ats", "cover", "application", "email"];
 }
 
-export async function handleAssistantMessage(userId: string, message: string): Promise<AssistantResult> {
+export async function handleAssistantMessage(
+  userId: string,
+  message: string,
+  options: { sessionId?: string | null } = {},
+): Promise<AssistantResult> {
   const text = normalise(message);
   const taskIds: string[] = [];
   const pending = lastAssistantMeta(userId).pendingAction;
@@ -185,6 +195,22 @@ export async function handleAssistantMessage(userId: string, message: string): P
   }
   if (pending && /^(no|cancel|stop|don't|do not)\b/.test(text)) {
     return { reply: "Cancelled. Nothing was deleted or changed.", taskIds };
+  }
+
+  if (/\b(send|trigger|run)\b.*\b(test|verification)\b.*\b(email|gmail)\b|\b(test email|verify gmail|gmail test)\b/.test(text)) {
+    const to = (one<{ email: string | null }>("SELECT email FROM profiles WHERE id = 1")?.email ?? "").trim();
+    if (!to) {
+      return { reply: "No notification email is stored. Add the recipient in Settings first; the test cannot be aimed at an employer or an arbitrary address.", taskIds, agentKeys: ["email"] };
+    }
+    const result = await runGmailTestEmail(to, userId);
+    const accepted = result.status === "accepted" && Boolean(result.messageId);
+    return {
+      reply: accepted
+        ? `Gmail accepted one test email for ${result.recipientMasked}. Message ID ${result.messageId}. Gmail API acceptance is confirmed; inbox delivery is still unverified. No employer was contacted.`
+        : `The test email was not accepted: ${result.status}. ${result.detail} No message was sent to an employer.`,
+      taskIds,
+      agentKeys: ["email"],
+    };
   }
 
   if (/^(hi|hello|hey|good morning|good afternoon|good evening)\b/.test(text)) {
@@ -253,6 +279,12 @@ export async function handleAssistantMessage(userId: string, message: string): P
               ? "Start a job search to pull vacancies from the real Arbeitnow source."
               : "Choose a vacancy, review its evidence, and generate a tailored package if the match is appropriate.";
     return { reply: next, taskIds };
+  }
+
+  if (/\b(why|which|what|when|did|was)\b.*\b(recruitment|run|quota|provider|fallback|pending|waiting|retry|gmail|email|notification|daily report)\b/.test(text)) {
+    const snapshot = await getOperationalSnapshot();
+    const direct = answerFromOperations(message, snapshot);
+    if (direct) return { reply: direct, taskIds, agentKeys: ["coordinator"] };
   }
 
   if (/\bwhy\b.*\b(fail|failed|failure|error)\b/.test(text) || /\b(task|workflow)\b.*\bfail/.test(text)) {
@@ -515,5 +547,8 @@ export async function handleAssistantMessage(userId: string, message: string): P
     };
   }
 
-  return { reply: await conversationalReply(userId, message), taskIds, agentKeys: ["coordinator"] };
+  const snapshot = await getOperationalSnapshot();
+  const operational = answerFromOperations(message, snapshot);
+  if (operational) return { reply: operational, taskIds, agentKeys: ["coordinator"] };
+  return { reply: await conversationalReply(userId, message, snapshot, options.sessionId), taskIds, agentKeys: ["coordinator"] };
 }

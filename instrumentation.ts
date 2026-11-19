@@ -8,6 +8,11 @@ export async function register(): Promise<void> {
   startTempCleanupScheduler();
   const { startAiQueue } = await import("./lib/ai-queue");
   startAiQueue();
+  // Durable email outbox and document recovery survive process restarts.
+  const { startNotificationQueue } = await import("./lib/notify");
+  startNotificationQueue();
+  const { startRecoveryQueue } = await import("./lib/recruitment-recovery");
+  startRecoveryQueue();
   // Persistent daily recruitment schedule. The row lives in SQLite; this timer
   // only asks the database whether a run is due.
   const { startRecruitmentScheduler } = await import("./lib/recruitment-ticker");

@@ -6,16 +6,18 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { OrbLevels, OrbState } from "./CosmicOrb";
 import { VoiceAssistant } from "./VoiceAssistant";
+import { agentDefinition } from "@/lib/agent-definitions";
+import { voiceProfileForAgent, type LiveVoiceId } from "@/lib/agent-voices";
 
 const CosmicOrb = dynamic(() => import("./CosmicOrb"), {
   ssr: false,
   loading: () => <div className="lv-orb-loading" aria-hidden="true" />,
 });
 
-type Msg = { id: string | number; role: string; content: string; created_at?: string };
+type Msg = { id: string | number; role: string; content: string; created_at?: string; agentKey?: AgentKey };
 type LiveState = "idle" | "connecting" | "listening" | "processing" | "speaking" | "interrupted" | "disconnected" | "error";
 type AgentKey = "coordinator" | "research" | "analysis" | "cv" | "ats" | "cover" | "application" | "email";
-type VoiceName = "Charon" | "Orus" | "Fenrir" | "Puck";
+type VoiceName = LiveVoiceId;
 
 type LiveSetup = {
   model: string;
@@ -44,17 +46,11 @@ type SessionPayload = {
   sessionId: string;
   model: string;
   voice: VoiceName;
+  voiceName?: string;
   greeting: boolean;
 };
 
 type ToolCall = { id?: string; name?: string; args?: Record<string, unknown> };
-
-const VOICES: Array<[VoiceName, string]> = [
-  ["Charon", "Charon — informative, calm male"],
-  ["Orus", "Orus — firm, composed male"],
-  ["Fenrir", "Fenrir — excitable male"],
-  ["Puck", "Puck — upbeat male"],
-];
 
 const AGENT_LABELS: Record<AgentKey, string> = {
   coordinator: "Chief Coordinator",
@@ -78,7 +74,6 @@ const STATUS: Record<LiveState, { label: string; hint: string; tone: string }> =
   error: { label: "Unavailable", hint: "Live voice could not start.", tone: "bad" },
 };
 
-const STORAGE_KEY = "atw.live.voice.v1";
 const SESSION_KEY = "atw.live.session.v1";
 
 function makeId(prefix: string): string {
@@ -102,10 +97,6 @@ function base64ToInt16(base64: string): Int16Array {
   return new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg[] }) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<LiveState>("idle");
@@ -114,10 +105,12 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   const [partialAssistant, setPartialAssistant] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [voice, setVoice] = useState<VoiceName>("Charon");
+  const [model, setModel] = useState("Gemini Live");
   const [muted, setMuted] = useState(false);
   const [activeAgent, setActiveAgent] = useState<AgentKey>("coordinator");
   const [usage, setUsage] = useState<{ prompt: number; response: number; total: number } | null>(null);
+  const usageRef = useRef<{ prompt: number; response: number; total: number } | null>(null);
+  const reportedUsage = useRef({ prompt: 0, response: 0, total: 0 });
   const [legacyOpen, setLegacyOpen] = useState(false);
   const [compactOrb, setCompactOrb] = useState(false);
 
@@ -130,7 +123,6 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionIdRef = useRef("");
   const activeAgentRef = useRef<AgentKey>("coordinator");
-  const voiceRef = useRef<VoiceName>("Charon");
   const stateRef = useRef<LiveState>("idle");
   const greetingRef = useRef(false);
   const resumptionHandle = useRef("");
@@ -176,27 +168,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   }, [activeAgent]);
 
   useEffect(() => {
-    voiceRef.current = voice;
-  }, [voice]);
-
-  useEffect(() => {
     try {
-      const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "{}") as { voice?: string };
-      if (VOICES.some(([name]) => name === saved.voice)) setVoice(saved.voice as VoiceName);
       const savedSession = window.sessionStorage.getItem(SESSION_KEY);
       if (savedSession && /^voice_[A-Za-z0-9_-]{6,80}$/.test(savedSession)) sessionIdRef.current = savedSession;
     } catch {
       // Private mode: the session still works without persistence.
     }
   }, []);
-
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ voice }));
-    } catch {
-      // Ignore private-mode storage failures.
-    }
-  }, [voice]);
 
   useEffect(() => {
     const query = window.matchMedia("(max-width: 700px)");
@@ -269,7 +247,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
 
   function appendMessage(role: "user" | "assistant", content: string) {
     if (!content.trim()) return;
-    setMessages((previous) => [...previous, { id: makeId("live-msg-"), role, content: content.trim() }]);
+    setMessages((previous) => [...previous, { id: makeId("live-msg-"), role, content: content.trim(), agentKey: activeAgentRef.current }]);
   }
 
   function stopPlayback() {
@@ -417,7 +395,12 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     }
   }
 
-  async function saveTurn(role: "user" | "assistant", content: string, interruptedTurn: boolean) {
+  async function saveTurn(
+    role: "user" | "assistant",
+    content: string,
+    interruptedTurn: boolean,
+    tokenDelta?: { promptTokens: number; completionTokens: number; totalTokens: number },
+  ) {
     if (!content.trim() || !sessionIdRef.current) return;
     try {
       await fetch("/api/voice/live/transcript", {
@@ -431,11 +414,25 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
           agentKey: activeAgentRef.current,
           taskIds: turnTaskIds.current,
           interrupted: interruptedTurn,
+          model,
+          usage: tokenDelta,
         }),
       });
     } catch {
       // A transcript write must never break the live conversation.
     }
+  }
+
+  function consumeUsageDelta(): { promptTokens: number; completionTokens: number; totalTokens: number } | undefined {
+    const current = usageRef.current;
+    if (!current) return undefined;
+    const delta = {
+      promptTokens: Math.max(0, current.prompt - reportedUsage.current.prompt),
+      completionTokens: Math.max(0, current.response - reportedUsage.current.response),
+      totalTokens: Math.max(0, current.total - reportedUsage.current.total),
+    };
+    reportedUsage.current = { prompt: current.prompt, response: current.response, total: current.total };
+    return delta.totalTokens > 0 ? delta : undefined;
   }
 
   function flushTranscripts() {
@@ -447,8 +444,9 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       void saveTurn("user", userText, wasInterrupted);
     }
     if (assistantText) {
+      const tokenDelta = consumeUsageDelta();
       appendMessage("assistant", assistantText);
-      void saveTurn("assistant", assistantText, wasInterrupted);
+      void saveTurn("assistant", assistantText, wasInterrupted, tokenDelta);
     }
     inputTranscript.current = "";
     outputTranscript.current = "";
@@ -462,15 +460,15 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   async function performHandoff(target: AgentKey) {
     if (switching.current) return;
     switching.current = true;
+    pendingHandoff.current = null;
     if (handoffTimer.current) {
       clearTimeout(handoffTimer.current);
       handoffTimer.current = null;
     }
-    const context = playbackContext.current;
-    const remaining = context ? Math.max(0, (nextPlaybackAt.current - context.currentTime) * 1000) : 0;
+    // Cut the old agent's speech immediately. The handoff must not wait for
+    // queued audio, a model turn or a timer before the identity changes.
+    stopPlayback();
     setNotice(`Switching to ${AGENT_LABELS[target]}…`);
-    await sleep(Math.min(7000, remaining + 220));
-    if (!mounted.current) return;
     flushTranscripts();
     setActiveAgent(target);
     activeAgentRef.current = target;
@@ -516,9 +514,8 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
           if (handoffTimer.current) clearTimeout(handoffTimer.current);
           handoffTimer.current = setTimeout(() => {
             const target = pendingHandoff.current;
-            pendingHandoff.current = null;
             if (target) void performHandoff(target);
-          }, 7000);
+          }, 250);
         }
       } catch (cause) {
         responses.push({
@@ -543,8 +540,9 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       inputTranscript.current = "";
     }
     if (assistantText) {
+      const tokenDelta = consumeUsageDelta();
       appendMessage("assistant", assistantText);
-      void saveTurn("assistant", assistantText, wasInterrupted);
+      void saveTurn("assistant", assistantText, wasInterrupted, tokenDelta);
       outputTranscript.current = "";
     }
     setPartialUser("");
@@ -572,7 +570,6 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       setState("listening");
     }
     const target = pendingHandoff.current;
-    pendingHandoff.current = null;
     if (target) void performHandoff(target);
   }
 
@@ -667,11 +664,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       | { promptTokenCount?: number; responseTokenCount?: number; totalTokenCount?: number }
       | undefined;
     if (usageMessage) {
-      setUsage({
+      const nextUsage = {
         prompt: usageMessage.promptTokenCount ?? 0,
         response: usageMessage.responseTokenCount ?? 0,
         total: usageMessage.totalTokenCount ?? 0,
-      });
+      };
+      usageRef.current = nextUsage;
+      setUsage(nextUsage);
     }
 
     const resumption = message.sessionResumptionUpdate as { newHandle?: string; resumable?: boolean } | undefined;
@@ -756,7 +755,6 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       body: JSON.stringify({
         agentKey,
         sessionId: sessionIdRef.current,
-        voice: voiceRef.current,
         greet,
       }),
     });
@@ -772,6 +770,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     }
     if (!payload.wsUrl || !payload.setup) throw new Error("The live voice session was incomplete.");
     sessionIdRef.current = payload.sessionId;
+    setModel(payload.model || "Gemini Live");
     try {
       window.sessionStorage.setItem(SESSION_KEY, payload.sessionId);
     } catch {
@@ -799,10 +798,14 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     }
     if (!options.preserveMessages) {
       setUsage(null);
+      usageRef.current = null;
+      reportedUsage.current = { prompt: 0, response: 0, total: 0 };
       resumptionHandle.current = "";
     }
     if (options.fresh) {
       sessionIdRef.current = makeId("voice_");
+      usageRef.current = null;
+      reportedUsage.current = { prompt: 0, response: 0, total: 0 };
       resumptionHandle.current = "";
       try {
         window.sessionStorage.setItem(SESSION_KEY, sessionIdRef.current);
@@ -818,6 +821,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     setError("");
     setNotice("");
     setState("connecting");
+    stopPlayback();
     greetingRef.current = Boolean(options.greet);
     ensurePlayback();
     closeSocket();
@@ -926,6 +930,8 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   const live = state !== "idle" && state !== "disconnected" && state !== "error";
   const connected = state === "listening" || state === "speaking" || state === "processing" || state === "interrupted";
   const badgeTone = state === "error" ? "badge-bad" : state === "speaking" || state === "listening" ? "badge-good" : "badge-info";
+  const activeProfile = voiceProfileForAgent(activeAgent);
+  const activeRole = agentDefinition(activeAgent)?.role ?? "Specialist";
   const orbState: OrbState = state === "idle" ? "IDLE"
     : state === "connecting" ? "CONNECTING"
       : state === "listening" ? "LISTENING"
@@ -939,7 +945,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       <button
         type="button"
         className={`header-cta voice-trigger ${open ? "active" : ""}`}
-        aria-label="Open the live Chief Coordinator"
+        aria-label="Open live voice"
         aria-expanded={open}
         onClick={handleTrigger}
       >
@@ -956,12 +962,12 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
 
       {open && typeof document !== "undefined" ? createPortal(
         <div className="lv-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closePanel(); }}>
-          <section className="lv-panel" role="dialog" aria-modal="true" aria-label="Chief Coordinator live voice">
+          <section className="lv-panel" role="dialog" aria-modal="true" aria-label={`${AGENT_LABELS[activeAgent]} live voice`}>
             <header className="lv-head">
               <div className="lv-title">
                 <span className="lv-head-mark" aria-hidden="true"><i /></span>
                 <div className="min-w-0">
-                  <div className="lv-eyebrow">AT AI AGENCY <span>· Chief Coordinator</span></div>
+                  <div className="lv-eyebrow">AT AI AGENCY <span>· {activeAgent === "coordinator" ? "Chief Coordinator" : activeRole}</span></div>
                   <h2>{AGENT_LABELS[activeAgent]}</h2>
                 </div>
               </div>
@@ -987,7 +993,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
               <div className="lv-meta">
                 <span className={`lv-presence ${connected ? "online" : ""}`}><i /> {connected ? "Connected" : state === "connecting" ? "Connecting" : "Not connected"}</span>
                 <span className={`lv-mic ${muted ? "is-muted" : live ? "is-live" : ""}`}><i /> {muted ? "Mic muted" : live ? "Mic live" : "Mic idle"}</span>
-                <span>{voice}</span>
+                <span>{activeProfile.voiceName} · {model}</span>
                 <span>English</span>
               </div>
             </div>
@@ -1017,13 +1023,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
             <div className="lv-transcript" ref={scrollRef}>
               {messages.length === 0 && !partialUser && !partialAssistant ? (
                 <div className="lv-empty">
-                  <p>One click starts a continuous conversation. Speak naturally, pause, or interrupt at any time.</p>
-                  <p className="hint">Try: “How many agents are working?” or “Bring the QA agent into this conversation.”</p>
+                  <p>One click starts a continuous conversation with {AGENT_LABELS[activeAgent]}. Speak naturally, pause, or interrupt at any time.</p>
+                  <p className="hint">{activeAgent === "coordinator" ? "Try: “How many agents are working, and which models are they using?” or “Transfer me to the research agent.”" : `You are speaking directly with ${activeRole} using ${activeProfile.voiceName}. Say “return to the coordinator” to go back.`}</p>
                 </div>
               ) : (
                 messages.slice(-8).map((message) => (
                   <div key={message.id} className={`lv-msg ${message.role === "user" ? "is-user" : "is-assistant"}`}>
-                    <div className="lv-msg-role">{message.role === "user" ? "You" : AGENT_LABELS[activeAgent]}</div>
+                    <div className="lv-msg-role">{message.role === "user" ? "You" : AGENT_LABELS[message.agentKey ?? activeAgent]}</div>
                     <div>{message.content}</div>
                   </div>
                 ))
@@ -1054,26 +1060,12 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
                 )}
               </div>
               <div className="lv-options">
-                <label className="lv-option">
-                  <span>Voice</span>
-                  <select
-                    className="select"
-                    value={voice}
-                    onChange={(event) => {
-                      const next = event.target.value as VoiceName;
-                      setVoice(next);
-                      voiceRef.current = next;
-                      if (live) setNotice("Voice change applies on the next session.");
-                    }}
-                  >
-                    {VOICES.map(([name, label]) => <option key={name} value={name}>{label}</option>)}
-                  </select>
-                </label>
-                {usage ? <span className="lv-usage">{usage.total.toLocaleString("en-GB")} tokens</span> : null}
+                <span className="lv-usage">Voice {activeProfile.voiceName} · assigned to {AGENT_LABELS[activeAgent]}</span>
+                {usage ? <span className="lv-usage">{usage.total.toLocaleString("en-GB")} session tokens</span> : null}
                 <Link href="/assistant" className="lv-text-link">Text chat</Link>
               </div>
               <p className="lv-privacy">
-                Continuous audio is sent directly to Google Gemini Live with a short-lived token. Raw microphone recordings are not stored; only completed transcripts are saved.
+                Continuous audio is sent directly to Google Gemini Live with a short-lived token. Each agent has a fixed server-assigned voice; switching agents switches the voice immediately. Raw microphone recordings are not stored; only completed transcripts are saved.
               </p>
             </footer>
           </section>

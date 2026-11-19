@@ -132,3 +132,56 @@ export function AgentStatusBadge({ status, enabled = true }: { status: string; e
     </span>
   );
 }
+
+export function AgentAvailabilityBadge({
+  state,
+  label,
+  detail,
+}: {
+  state: "online" | "offline" | "initialising" | "unavailable" | "degraded";
+  label: string;
+  detail?: string;
+}) {
+  const className =
+    state === "online"
+      ? "badge-good"
+      : state === "degraded"
+        ? "badge-warn"
+        : state === "unavailable"
+          ? "badge-bad"
+          : state === "initialising"
+            ? "badge-info"
+            : "badge-neutral";
+  return (
+    <span className={`badge ${className}`} title={detail}>
+      <span className={`dot ${state === "online" || state === "initialising" ? "dot-live" : ""}`} /> {label}
+    </span>
+  );
+}
+
+export function AgentTaskBadge({
+  state,
+  label,
+  detail,
+}: {
+  state: "idle" | "queued" | "running" | "thinking" | "waiting_tool" | "waiting_intervention" | "completed" | "failed" | "cancelled";
+  label: string;
+  detail?: string;
+}) {
+  const className =
+    state === "failed"
+      ? "badge-bad"
+      : state === "completed"
+        ? "badge-good"
+        : ["running", "thinking", "waiting_tool", "waiting_intervention"].includes(state)
+          ? "badge-info"
+          : state === "queued"
+            ? "badge-warn"
+            : "badge-neutral";
+  const active = ["running", "thinking", "waiting_tool", "waiting_intervention"].includes(state);
+  return (
+    <span className={`badge ${className}`} title={detail}>
+      <span className={`dot ${active ? "dot-live" : ""}`} /> {label}
+    </span>
+  );
+}

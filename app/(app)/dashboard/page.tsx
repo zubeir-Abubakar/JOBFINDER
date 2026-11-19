@@ -309,7 +309,7 @@ export default async function DashboardPage({
                     </div>
                     <AgentStatusBadge status={displayStatus} enabled={agent.enabled === 1} />
                   </div>
-                  <div className="desc">{agent.current_task ?? (displayStatus === "idle" ? "Idle — ready for a task" : agent.role)}</div>
+                  <div className="desc">{agent.current_task ?? (displayStatus === "idle" ? "Idle — no task assigned" : agent.role)}</div>
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className={`badge ${exec.tone}`} title={exec.detail} style={{ fontSize: 9.5 }}>
                       {exec.label}

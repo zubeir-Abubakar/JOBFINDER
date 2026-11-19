@@ -2,6 +2,7 @@ import { requireAdmin } from "@/lib/auth";
 import { PageHead, Flash } from "@/components/ui";
 import { param, relativeTime } from "@/lib/format";
 import { aiCounterReconciliation, aiUsageBySource, freeLlmConfigured, freeLlmPolicyIssue, gatewayCooldownStatus, ollamaEndpointLabel, providerBudget, providerHealth, recentUsage, usageSummary } from "@/lib/providers";
+import { providerHealthSnapshot } from "@/lib/provider-health";
 import { one } from "@/lib/db";
 import { testOllamaAction, testProvidersAction } from "@/lib/actions/admin";
 import { SubmitButton } from "@/components/SubmitButton";
@@ -23,6 +24,7 @@ export default async function AdminAiPage({
   const ollama = health.find((provider) => provider.name === "ollama");
   const legacy = health.filter((provider) => provider.name === "gemini" || provider.name === "openrouter");
   const cooldown = gatewayCooldownStatus();
+  const routeHealth = providerHealthSnapshot();
   const lastSuccess = one<{ provider: string; model: string; created_at: string }>(
     "SELECT provider, model, created_at FROM provider_usage WHERE status = 'ok' ORDER BY id DESC LIMIT 1",
   );
@@ -149,6 +151,37 @@ export default async function AdminAiPage({
               Authentication/configuration errors fail closed; they never trigger a fallback. Ollama is contacted only for recoverable rate limits, outages, network errors and timeouts.
             </div>
           </div>
+        </div>
+      </section>
+
+      <section className="card mb-4">
+        <div className="card-head">
+          <div>
+            <h2>Route health</h2>
+            <p className="card-sub">Persisted per-model failure state. Cooling routes are not retried until their cooldown expires.</p>
+          </div>
+          <span className={`badge ${routeHealth.length ? "badge-warn" : "badge-good"}`}>
+            {routeHealth.length ? `${routeHealth.length} route(s) limited` : "all clear"}
+          </span>
+        </div>
+        <div className="card-body stack text-[12px]" style={{ gap: 7 }}>
+          {routeHealth.length === 0 ? (
+            <p style={{ color: "var(--muted)" }}>No failed or cooling FreeLLMAPI/Ollama route is recorded.</p>
+          ) : (
+            routeHealth.map((route) => (
+              <div key={`${route.provider}-${route.model}`} className="between" style={{ alignItems: "flex-start", gap: 12 }}>
+                <div>
+                  <div className="cell-title">{route.provider} / {route.model}</div>
+                  <div className="cell-sub">{route.kind?.replace(/_/g, " ") ?? route.status}{route.reason ? ` · ${route.reason.slice(0, 180)}` : ""}</div>
+                </div>
+                <span className={`badge ${route.remainingMs > 0 ? "badge-warn" : "badge-bad"}`}>
+                  {route.remainingMs > 0
+                    ? `${Math.ceil(route.remainingMs / 1000)}s cooldown`
+                    : route.status.replace(/_/g, " ")}
+                </span>
+              </div>
+            ))
+          )}
         </div>
       </section>
 

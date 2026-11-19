@@ -115,9 +115,17 @@ export function agentAvailability(key: string): AgentAvailability {
  * non-terminal states. Completed/failed remain historical facts, which is why
  * the UI must label them as history when no workflow is running.
  */
-export function effectiveAgentStatus(status: string, enabled: boolean, availability: AgentAvailability): string {
+export function effectiveAgentStatus(
+  status: string,
+  enabled: boolean,
+  availability: AgentAvailability,
+  options: { hasActiveWorkflow?: boolean } = {},
+): string {
   if (!enabled) return status;
-  if (["paused", "working", "thinking", "failed", "completed"].includes(status)) return status;
+  if (["paused", "working", "thinking", "failed"].includes(status)) return status;
+  // "Completed" is a task outcome, not current availability. With no live
+  // assignment the roster shows Idle and keeps the task as history.
+  if (status === "completed") return "idle";
   if (!availability.available) return "unavailable";
   return status;
 }

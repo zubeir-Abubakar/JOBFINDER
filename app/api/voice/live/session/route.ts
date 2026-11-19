@@ -3,10 +3,9 @@ import {
   createLiveSession,
   isLiveAgentKey,
   liveVoiceConfig,
-  normaliseVoice,
   safeSessionId,
-  type LiveVoiceName,
 } from "@/lib/live-voice";
+import { voiceProfileForAgent } from "@/lib/agent-voices";
 import { randomId } from "@/lib/security";
 
 export const dynamic = "force-dynamic";
@@ -40,7 +39,9 @@ export async function POST(request: Request) {
   const requestedAgent = typeof body?.agentKey === "string" ? body.agentKey : "coordinator";
   const agentKey = isLiveAgentKey(requestedAgent) ? requestedAgent : "coordinator";
   const sessionId = safeSessionId(body?.sessionId);
-  const voice: LiveVoiceName = normaliseVoice(typeof body?.voice === "string" ? body.voice : config.voice);
+  // The agent assignment is the only source of truth for the voice. A client
+  // cannot choose a different voice, which keeps identity and audio aligned.
+  const profile = voiceProfileForAgent(agentKey);
   const greet = body?.greet !== false;
 
   // Prevent a single page from minting tokens in a tight loop. A reconnect
@@ -57,7 +58,7 @@ export async function POST(request: Request) {
       userId: user.id,
       agentKey,
       sessionId,
-      voice,
+      voice: profile.voiceId,
       greet,
     });
     return Response.json(session, {
@@ -82,8 +83,11 @@ export async function GET() {
       configured: config.configured,
       missing: config.missing,
       model: config.model,
-      voice: config.voice,
-      voices: ["Charon", "Orus", "Fenrir", "Puck"],
+      voice: voiceProfileForAgent("coordinator").voiceName,
+      voices: ["coordinator", "research", "analysis", "cv", "ats", "cover", "application", "email"].map((key) => {
+        const profile = voiceProfileForAgent(key);
+        return { agentKey: key, voiceId: profile.voiceId, voiceName: profile.voiceName };
+      }),
       sessionPrefix: `voice_${randomId().slice(0, 6)}`,
     },
     { headers: { "Cache-Control": "no-store" } },

@@ -166,6 +166,21 @@ test("Ollama disabled alone never makes a provider available", () => {
   });
 });
 
+test("Gemini and OpenRouter credentials never count as a text route", () => {
+  withEnv(
+    {
+      FREELLMAPI_ENABLED: "false",
+      OLLAMA_ENABLED: "false",
+      GEMINI_API_KEY: "test-gemini-key",
+      OPENROUTER_ENABLED: "true",
+      OPENROUTER_API_KEY: "test-openrouter-key",
+    },
+    () => {
+      assert.equal(providerConfigured(), false);
+    },
+  );
+});
+
 test("an unset FreeLLMAPI model does not disable a healthy Ollama fallback", () => {
   withEnv(
     {

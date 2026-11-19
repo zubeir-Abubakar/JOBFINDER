@@ -6,6 +6,7 @@ import { formatDateTime, param } from "@/lib/format";
 import { saveEmailConfigAction } from "@/lib/actions/admin";
 import { SubmitButton } from "@/components/SubmitButton";
 import { accountStatus } from "@/lib/gmail";
+import { notificationQueueSnapshot } from "@/lib/notify";
 import { connectGmailAction, disconnectGmailAction, syncGmailAction } from "@/lib/actions/gmail";
 
 export const dynamic = "force-dynamic";
@@ -19,10 +20,11 @@ export default async function AdminEmailPage({
   const sp = await searchParams;
   const settings = getSettings();
   const email = settings.email ?? { provider: "gmail", connected: false, sender: "", account: "" };
-  const notifications = all<{ id: number; kind: string; subject: string; channel: string; status: string; created_at: string }>(
-    "SELECT id, kind, subject, channel, status, created_at FROM notifications ORDER BY id DESC LIMIT 15",
+  const notifications = all<{ id: number; kind: string; subject: string; channel: string; status: string; delivery_status: string | null; provider_message_id: string | null; created_at: string }>(
+    "SELECT id, kind, subject, channel, status, delivery_status, provider_message_id, created_at FROM notifications ORDER BY id DESC LIMIT 15",
   );
   const gmail = accountStatus();
+  const outbox = notificationQueueSnapshot();
 
   return (
     <>
@@ -89,8 +91,7 @@ export default async function AdminEmailPage({
                 <input type="checkbox" name="connected" defaultChecked={email.connected} /> Mark the provider as connected
               </label>
               <div className="alert alert-info">
-                Marking this connected does not send anything by itself. The explicit test in Settings can send one message through the connected Gmail account;
-                automatic notification emails are not implemented. In-app notifications remain independent of email delivery.
+                Marking this connected does not send anything by itself. Notification emails use a durable outbox with deduplication and bounded retries. Gmail API acceptance is recorded as delivery “accepted”, never as confirmed inbox delivery. In-app notifications remain independent of email delivery.
               </div>
               <SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save email configuration</SubmitButton>
             </form>
@@ -119,6 +120,11 @@ export default async function AdminEmailPage({
             </div>
           </div>
           <div className="card-body">
+            <div className="card-quiet p-3 mb-3 text-[11.5px] leading-relaxed">
+              <strong>Delivery outbox:</strong> {outbox.counts.pending} pending · {outbox.counts.retry_scheduled} retry scheduled · {outbox.counts.sending} sending · {outbox.counts.sent} accepted by Gmail · {outbox.counts.failed} failed.
+              {outbox.lastError?.last_error ? <div className="mt-1"><strong>Last delivery error:</strong> {outbox.lastError.last_error}</div> : null}
+              {outbox.lastAccepted ? <div className="mt-1"><strong>Last accepted:</strong> {outbox.lastAccepted.kind ?? "email"} · message {outbox.lastAccepted.provider_message_id ?? "none"} · {outbox.lastAccepted.finished_at ? formatDateTime(outbox.lastAccepted.finished_at) : "unknown"}</div> : null}
+            </div>
             {notifications.length === 0 ? (
               <div className="empty">No notifications yet.</div>
             ) : (
@@ -128,7 +134,7 @@ export default async function AdminEmailPage({
                     <span className="feed-dot">·</span>
                     <div>
                       <div className="feed-text">{n.subject}</div>
-                      <div className="feed-time">{n.kind} · {n.channel} · {n.status} · {formatDateTime(n.created_at)}</div>
+                      <div className="feed-time">{n.kind} · {n.channel} · {n.status} · delivery {n.delivery_status ?? "not-requested"}{n.provider_message_id ? ` · ${n.provider_message_id}` : ""} · {formatDateTime(n.created_at)}</div>
                     </div>
                   </div>
                 ))}

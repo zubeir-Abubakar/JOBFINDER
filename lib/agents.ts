@@ -86,10 +86,13 @@ export function startTask(agentKey: string, workflowId: string, title: string, d
     throw new Error(`${agentIdentity(agentKey).name} is unavailable. Missing dependency: ${availability.dependency}. ${availability.reason}`);
   }
   const id = `task_${randomId()}`;
+  const at = nowIso();
   run(
-    "INSERT INTO tasks (id, workflow_id, agent_key, title, status, detail, execution_mode, created_at, started_at) VALUES (?, ?, ?, ?, 'running', ?, 'deterministic', ?, ?)",
-    [id, workflowId, agentKey, title, detail, nowIso(), nowIso()],
+    "INSERT INTO tasks (id, workflow_id, agent_key, title, status, detail, execution_mode, created_at, started_at) VALUES (?, ?, ?, ?, 'queued', ?, 'deterministic', ?, ?)",
+    [id, workflowId, agentKey, title, detail, at, at],
   );
+  emitWorkflowEvent({ workflowId, type: "agent.queued", agentKey, message: `${agentIdentity(agentKey).shortName} queued: ${title}`, meta: { taskId: id, detail } });
+  run("UPDATE tasks SET status = 'running' WHERE id = ?", [id]);
   if (agentKeyExists(agentKey)) {
     run("UPDATE agents SET status = 'working', current_task = ? WHERE key = ?", [title, agentKey]);
   }
@@ -114,6 +117,25 @@ export function markAgentThinking(agentKey: string): void {
 
 export function markAgentWorking(agentKey: string): void {
   run("UPDATE agents SET status = 'working' WHERE key = ? AND status = 'thinking'", [agentKey]);
+}
+
+/** Durable non-terminal task states used by provider/document recovery. */
+export function setTaskWaiting(
+  taskId: string,
+  agentKey: string,
+  state: "waiting_provider" | "retry_scheduled" | "waiting_intervention",
+  reason: string,
+  nextRetryAt: string | null = null,
+): void {
+  run("UPDATE tasks SET status = ?, state_reason = ?, next_retry_at = ? WHERE id = ?", [state, reason.slice(0, 1200), nextRetryAt, taskId]);
+  if (agentKeyExists(agentKey)) {
+    run("UPDATE agents SET status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'idle' END, current_task = NULL WHERE key = ?", [agentKey]);
+  }
+}
+
+export function resumeTask(taskId: string, agentKey: string): void {
+  run("UPDATE tasks SET status = 'running', state_reason = NULL, next_retry_at = NULL, started_at = COALESCE(started_at, ?) WHERE id = ?", [nowIso(), taskId]);
+  if (agentKeyExists(agentKey)) run("UPDATE agents SET status = 'working' WHERE key = ?", [agentKey]);
 }
 
 export function completeTask(taskId: string, agentKey: string, output: string, requiresInput = false): void {

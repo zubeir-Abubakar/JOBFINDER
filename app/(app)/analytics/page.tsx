@@ -1,16 +1,19 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth";
-import { all, one } from "@/lib/db";
 import { PageHead, Stat, Empty } from "@/components/ui";
-import { BarChart, Funnel } from "@/components/charts";
+import { BarChart, Funnel, PieChart, RankingBars } from "@/components/charts";
+import { getAnalytics, resolveAnalyticsRange } from "@/lib/analytics";
+import { agentIdentity } from "@/lib/agent-identity";
 import { formatDate, param, pct } from "@/lib/format";
-import { statusLabel } from "@/lib/application-status";
 
 export const dynamic = "force-dynamic";
 
-function dayKey(date: Date): string {
-  return date.toISOString().slice(0, 10);
-}
+const PRESETS = [
+  { key: "today", label: "Today" },
+  { key: "7", label: "Last 7 days" },
+  { key: "30", label: "Last 30 days" },
+  { key: "all", label: "All time" },
+] as const;
 
 export default async function AnalyticsPage({
   searchParams,
@@ -19,105 +22,23 @@ export default async function AnalyticsPage({
 }) {
   await requireUser();
   const sp = await searchParams;
-  const today = new Date();
-  const defaultFrom = new Date(today.getTime() - 29 * 86400_000);
-  const from = param(sp.from) || dayKey(defaultFrom);
-  const to = param(sp.to) || dayKey(today);
-  const period = param(sp.report) || "daily";
-
-  const discoveredByDay = all<{ d: string; c: number }>(
-    "SELECT date(discovered_at) AS d, COUNT(*) AS c FROM jobs WHERE date(discovered_at) BETWEEN ? AND ? GROUP BY d ORDER BY d",
-    [from, to],
-  );
-  const dayMap = new Map(discoveredByDay.map((r) => [r.d, r.c]));
-  const days: Array<{ label: string; value: number }> = [];
-  const cursor = new Date(`${from}T00:00:00Z`);
-  const end = new Date(`${to}T00:00:00Z`);
-  const span = Math.min(60, Math.max(1, Math.round((end.getTime() - cursor.getTime()) / 86400_000) + 1));
-  for (let i = 0; i < span; i += 1) {
-    const key = dayKey(cursor);
-    days.push({ label: key.slice(5), value: dayMap.get(key) ?? 0 });
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
-  }
-
-  const weekly: Array<{ label: string; value: number }> = [];
-  for (let i = 7; i >= 0; i -= 1) {
-    const start = new Date(today.getTime() - (i + 1) * 7 * 86400_000);
-    const finish = new Date(today.getTime() - i * 7 * 86400_000);
-    const count = one<{ c: number }>(
-      "SELECT COUNT(*) AS c FROM applications WHERE submitted_at >= ? AND submitted_at < ?",
-      [start.toISOString(), finish.toISOString()],
-    )?.c ?? 0;
-    weekly.push({ label: `W-${i}`, value: count });
-  }
-
-  const monthly: Array<{ label: string; value: number }> = [];
-  for (let i = 5; i >= 0; i -= 1) {
-    const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - i, 1));
-    const finish = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() - i + 1, 1));
-    const count = one<{ c: number }>(
-      "SELECT COUNT(*) AS c FROM applications WHERE submitted_at >= ? AND submitted_at < ?",
-      [start.toISOString(), finish.toISOString()],
-    )?.c ?? 0;
-    monthly.push({ label: start.toLocaleDateString("en-GB", { month: "short" }), value: count });
-  }
-
-  const statusRows = all<{ status: string; c: number }>(
-    "SELECT status, COUNT(*) AS c FROM applications GROUP BY status ORDER BY c DESC",
-  );
-  const submitted = one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE submitted_at IS NOT NULL")?.c ?? 0;
-  const interviews = one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('interview_invited','interview_completed','offer_received')")?.c ?? 0;
-  const offers = one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'offer_received'")?.c ?? 0;
-  const rejected = one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'rejected'")?.c ?? 0;
-  const responded = one<{ c: number }>(
-    "SELECT COUNT(*) AS c FROM applications WHERE status IN ('acknowledged','interview_invited','interview_completed','offer_received','rejected')",
-  )?.c ?? 0;
-
-  const funnel = [
-    { label: "Vacancies discovered", value: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs")?.c ?? 0 },
-    { label: "Vacancies analysed", value: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NOT NULL")?.c ?? 0 },
-    { label: "Suitable matches", value: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_flag IN ('strong','possible')")?.c ?? 0 },
-    { label: "Application packages", value: one<{ c: number }>("SELECT COUNT(DISTINCT job_id) AS c FROM documents WHERE kind = 'tailored_cv' AND deleted_at IS NULL")?.c ?? 0 },
-    { label: "Submitted", value: submitted },
-    { label: "Interviews", value: interviews },
-    { label: "Offers", value: offers },
-  ];
-
-  const topTitles = all<{ title: string; c: number; submitted: number }>(
-    `SELECT j.title, COUNT(*) AS c, SUM(CASE WHEN a.submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted
-     FROM applications a JOIN jobs j ON j.id = a.job_id GROUP BY lower(j.title) ORDER BY c DESC LIMIT 6`,
-  );
-  const topLocations = all<{ location: string; c: number }>(
-    `SELECT COALESCE(j.location, 'Unknown') AS location, COUNT(*) AS c FROM applications a JOIN jobs j ON j.id = a.job_id
-     GROUP BY lower(COALESCE(j.location,'Unknown')) ORDER BY c DESC LIMIT 6`,
-  );
-  const sourcePerformance = all<{ source: string; total: number; submitted: number }>(
-    `SELECT j.source, COUNT(*) AS total, SUM(CASE WHEN a.submitted_at IS NOT NULL THEN 1 ELSE 0 END) AS submitted
-     FROM applications a JOIN jobs j ON j.id = a.job_id GROUP BY j.source ORDER BY total DESC`,
-  );
-  const cvPerformance = all<{ version: string | null; ats: number | null; c: number }>(
-    `SELECT d.version, d.ats_score AS ats, COUNT(a.id) AS c FROM documents d
-     LEFT JOIN applications a ON a.cv_document_id = d.id AND a.submitted_at IS NOT NULL
-     WHERE d.kind = 'tailored_cv' AND d.deleted_at IS NULL GROUP BY d.id ORDER BY d.created_at DESC LIMIT 8`,
-  );
-
-  const reportWindow = period === "weekly" ? 7 : period === "monthly" ? 30 : 1;
-  const since = new Date(Date.now() - reportWindow * 86400_000).toISOString();
-  const report = {
-    discovered: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE discovered_at >= ?", [since])?.c ?? 0,
-    strong: one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_flag = 'strong' AND discovered_at >= ?", [since])?.c ?? 0,
-    prepared: one<{ c: number }>("SELECT COUNT(*) AS c FROM documents WHERE created_at >= ? AND kind = 'tailored_cv'", [since])?.c ?? 0,
-    submitted: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE submitted_at >= ?", [since])?.c ?? 0,
-    awaiting: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'awaiting_approval'")?.c ?? 0,
-    failures: one<{ c: number }>("SELECT COUNT(*) AS c FROM tasks WHERE status = 'failed' AND created_at >= ?", [since])?.c ?? 0,
-    responses: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('acknowledged','interview_invited','interview_completed','offer_received','rejected') AND last_update >= ?", [since])?.c ?? 0,
-  };
+  const range = resolveAnalyticsRange({
+    preset: param(sp.preset),
+    from: param(sp.from),
+    to: param(sp.to),
+  });
+  const data = getAnalytics(range);
+  const verified = data.funnel.find((step) => step.label === "Verified submissions")?.value ?? 0;
+  const prepared = data.funnel.find((step) => step.label === "Applications prepared")?.value ?? 0;
+  const activeAgents = data.agentDistribution.find((slice) => slice.label === "Running")?.value ?? 0;
+  const spanDays = Math.max(1, Math.round((Date.parse(`${range.to}T00:00:00Z`) - Date.parse(`${range.from}T00:00:00Z`)) / 86_400_000) + 1);
+  const trendHeading = spanDays > 92 ? "Weekly activity" : "Daily activity";
 
   return (
     <>
       <PageHead
         title="Analytics & reporting"
-        sub="Every chart is computed from your database. Where there is no data, the chart stays empty rather than showing sample numbers."
+        sub="Live workforce intelligence computed from SQLite. Every chart follows the selected window; empty ranges stay empty instead of showing sample data."
         actions={
           <>
             <a href="/api/export/applications" className="btn">Export applications</a>
@@ -126,179 +47,329 @@ export default async function AnalyticsPage({
         }
       />
 
-      <form method="get" className="card mb-4">
-        <div className="card-body flex flex-wrap items-end gap-2" style={{ paddingTop: 16 }}>
-          <div>
-            <label className="label" htmlFor="from">From</label>
-            <input id="from" name="from" type="date" className="input" defaultValue={from} />
+      <section className="card mb-4 analytics-filter">
+        <div className="card-body stack" style={{ paddingTop: 16 }}>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {PRESETS.map((preset) => {
+              const href = `/analytics?${preset.key === "all" ? `preset=all&to=${range.to}` : `preset=${preset.key}`}#charts`;
+              return (
+                <Link key={preset.key} href={href} className={`btn btn-sm ${range.preset === preset.key ? "btn-primary" : ""}`}>
+                  {preset.label}
+                </Link>
+              );
+            })}
+            <span className="ml-auto badge badge-neutral">{range.label}</span>
           </div>
-          <div>
-            <label className="label" htmlFor="to">To</label>
-            <input id="to" name="to" type="date" className="input" defaultValue={to} />
-          </div>
-          <button type="submit" className="btn btn-primary">Apply date filter</button>
-          <Link href="/analytics" className="btn">Reset</Link>
-          <span className="ml-auto text-[11px]" style={{ color: "var(--muted)" }}>Counting {span} day(s)</span>
+          <form method="get" className="flex flex-wrap items-end gap-2">
+            <input type="hidden" name="preset" value="custom" />
+            <div>
+              <label className="label" htmlFor="from">From</label>
+              <input id="from" name="from" type="date" className="input" defaultValue={range.from} />
+            </div>
+            <div>
+              <label className="label" htmlFor="to">To</label>
+              <input id="to" name="to" type="date" className="input" defaultValue={range.to} />
+            </div>
+            <button type="submit" className="btn btn-primary">Apply custom range</button>
+            <Link href="/analytics" className="btn">Reset</Link>
+            <span className="text-[11px] ml-auto" style={{ color: "var(--muted)" }}>
+              {formatDate(range.from)} — {formatDate(range.to)}
+            </span>
+          </form>
         </div>
-      </form>
+      </section>
 
       <section className="stats mb-4">
-        <Stat label="Submitted" value={submitted} tone="good" />
-        <Stat label="Interview conversion" value={`${pct(interviews, submitted)}%`} note={`${interviews} of ${submitted}`} tone={interviews ? "good" : undefined} />
-        <Stat label="Employer response rate" value={`${pct(responded, submitted)}%`} note={`${responded} responded`} />
-        <Stat label="Rejection rate" value={`${pct(rejected, submitted)}%`} note={`${rejected} rejected`} tone={rejected ? "bad" : undefined} />
-        <Stat label="Offers" value={offers} tone={offers ? "good" : undefined} />
+        <Stat label="Verified submissions" value={verified} note={`${data.outcomesTotal} application record(s) in range`} tone="good" />
+        <Stat label="Packages prepared" value={prepared} note="Tailored CV or cover letter" />
+        <Stat label="Tokens used" value={data.tokens.total.toLocaleString("en-GB")} note={`${data.tokens.calls} inference call(s)`} />
+        <Stat label="Agents running" value={activeAgents} note="Current execution state" tone={activeAgents ? "info" : undefined} />
+        <Stat label="Inference cost" value="Unverified" note="No verified price data" tone="warn" />
+      </section>
+
+      <div id="charts" />
+
+      <div className="grid g2 mb-4">
+        <section className="card">
+          <div className="card-head">
+            <div>
+              <h2>Agent distribution</h2>
+              <p className="card-sub">Current availability combined with latest task in this range.</p>
+            </div>
+          </div>
+          <div className="card-body">
+            <PieChart data={data.agentDistribution} label="agents" emptyLabel="No agent data" />
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head">
+            <div>
+              <h2>Provider distribution</h2>
+              <p className="card-sub">
+                Actual inference records by provider, measured by {data.providerMetric === "tokens" ? "tokens" : "calls"}.
+              </p>
+            </div>
+          </div>
+          <div className="card-body">
+            <PieChart data={data.providerDistribution} label={data.providerMetric === "tokens" ? "tokens" : "calls"} emptyLabel="No inference calls in this range" />
+          </div>
+        </section>
+      </div>
+
+      <section className="card mb-4">
+        <div className="card-head">
+          <div>
+            <h2>Model usage</h2>
+            <p className="card-sub">Token consumption by the model that actually served the call.</p>
+          </div>
+          <span className="badge badge-neutral">{data.modelUsage.length} model route(s)</span>
+        </div>
+        {data.modelUsage.length === 0 ? (
+          <div className="card-body"><Empty title="No model usage in this range" /></div>
+        ) : (
+          <div className="card-body grid g2">
+            <PieChart
+              data={data.modelUsage.map((row, index) => ({
+                label: row.model,
+                value: row.totalTokens,
+                detail: `${row.provider} · ${row.percentage}% of tokens`,
+                tone: (["accent", "cyan", "violet", "amber", "danger"] as const)[index % 5],
+              }))}
+              label="tokens"
+            />
+            <div className="table-wrap">
+              <table className="data">
+                <thead>
+                  <tr><th>Model</th><th>Calls</th><th>Input</th><th>Output</th><th>Total</th><th>Share</th></tr>
+                </thead>
+                <tbody>
+                  {data.modelUsage.map((row) => (
+                    <tr key={`${row.provider}-${row.model}`}>
+                      <td><span className="cell-title">{row.model}</span><div className="cell-sub">{row.provider}</div></td>
+                      <td className="num">{row.calls}</td>
+                      <td className="num">{row.inputTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.outputTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.totalTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.percentage}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </section>
 
       <div className="grid g2 mb-4">
         <section className="card">
           <div className="card-head">
             <div>
-              <h2>Jobs discovered per day</h2>
-              <p className="card-sub">{formatDate(from)} — {formatDate(to)}</p>
+              <h2>Agent productivity</h2>
+              <p className="card-sub">Successful, failed and other task outcomes in this range.</p>
             </div>
           </div>
           <div className="card-body">
-            {discoveredByDay.length === 0 ? <Empty title="No discoveries in this range" /> : <BarChart data={days} />}
+            <PieChart data={data.productivity} label="tasks" emptyLabel="No tasks in this range" />
           </div>
         </section>
+
         <section className="card">
           <div className="card-head">
             <div>
-              <h2>Applications per week</h2>
-              <p className="card-sub">Last 8 weeks, confirmed submissions only</p>
+              <h2>Task completion ranking</h2>
+              <p className="card-sub">Which agents complete the most work.</p>
             </div>
           </div>
-          <div className="card-body"><BarChart data={weekly} /></div>
-        </section>
-        <section className="card">
-          <div className="card-head">
-            <div>
-              <h2>Applications per month</h2>
-              <p className="card-sub">Last 6 calendar months</p>
-            </div>
+          <div className="card-body">
+            <RankingBars
+              data={data.productivityRanking.map((row) => ({
+                label: row.name,
+                value: row.completed,
+                detail: `${row.failed} failed · ${row.other} other`,
+              }))}
+            />
           </div>
-          <div className="card-body"><BarChart data={monthly} /></div>
         </section>
+      </div>
+
+      <div className="grid g2 mb-4">
         <section className="card">
           <div className="card-head">
             <div>
               <h2>Recruitment funnel</h2>
-              <p className="card-sub">From discovery to offer</p>
+              <p className="card-sub">Prepared and attempted are never counted as verified.</p>
             </div>
           </div>
-          <div className="card-body"><Funnel steps={funnel} /></div>
+          <div className="card-body">
+            <Funnel steps={data.funnel} />
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head">
+            <div>
+              <h2>Application outcomes</h2>
+              <p className="card-sub">Mutually exclusive categories reconciling to {data.outcomesTotal} record(s).</p>
+            </div>
+          </div>
+          <div className="card-body">
+            <PieChart data={data.outcomes} label="applications" emptyLabel="No applications in this range" />
+          </div>
+        </section>
+      </div>
+
+      <section className="card mb-4">
+        <div className="card-head">
+          <div>
+            <h2>{range.from === range.to ? "Daily" : trendHeading}</h2>
+            <p className="card-sub">Time series for vacancies, packages, verified submissions, agent tasks and token consumption. Long ranges are grouped into seven-day buckets.</p>
+          </div>
+        </div>
+        <div className="card-body grid g2">
+          {([
+            ["Vacancies discovered", data.trends.vacancies, ""],
+            ["Applications prepared", data.trends.prepared, ""],
+            ["Verified submissions", data.trends.verified, ""],
+            ["Agent task activity", data.trends.tasks, ""],
+            ["Token consumption", data.trends.tokens, " tokens"],
+          ] as Array<[string, Array<{ label: string; value: number }>, string]>).map(([label, series, suffix]) => (
+            <div className="analytics-chart" key={String(label)}>
+              <div className="between mb-2">
+                <span className="text-[12.5px] font-semibold">{label as string}</span>
+                <span className="text-[10.5px] num" style={{ color: "var(--muted)" }}>
+                  {series.reduce((sum, point) => sum + point.value, 0).toLocaleString("en-GB")}{suffix as string}
+                </span>
+              </div>
+              <BarChart data={series} height={132} suffix={String(suffix)} />
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="card mb-4">
+        <div className="card-head">
+          <div>
+            <h2>Weekly totals</h2>
+            <p className="card-sub">The selected range grouped into seven-day buckets.</p>
+          </div>
+        </div>
+        <div className="table-wrap">
+          <table className="data">
+            <thead>
+              <tr><th>Week</th><th>Vacancies</th><th>Prepared</th><th>Verified</th><th>Tasks</th><th>Tokens</th></tr>
+            </thead>
+            <tbody>
+              {data.weekly.vacancies.map((point, index) => (
+                <tr key={`${point.label}-${index}`}>
+                  <td className="cell-title">{point.label}</td>
+                  <td className="num">{point.value}</td>
+                  <td className="num">{data.weekly.prepared[index]?.value ?? 0}</td>
+                  <td className="num">{data.weekly.verified[index]?.value ?? 0}</td>
+                  <td className="num">{data.weekly.tasks[index]?.value ?? 0}</td>
+                  <td className="num">{(data.weekly.tokens[index]?.value ?? 0).toLocaleString("en-GB")}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <div className="grid g2 mb-4">
+        <section className="card">
+          <div className="card-head"><div><h2>Token usage</h2><p className="card-sub">Provider-reported and estimated counts stay separate.</p></div></div>
+          <div className="card-body stack" style={{ gap: 9 }}>
+            {[
+              ["Input tokens", data.tokens.input],
+              ["Output tokens", data.tokens.output],
+              ["Total tokens", data.tokens.total],
+              ["Cached tokens", data.tokens.cached],
+              ["Provider-reported", data.tokens.providerReported],
+              ["Estimated", data.tokens.estimated],
+              ["Historical / unknown source", data.tokens.unknown],
+              ["Local Ollama tokens", data.tokens.local],
+              ["External API tokens", data.tokens.external],
+            ].map(([label, value]) => (
+              <div className="between text-[12.5px]" key={String(label)}>
+                <span style={{ color: "var(--muted)" }}>{label}</span>
+                <span className="num font-semibold">{Number(value).toLocaleString("en-GB")}</span>
+              </div>
+            ))}
+            <div className="card-quiet p-3 text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+              Cost is <strong>unverified</strong>, not a measured zero. {data.tokens.costDetail}
+            </div>
+          </div>
+        </section>
+
+        <section className="card">
+          <div className="card-head"><div><h2>Usage by agent</h2><p className="card-sub">Actual inference records; failed calls are included where recorded.</p></div></div>
+          <div className="table-wrap">
+            {data.tokens.byAgent.length === 0 ? <Empty title="No inference usage" /> : (
+              <table className="data">
+                <thead><tr><th>Agent</th><th>Calls</th><th>Input</th><th>Output</th><th>Total</th></tr></thead>
+                <tbody>
+                  {data.tokens.byAgent.map((row) => (
+                    <tr key={row.agentKey}>
+                      <td><span className="cell-title">{agentIdentity(row.agentKey).shortName}</span></td>
+                      <td className="num">{row.calls}</td>
+                      <td className="num">{row.inputTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.outputTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.totalTokens.toLocaleString("en-GB")}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
         </section>
       </div>
 
       <div className="grid g2 mb-4">
         <section className="card">
-          <div className="card-head"><div><h2>Application status distribution</h2></div></div>
-          <div className="card-body">
-            {statusRows.length === 0 ? <Empty title="No applications recorded" /> : (
-              <div className="stack" style={{ gap: 8 }}>
-                {statusRows.map((row) => (
-                  <div key={row.status} className="between">
-                    <span className="text-[12.5px]">{statusLabel(row.status)}</span>
-                    <div className="flex items-center gap-2">
-                      <div style={{ width: 120 }} className="bar"><span style={{ width: `${pct(row.c, statusRows.reduce((s, r) => s + r.c, 0))}%` }} /></div>
-                      <span className="num text-[12px]" style={{ minWidth: 24, textAlign: "right" }}>{row.c}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
+          <div className="card-head"><div><h2>Usage by provider</h2></div></div>
+          <div className="table-wrap">
+            {data.tokens.byProvider.length === 0 ? <Empty title="No provider usage" /> : (
+              <table className="data">
+                <thead><tr><th>Provider</th><th>Calls</th><th>Total</th><th>Reported</th><th>Estimated</th></tr></thead>
+                <tbody>
+                  {data.tokens.byProvider.map((row, index) => (
+                    <tr key={`${row.provider}-${row.model}-${index}`}>
+                      <td><span className="cell-title">{row.provider === "ollama" ? "Ollama (local — no API charge)" : row.provider}</span><div className="cell-sub">{row.model}</div></td>
+                      <td className="num">{row.calls}</td>
+                      <td className="num">{row.totalTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.providerReportedTokens.toLocaleString("en-GB")}</td>
+                      <td className="num">{row.estimatedTokens.toLocaleString("en-GB")}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             )}
           </div>
         </section>
-        <section className="card">
-          <div className="card-head"><div><h2>Performance by source and version</h2><p className="card-sub">Which channels and CV versions convert</p></div></div>
-          <div className="card-body stack" style={{ gap: 14 }}>
-            <div>
-              <div className="label">Sources</div>
-              {sourcePerformance.length === 0 ? <p className="text-[12px]" style={{ color: "var(--muted)" }}>No data yet.</p> : sourcePerformance.map((row) => (
-                <div key={row.source} className="between text-[12.5px] py-1">
-                  <span>{row.source}</span>
-                  <span className="num" style={{ color: "var(--muted)" }}>{row.submitted}/{row.total} submitted</span>
-                </div>
-              ))}
-            </div>
-            <div>
-              <div className="label">Most recent tailored CVs</div>
-              {cvPerformance.length === 0 ? <p className="text-[12px]" style={{ color: "var(--muted)" }}>No tailored documents yet.</p> : cvPerformance.map((row, i) => (
-                <div key={i} className="between text-[12.5px] py-1">
-                  <span>Version {row.version ?? "—"} · ATS {row.ats ?? "—"}/100</span>
-                  <span className="num" style={{ color: "var(--muted)" }}>{row.c} linked application(s)</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </section>
-        <section className="card">
-          <div className="card-head"><div><h2>Most successful job titles</h2></div></div>
+
+        <section className="card" id="reports">
+          <div className="card-head"><div><h2>Analytics report</h2><p className="card-sub">Generated from live records for the selected range.</p></div></div>
           <div className="card-body">
-            {topTitles.length === 0 ? <Empty title="Not enough data" /> : topTitles.map((row) => (
-              <div key={row.title} className="between text-[12.5px] py-1">
-                <span className="truncate" style={{ maxWidth: "70%" }}>{row.title}</span>
-                <span className="num" style={{ color: "var(--muted)" }}>{row.submitted}/{row.c} submitted</span>
+            <div className="card-quiet p-4 stack" style={{ gap: 7 }}>
+              <div className="between"><span className="text-[12.5px] font-semibold">{range.label}</span><span className="badge badge-neutral">Live data</span></div>
+              <div className="text-[11.5px]" style={{ color: "var(--muted)" }}>{formatDate(range.from)} — {formatDate(range.to)} · generated {new Date(data.generatedAt).toLocaleString("en-GB")}</div>
+              <div className="grid g2 mt-2" style={{ gap: 8 }}>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Applications</span><span className="num">{data.outcomesTotal}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Verified</span><span className="num">{verified}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Prepared</span><span className="num">{prepared}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Tasks</span><span className="num">{data.productivity.reduce((sum, row) => sum + row.value, 0)}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Tokens</span><span className="num">{data.tokens.total.toLocaleString("en-GB")}</span></div>
+                <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Cost</span><span className="num">Unverified</span></div>
               </div>
-            ))}
-          </div>
-        </section>
-        <section className="card">
-          <div className="card-head"><div><h2>Most active locations</h2></div></div>
-          <div className="card-body">
-            {topLocations.length === 0 ? <Empty title="Not enough data" /> : topLocations.map((row) => (
-              <div key={row.location} className="between text-[12.5px] py-1">
-                <span className="truncate" style={{ maxWidth: "70%" }}>{row.location}</span>
-                <span className="num" style={{ color: "var(--muted)" }}>{row.c}</span>
-              </div>
-            ))}
+              <p className="hint mt-1">No data is fabricated. Empty categories remain visible in the legends with a zero count.</p>
+            </div>
           </div>
         </section>
       </div>
 
-      <section className="card" id="reports">
-        <div className="card-head">
-          <div>
-            <h2>Reports</h2>
-            <p className="card-sub">Generated from live records. Choose a window.</p>
-          </div>
-          <div className="row">
-            {["daily", "weekly", "monthly"].map((p) => (
-              <Link key={p} href={`/analytics?report=${p}#reports`} className={`btn btn-sm ${period === p ? "btn-primary" : ""}`}>
-                {p.charAt(0).toUpperCase() + p.slice(1)}
-              </Link>
-            ))}
-          </div>
-        </div>
-        <div className="card-body">
-          <div className="card-quiet p-4">
-            <div className="between">
-              <div>
-                <div className="text-[13.5px] font-semibold">{period.charAt(0).toUpperCase() + period.slice(1)} recruitment report</div>
-                <div className="text-[11px]" style={{ color: "var(--muted)" }}>Window: last {reportWindow} day(s) · generated {new Date().toLocaleString("en-GB")}</div>
-              </div>
-              <span className="badge badge-neutral">Live data</span>
-            </div>
-            <div className="grid g3 mt-4" style={{ gap: 10 }}>
-              {[
-                ["Jobs discovered", report.discovered],
-                ["Strong matches", report.strong],
-                ["CVs prepared", report.prepared],
-                ["Applications submitted", report.submitted],
-                ["Awaiting approval", report.awaiting],
-                ["Failed tasks", report.failures],
-                ["Employer responses", report.responses],
-              ].map(([label, value]) => (
-                <div key={String(label)} className="between text-[12.5px]">
-                  <span style={{ color: "var(--muted)" }}>{label}</span>
-                  <span className="num font-semibold">{value as number}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      </section>
+      <p className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
+        Agent distribution uses current availability plus the latest task in the selected window. Provider and model charts use actual inference rows, not configured assignments. The custom range is inclusive. Weekly totals use seven-day buckets from {formatDate(range.from)}. {pct(verified, Math.max(1, data.outcomesTotal))}% of application records in this range have verified submission evidence.
+      </p>
     </>
   );
 }

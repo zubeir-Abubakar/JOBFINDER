@@ -238,10 +238,13 @@ CREATE TABLE IF NOT EXISTS provider_usage (
   agent_key TEXT NOT NULL,
   workflow_id TEXT,
   task_id TEXT,
+  session_id TEXT,
   source TEXT,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   total_tokens INTEGER NOT NULL DEFAULT 0,
+  cached_tokens INTEGER NOT NULL DEFAULT 0,
+  usage_source TEXT,
   cost_chf REAL NOT NULL DEFAULT 0,
   latency_ms INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
@@ -428,6 +431,70 @@ CREATE TABLE IF NOT EXISTS application_interventions (
 );
 CREATE INDEX IF NOT EXISTS idx_interventions_status ON application_interventions(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_interventions_app ON application_interventions(application_id, status);
+CREATE TABLE IF NOT EXISTS agent_sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  agent_key TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active',
+  previous_agent_key TEXT,
+  context_summary TEXT,
+  started_at TEXT NOT NULL,
+  last_active_at TEXT NOT NULL,
+  UNIQUE(user_id, agent_key)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_sessions_user ON agent_sessions(user_id, status, last_active_at DESC);
+CREATE TABLE IF NOT EXISTS provider_health (
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'unknown',
+  failure_kind TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  cooldown_until TEXT,
+  last_error TEXT,
+  last_error_at TEXT,
+  last_success_at TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (provider, model)
+);
+CREATE INDEX IF NOT EXISTS idx_provider_health_cooldown ON provider_health(status, cooldown_until);
+CREATE TABLE IF NOT EXISTS notification_outbox (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  notification_id INTEGER,
+  user_id TEXT,
+  kind TEXT NOT NULL,
+  recipient TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT NOT NULL,
+  provider TEXT,
+  provider_message_id TEXT,
+  provider_thread_id TEXT,
+  delivery TEXT,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_notification_outbox_due ON notification_outbox(status, available_at);
+CREATE TABLE IF NOT EXISTS recruitment_recovery (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  run_id TEXT NOT NULL,
+  job_id TEXT,
+  application_id TEXT,
+  stage TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  available_at TEXT NOT NULL,
+  last_error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_recruitment_recovery_due ON recruitment_recovery(status, available_at);
 `;
 
 type GlobalWithDb = typeof globalThis & { __atwDb?: DatabaseSync };
@@ -616,7 +683,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 14;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -648,6 +715,14 @@ function ensureSchema(db: DatabaseSync): void {
   // assistant/admin/manual calls carry an explicit source and no task id.
   ensureColumn(db, "provider_usage", "task_id", "task_id TEXT");
   ensureColumn(db, "provider_usage", "source", "source TEXT");
+  // Phase 3: token provenance and conversation attribution. Historical rows
+  // keep NULL provenance rather than being relabelled as measured.
+  ensureColumn(db, "provider_usage", "usage_source", "usage_source TEXT");
+  ensureColumn(db, "provider_usage", "cached_tokens", "cached_tokens INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "provider_usage", "session_id", "session_id TEXT");
+  ensureColumn(db, "agent_sessions", "previous_agent_key", "previous_agent_key TEXT");
+  ensureColumn(db, "agent_sessions", "context_summary", "context_summary TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_provider_usage_session ON provider_usage(session_id)");
   ensureColumn(db, "email_messages", "ai_category", "ai_category TEXT");
   ensureColumn(db, "email_messages", "ai_classified_at", "ai_classified_at TEXT");
   db.exec("CREATE INDEX IF NOT EXISTS idx_provider_usage_task ON provider_usage(task_id)");
@@ -718,6 +793,15 @@ function ensureSchema(db: DatabaseSync): void {
   // the standing policy is inactive, and the queue of essential questions that
   // need the owner's answer before a form can be completed.
   ensureColumn(db, "recruitment_runs", "applications_simulated", "applications_simulated INTEGER NOT NULL DEFAULT 0");
+  // Phase 4: durable provider recovery, notification delivery and document
+  // recovery. Additive columns only; older rows keep their unknown/NULL state.
+  ensureColumn(db, "tasks", "state_reason", "state_reason TEXT");
+  ensureColumn(db, "tasks", "next_retry_at", "next_retry_at TEXT");
+  ensureColumn(db, "jobs", "document_state", "document_state TEXT");
+  ensureColumn(db, "notifications", "dedupe_key", "dedupe_key TEXT");
+  ensureColumn(db, "notifications", "delivery_status", "delivery_status TEXT");
+  ensureColumn(db, "notifications", "provider_message_id", "provider_message_id TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(status, next_retry_at)");
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 

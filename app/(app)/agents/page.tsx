@@ -16,31 +16,16 @@ import {
 } from "@/lib/actions/agents";
 import { SubmitButton } from "@/components/SubmitButton";
 import { Icon } from "@/components/icons";
-import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
+import { AgentAvailabilityBadge, AgentAvatar, AgentTaskBadge } from "@/components/AgentAvatar";
 import { WorkflowFlow } from "@/components/WorkflowFlow";
 import { activeWorkflow, latestPausedWorkflow, recoverInterruptedRuns } from "@/lib/workflow";
-import { statusMeta, taskExecutionMeta } from "@/lib/agent-status";
+import { taskExecutionMeta } from "@/lib/agent-status";
 import { agentIdentity } from "@/lib/agent-identity";
-import { agentAvailability, effectiveAgentStatus } from "@/lib/agent-availability";
-import { providerHealth } from "@/lib/providers";
+import { agentPresentation } from "@/lib/agent-presentation";
+import { getOperationalSnapshot } from "@/lib/operations";
+import { switchAgentAction } from "@/lib/actions/chat";
 
 export const dynamic = "force-dynamic";
-
-type AgentRow = {
-  key: string;
-  name: string;
-  role: string;
-  description: string;
-  enabled: number;
-  status: string;
-  current_task: string | null;
-  last_run_at: string | null;
-  run_count: number;
-  success_count: number;
-  failure_count: number;
-  ai_success_count?: number;
-  ai_failure_count?: number;
-};
 type TaskRow = {
   id: string;
   workflow_id: string | null;
@@ -76,24 +61,21 @@ export default async function AgentsPage({
   recoverInterruptedRuns();
   const sp = await searchParams;
   const focus = param(sp.agent);
-  const agents = all<AgentRow>("SELECT * FROM agents ORDER BY sort");
+  const snapshot = await getOperationalSnapshot();
+  const agents = snapshot.agents;
   const tasks = all<TaskRow>(
     "SELECT id, workflow_id, agent_key, title, status, output, error, provider, model, created_at, finished_at, execution_mode, ai_outcome FROM tasks ORDER BY created_at DESC LIMIT 80",
   );
   const workflows = all<WorkflowRow>(
     "SELECT id, kind, label, status, summary, error, created_at, finished_at FROM workflows ORDER BY created_at DESC LIMIT 10",
   );
-  const latestByAgent = new Map<string, TaskRow>();
-  for (const task of tasks) if (!latestByAgent.has(task.agent_key)) latestByAgent.set(task.agent_key, task);
   const active = activeWorkflow();
   const paused = latestPausedWorkflow();
-  const health = await providerHealth();
-  const gateway = health.find((item) => item.name === "freellmapi");
-  const ollama = health.find((item) => item.name === "ollama");
+  const gateway = snapshot.providers.find((item) => item.name === "freellmapi");
+  const ollama = snapshot.providers.find((item) => item.name === "ollama");
   const pending = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NULL")?.c ?? 0;
   const filteredTasks = focus ? tasks.filter((task) => task.agent_key === focus) : tasks.slice(0, 30);
   const focusedAgent = focus ? agents.find((agent) => agent.key === focus) : null;
-  const anyActive = Boolean(active) || agents.some((agent) => statusMeta(agent.status).active);
   const tasksByWorkflow = new Map<string, TaskRow[]>();
   for (const task of tasks) {
     if (!task.workflow_id) continue;
@@ -147,14 +129,14 @@ export default async function AgentsPage({
             : gateway?.configured
               ? `AI gateway: FreeLLMAPI configured but unreachable — ${gateway.detail}`
               : "AI gateway: FreeLLMAPI is not configured."}{" "}
-        Ollama fallback: {ollama?.enabled ? (ollama.available ? "ready" : ollama.detail) : "disabled"}. Spending limit CHF 0.
+        Ollama fallback: {ollama?.configured ? (ollama.available ? "ready" : ollama.detail) : "disabled"}. Spending limit CHF 0.
       </div>
 
       <section className="card mb-4">
         <div className="card-head">
           <div>
             <h2>Agent roster</h2>
-            <p className="card-sub">Status, current assignment and the provider/model used for the latest execution.</p>
+            <p className="card-sub">Availability, current task and last outcome are separate. Configured is the shared text route; Actual is the provider/model that served the latest inference.</p>
           </div>
           <form action={analyseBacklogAction}>
             <SubmitButton className="btn btn-sm" pendingLabel="Analysing…">Analyse backlog</SubmitButton>
@@ -162,43 +144,110 @@ export default async function AgentsPage({
         </div>
         <div className="card-body grid g2">
           {agents.map((agent) => {
-            const latest = latestByAgent.get(agent.key);
-            const availability = agentAvailability(agent.key);
-            const displayStatus = effectiveAgentStatus(agent.status, agent.enabled === 1, availability);
+            const presentation = agentPresentation({
+              enabled: agent.enabled,
+              status: agent.status,
+              currentTask: agent.currentTask,
+              availability: agent.availability,
+              lastTask: agent.lastTaskOutcome && agent.lastTaskTitle
+                ? { status: agent.lastTaskOutcome, title: agent.lastTaskTitle, at: agent.lastTaskAt }
+                : null,
+            });
+            const avatarStatus = presentation.task.state === "idle"
+              ? agent.availability.available ? "idle" : "unavailable"
+              : agent.status;
+            const actualProvider = agent.provider
+              ? `${agent.provider} / ${agent.model ?? "model not recorded"}`
+              : "Not used yet";
+            const configuredProvider = agent.configuredProvider
+              ? `${agent.configuredProvider} / ${agent.configuredModel ?? "model not configured"}`
+              : "Not configured";
+            const upstream = agent.lastRoutedPlatform || agent.lastRoutedModel
+              ? `${agent.lastRoutedPlatform ?? "upstream"} / ${agent.lastRoutedModel ?? "model not reported"}`
+              : "Not reported";
+            const fallbackHistory = agent.fallbackHistory.length
+              ? agent.fallbackHistory.map((entry) => `${entry.model} · ${relativeTime(entry.at)}`).join("; ")
+              : "None today";
             return (
               <div key={agent.key} className="agent-card agent-card-rich">
-                <div className="between" style={{ alignItems: "flex-start" }}>
-                  <div className="flex items-center gap-2.5">
-                    <AgentAvatar agentKey={agent.key} status={displayStatus} />
-                    <div>
+                <div className="between" style={{ alignItems: "flex-start", gap: 10 }}>
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <AgentAvatar agentKey={agent.key} status={avatarStatus} />
+                    <div className="min-w-0">
                       <div className="name">{agent.name}</div>
                       <div className="text-[10.5px] uppercase tracking-[0.08em]" style={{ color: "var(--muted)" }}>{agent.role}</div>
                     </div>
                   </div>
-                  <AgentStatusBadge status={displayStatus} enabled={agent.enabled === 1} />
+                  <div className="flex flex-wrap items-center justify-end gap-1.5">
+                    <AgentAvailabilityBadge
+                      state={presentation.availability.state}
+                      label={presentation.availability.label}
+                      detail={presentation.availability.detail}
+                    />
+                    <AgentTaskBadge
+                      state={presentation.task.state}
+                      label={presentation.task.label}
+                      detail={presentation.task.detail}
+                    />
+                  </div>
                 </div>
                 <p className="desc">{agent.description}</p>
-                {!availability.available ? (
-                  <div className="alert alert-error" style={{ padding: "7px 9px", fontSize: 11 }}>
-                    <strong>{availability.dependency} unavailable.</strong> {availability.reason}
+                {presentation.availability.state === "unavailable" || presentation.availability.state === "degraded" ? (
+                  <div className={`alert ${presentation.availability.state === "degraded" ? "alert-info" : "alert-error"}`} style={{ padding: "7px 9px", fontSize: 11 }}>
+                    <strong>{presentation.availability.label}.</strong> {presentation.availability.detail}
                   </div>
                 ) : null}
-                <div className="agent-meta">
-                  <span>Current</span>
-                  <strong>{agent.current_task ?? "Idle — no task assigned"}</strong>
-                  <span>Provider</span>
-                  <strong>{latest?.provider ?? "—"}</strong>
-                  <span>Model</span>
-                  <strong title={latest?.model ?? undefined}>{latest?.model ?? "—"}</strong>
-                  <span>Last run</span>
-                  <strong>{relativeTime(agent.last_run_at)}</strong>
+                <div className="agent-current">
+                  <span className="agent-current-label">Current task</span>
+                  <strong>{presentation.task.detail}</strong>
                 </div>
-                <div className="flex items-center justify-between text-[11px]" style={{ color: "var(--muted)" }}>
+                <div className="agent-meta agent-meta-rich">
+                  <span>Last outcome</span>
+                  <strong title={presentation.lastOutcome.detail}>
+                    {presentation.lastOutcome.label} · {presentation.lastOutcome.detail}
+                    {presentation.lastOutcome.at ? ` · ${relativeTime(presentation.lastOutcome.at)}` : ""}
+                  </strong>
+                  <span>Configured</span>
+                  <strong title={configuredProvider}>{configuredProvider}</strong>
+                  <span>Actual</span>
+                  <strong title={actualProvider}>{actualProvider}</strong>
+                  <span>Upstream</span>
+                  <strong title={upstream}>{upstream}</strong>
+                  <span>Health</span>
+                  <strong>
+                    {agent.configuredProviderStatus}
+                    {agent.fallbackActive ? " · fallback active" : ""}
+                  </strong>
+                  <span>Last success</span>
+                  <strong>{relativeTime(agent.lastSuccessfulInferenceAt)}</strong>
+                  <span>Last activity</span>
+                  <strong>{relativeTime(agent.lastActivityAt)}</strong>
+                  <span>Provider error</span>
+                  <strong title={agent.lastProviderError ?? undefined}>
+                    {agent.lastProviderError ? relativeTime(agent.lastProviderErrorAt) : "None recorded"}
+                  </strong>
+                  <span>Retries today</span>
+                  <strong>{agent.retryCount}</strong>
+                  <span>Fallback history</span>
+                  <strong title={fallbackHistory}>{fallbackHistory}</strong>
+                </div>
+                {agent.lastProviderError ? (
+                  <div className="text-[10.5px] leading-relaxed" style={{ color: "var(--danger)" }}>
+                    {agent.lastProviderError}
+                  </div>
+                ) : null}
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]" style={{ color: "var(--muted)" }}>
                   <span className="num">
-                    {agent.run_count} tasks · {agent.success_count} ok · {agent.failure_count} failed · AI calls {agent.ai_success_count ?? 0} ok
-                    {agent.ai_failure_count ? ` / ${agent.ai_failure_count} failed` : ""}
+                    {agent.runCount} tasks · {agent.successCount} ok · {agent.failureCount} failed · AI {agent.aiSuccessCount} ok
+                    {agent.aiFailureCount ? ` / ${agent.aiFailureCount} failed` : ""} · {agent.retryCount} retry attempt(s) today · {agent.tokenUsageToday.toLocaleString("en-GB")} tokens today
                   </span>
-                  <Link href={`/agents?agent=${agent.key}#activity`} className="btn btn-sm">Activity</Link>
+                  <div className="flex items-center gap-1.5">
+                    <form action={switchAgentAction}>
+                      <input type="hidden" name="agent" value={agent.key} />
+                      <SubmitButton className="btn btn-sm" pendingLabel="Connecting…">Talk</SubmitButton>
+                    </form>
+                    <Link href={`/agents?agent=${agent.key}#activity`} className="btn btn-sm">Activity</Link>
+                  </div>
                 </div>
               </div>
             );

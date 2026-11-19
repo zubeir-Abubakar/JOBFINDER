@@ -1,7 +1,7 @@
 import { revalidatePath } from "next/cache";
 import { currentUser } from "@/lib/auth";
 import { run, nowIso } from "@/lib/db";
-import { handleAssistantMessage } from "@/lib/assistant";
+import { routeAssistantMessage } from "@/lib/agent-router";
 import { chatHistory } from "@/lib/chat";
 
 export const dynamic = "force-dynamic";
@@ -26,11 +26,18 @@ export async function POST(request: Request) {
   if (!message) return Response.json({ error: "Message is empty." }, { status: 400 });
 
   run("INSERT INTO chat_messages (user_id, role, content, created_at) VALUES (?, 'user', ?, ?)", [user.id, message, nowIso()]);
-  const result = await handleAssistantMessage(user.id, message);
+  const result = await routeAssistantMessage(user.id, message);
   run("INSERT INTO chat_messages (user_id, role, content, meta, created_at) VALUES (?, 'assistant', ?, ?, ?)", [
     user.id,
     result.reply,
-    JSON.stringify({ taskIds: result.taskIds, agentKeys: result.agentKeys ?? [], pendingAction: result.pendingAction ?? null }),
+    JSON.stringify({
+      taskIds: result.taskIds,
+      agentKeys: result.agentKeys ?? [],
+      agentKey: result.agentKey,
+      sessionId: result.sessionId,
+      handover: result.handover ?? null,
+      pendingAction: result.pendingAction ?? null,
+    }),
     nowIso(),
   ]);
   revalidatePath("/assistant");
@@ -38,6 +45,9 @@ export async function POST(request: Request) {
   return Response.json({
     reply: result.reply,
     agentKeys: result.agentKeys ?? [],
+    agentKey: result.agentKey,
+    sessionId: result.sessionId,
+    handover: result.handover ?? null,
     taskIds: result.taskIds,
     pendingAction: result.pendingAction ?? null,
   });

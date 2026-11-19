@@ -2,6 +2,7 @@ import { revalidatePath } from "next/cache";
 import { currentUser } from "@/lib/auth";
 import { nowIso, one, run } from "@/lib/db";
 import { isLiveAgentKey, safeSessionId } from "@/lib/live-voice";
+import { recordUsage } from "@/lib/providers";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -21,6 +22,8 @@ export async function POST(request: Request) {
     agentKey?: unknown;
     taskIds?: unknown;
     interrupted?: unknown;
+    model?: unknown;
+    usage?: unknown;
   } | null;
   const sessionId = safeSessionId(body?.sessionId);
   const turnId = typeof body?.turnId === "string" ? body.turnId.slice(0, 100) : "";
@@ -39,6 +42,36 @@ export async function POST(request: Request) {
     [user.id, `%"voiceKey":"${voiceKey}"%`],
   );
   if (existing) return Response.json({ ok: true, duplicate: true, id: existing.id });
+
+  // Gemini Live reports provider token counts with the turn. The browser sends
+  // the delta since the previous reported turn, so a cumulative session counter
+  // is never recorded twice, and a retry/duplicate transcript adds no usage.
+  if (role === "assistant" && body?.usage && typeof body.usage === "object" && !Array.isArray(body.usage)) {
+    const usage = body.usage as { promptTokens?: unknown; completionTokens?: unknown; totalTokens?: unknown };
+    const number = (value: unknown) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? Math.min(Math.floor(parsed), 1_000_000) : 0;
+    };
+    const promptTokens = number(usage.promptTokens);
+    const completionTokens = number(usage.completionTokens);
+    const totalTokens = Math.max(number(usage.totalTokens), promptTokens + completionTokens);
+    if (totalTokens > 0) {
+      const model = typeof body.model === "string" && /^[A-Za-z0-9._:-]{1,80}$/.test(body.model)
+        ? body.model
+        : "gemini-3.8-live";
+      recordUsage({
+        provider: "gemini-live",
+        model,
+        agentKey,
+        sessionId,
+        source: "assistant",
+        usage: { promptTokens, completionTokens, totalTokens },
+        usageSource: "provider",
+        latencyMs: 0,
+        status: "ok",
+      });
+    }
+  }
 
   const meta = JSON.stringify({
     channel: "voice",

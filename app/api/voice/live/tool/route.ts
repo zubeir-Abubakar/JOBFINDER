@@ -21,11 +21,10 @@ export async function POST(request: Request) {
   const agentKey = typeof body?.agentKey === "string" && isLiveAgentKey(body.agentKey) ? body.agentKey : "coordinator";
   const args = body?.args && typeof body.args === "object" && !Array.isArray(body.args) ? (body.args as Record<string, unknown>) : {};
   if (!name) return Response.json({ error: "Missing tool name." }, { status: 400 });
-  // Validate the session id shape even though this handler does not read the transcript table.
-  safeSessionId(body?.sessionId);
+  const sessionId = safeSessionId(body?.sessionId);
 
   try {
-    const outcome = await executeLiveTool({ userId: user.id, agentKey, name, args });
+    const outcome = await executeLiveTool({ userId: user.id, agentKey, sessionId, name, args });
     return Response.json(outcome, { headers: { "Cache-Control": "no-store" } });
   } catch (error) {
     return Response.json(

@@ -99,6 +99,7 @@ const {
   setGatewayCooldown,
   testOllamaConnection,
 } = await import("../lib/providers.ts");
+const { clearProviderCooldowns } = await import("../lib/provider-health.ts");
 
 getDb();
 run(
@@ -122,6 +123,7 @@ function input(technical = false) {
 
 function reset(mode: Mode = "ok"): void {
   clearGatewayCooldown();
+  clearProviderCooldowns();
   gatewayMode = mode;
   ollamaMode = "ok";
   gatewayCalls = 0;

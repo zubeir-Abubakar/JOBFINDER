@@ -26,6 +26,7 @@ import {
   recordPolicySimulation,
 } from "./recruitment-policy";
 import { notify } from "./notify";
+import { enqueueDocumentRecovery } from "./recruitment-recovery";
 import { audit } from "./audit";
 import { localDateKey, nextDailyRun, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, formatInZone } from "./recruitment-schedule";
 import { recordApplicationEvent } from "./application-events";
@@ -143,13 +144,42 @@ function logAgent(input: {
   provider?: string | null;
   model?: string | null;
 }): void {
+  const assignment = input.assignment.slice(0, 500);
+  // Close the matching running row instead of leaving stale "running" rows
+  // beside their own completion. Per-vacancy assignments remain separate.
+  const open = input.status === "running"
+    ? null
+    : one<{ id: number }>(
+        "SELECT id FROM recruitment_run_agents WHERE run_id = ? AND agent_key = ? AND assignment = ? AND status = 'running' ORDER BY id DESC LIMIT 1",
+        [input.runId, input.agentKey, assignment],
+      );
+  if (open) {
+    run(
+      `UPDATE recruitment_run_agents SET status = ?, attempt = ?, output = ?, error = ?, coordinator_decision = ?,
+         execution_mode = ?, provider = ?, model = ?, started_at = COALESCE(started_at, ?), finished_at = ? WHERE id = ?`,
+      [
+        input.status,
+        input.attempt ?? 1,
+        input.output ? input.output.slice(0, 4000) : null,
+        input.error ? input.error.slice(0, 2000) : null,
+        input.decision ? input.decision.slice(0, 1000) : null,
+        input.executionMode ?? "deterministic",
+        input.provider ?? null,
+        input.model ?? null,
+        input.startedAt ?? nowIso(),
+        input.finishedAt ?? nowIso(),
+        open.id,
+      ],
+    );
+    return;
+  }
   run(
     `INSERT INTO recruitment_run_agents (run_id, agent_key, assignment, status, attempt, output, error, coordinator_decision, execution_mode, provider, model, started_at, finished_at, created_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       input.runId,
       input.agentKey,
-      input.assignment.slice(0, 500),
+      assignment,
       input.status,
       input.attempt ?? 1,
       input.output ? input.output.slice(0, 4000) : null,
@@ -163,6 +193,29 @@ function logAgent(input: {
       nowIso(),
     ],
   );
+}
+
+/** Close assignments left non-terminal by an interrupted or advisory-only stage. */
+function closeOpenAssignments(runId: string, status: "completed" | "failed", note: string, workflowId: string | null = null): void {
+  const at = nowIso();
+  run(
+    "UPDATE recruitment_run_agents SET status = ?, coordinator_decision = COALESCE(coordinator_decision, ?), finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('running','queued') AND finished_at IS NULL",
+    [status, note, at, runId],
+  );
+  if (!workflowId) return;
+  // The task table is a second execution ledger. A stage that never emitted a
+  // terminal task state must not remain "running" after the run has ended.
+  const openAgents = all<{ agent_key: string }>(
+    "SELECT DISTINCT agent_key FROM tasks WHERE workflow_id = ? AND status IN ('queued','running','waiting_provider','retry_scheduled')",
+    [workflowId],
+  );
+  run(
+    "UPDATE tasks SET status = ?, state_reason = ?, finished_at = COALESCE(finished_at, ?) WHERE workflow_id = ? AND status IN ('queued','running','waiting_provider','retry_scheduled')",
+    [status, note.slice(0, 1200), at, workflowId],
+  );
+  for (const row of openAgents) {
+    run("UPDATE agents SET status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'idle' END, current_task = NULL WHERE key = ?", [row.agent_key]);
+  }
 }
 
 /** An unavailable or paused agent is recorded; deterministic work still runs. */
@@ -645,7 +698,17 @@ export async function executeRun(
       failures.push(`Discovery: ${message}`);
       logAgent({ runId, agentKey: "research", assignment: "Discover vacancies", status: "failed", error: message, finishedAt: nowIso() });
       safeFail(researchTask.taskId, "research", message);
-      throw new Error(message);
+      // Preserve the run and any previously qualified backlog. Do not invent a
+      // vacancy and do not rerun discovery against the same failed endpoints.
+      discovery = {
+        discovered: 0,
+        inserted: 0,
+        duplicates: 0,
+        filtered: 0,
+        jobIds: [],
+        sources: [],
+        warnings: [`Discovery unavailable: ${message}`],
+      };
     }
     for (const warning of discovery.warnings) warnings.push(warning);
     const sourceSummary = discovery.sources
@@ -665,6 +728,13 @@ export async function executeRun(
       `${discovery.inserted} new vacancies; ${discovery.duplicates} duplicate listing(s) blocked; ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
     );
     updateCounts(runId, { jobs_discovered: discovery.inserted, warnings: warnings.length });
+    notify({
+      userId,
+      kind: "job_discovery_completed",
+      dedupeKey: `discovery:${runId}`,
+      subject: `Job discovery completed: ${discovery.inserted} new`,
+      body: `${discovery.inserted} new vacancy(ies) stored, ${discovery.duplicates} duplicate listing(s) blocked, ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
+    });
 
     /* 2. Eligibility and scoring */
     pushState(runId, "analysing", "Eligibility and evidence-based scoring are running for every discovered vacancy.");
@@ -731,6 +801,19 @@ export async function executeRun(
       }
     }
     qualifiedJobs.sort((a, b) => b.score - a.score);
+    const strongMatches = all<{ title: string; company: string; match_score: number }>(
+      "SELECT title, company, match_score FROM jobs WHERE run_id = ? AND match_flag = 'strong' ORDER BY match_score DESC LIMIT 5",
+      [runId],
+    );
+    if (strongMatches.length > 0) {
+      notify({
+        userId,
+        kind: "strong_match",
+        dedupeKey: `strong_match:${runId}`,
+        subject: `${strongMatches.length} strong match${strongMatches.length === 1 ? "" : "es"} discovered`,
+        body: strongMatches.map((job) => `${job.title} at ${job.company} — ${job.match_score}%`).join("\n"),
+      });
+    }
     logAgent({
       runId,
       agentKey: "analysis",
@@ -914,7 +997,11 @@ export async function executeRun(
         startedAt: started,
         finishedAt: nowIso(),
       });
-      if (!result.ok) warnings.push(`Coordinator AI review failed: ${result.error}`);
+      if (!result.ok) {
+        const reviewFailure = `Coordinator AI review failed: ${result.error}`;
+        warnings.push(reviewFailure);
+        failures.push(reviewFailure);
+      }
     }
 
     /* 3. Documents */
@@ -963,14 +1050,22 @@ export async function executeRun(
           }
         }
         if (!pkg?.ok) {
-          failures.push(`Documents for ${job.title} at ${job.company}: ${lastError ?? "unknown failure"}`);
+          const documentError = lastError ?? "unknown failure";
+          failures.push(`Documents for ${job.title} at ${job.company}: ${documentError}`);
           const app = one<{ id: string }>("SELECT id FROM applications WHERE job_id = ?", [item.id]);
           if (app) {
-            run("UPDATE applications SET status = 'human_intervention_required', run_id = ?, last_update = ? WHERE id = ?", [runId, nowIso(), app.id]);
+            run("UPDATE applications SET status = 'awaiting_documents', run_id = ?, last_update = ? WHERE id = ?", [runId, nowIso(), app.id]);
           }
+          enqueueDocumentRecovery({
+            runId,
+            jobId: item.id,
+            applicationId: app?.id ?? null,
+            error: documentError,
+          });
           continue;
         }
         prepared += 1;
+        run("UPDATE jobs SET document_state = 'prepared' WHERE id = ?", [item.id]);
         if (pkg.applicationId) {
           run("UPDATE applications SET run_id = ?, status = 'quality_check', last_update = ? WHERE id = ?", [runId, nowIso(), pkg.applicationId]);
           run("UPDATE documents SET run_id = ? WHERE job_id = ? AND deleted_at IS NULL AND kind IN ('tailored_cv','cover_letter')", [runId, item.id]);
@@ -1009,6 +1104,12 @@ export async function executeRun(
           finishedAt: nowIso(),
         });
         warnings.push(`Quality gate stopped ${job.title} at ${job.company}: ${readiness.reasons[0]}`);
+        notify({
+          kind: "ats_blocked",
+          dedupeKey: `quality_blocked:${runId}:${item.id}`,
+          subject: `Application documents need attention: ${job.title}`,
+          body: `${job.company} was not submitted because a mandatory document/quality check failed: ${readiness.reasons.slice(0, 3).join(" ")}`,
+        });
       }
     }
 
@@ -1054,6 +1155,14 @@ export async function executeRun(
           );
           recordApplicationEvent({ applicationId: item.applicationId, type: "submission.simulated", message: reason });
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", output: reason, decision: "The package reached the submission stage without approval; no application was sent.", finishedAt: nowIso() });
+          if (!dryRun) {
+            notify({
+              kind: "application_approval_required",
+              dedupeKey: `approval_required:${runId}:${item.jobId}`,
+              subject: `Application ready for your approval: ${item.job.title}`,
+              body: `${item.job.company} is prepared but was not submitted. ${reason}`,
+            });
+          }
           simulated += 1;
           continue;
         }
@@ -1072,6 +1181,12 @@ export async function executeRun(
           failures.push(`Submission for ${item.job.title}: ${message}`);
           run("UPDATE applications SET status = 'human_intervention_required', submission_status = 'failed', last_update = ? WHERE id = ?", [nowIso(), item.applicationId]);
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: message, decision: "Coordinator stopped this submission; the run continues.", finishedAt: nowIso() });
+          notify({
+            kind: "application_failed",
+            dedupeKey: `submission_failed:${runId}:${item.jobId}`,
+            subject: `Application submission failed: ${item.job.title}`,
+            body: `${item.job.company} was not recorded as submitted. ${message}`,
+          });
           intervention += 1;
           continue;
         }
@@ -1081,9 +1196,21 @@ export async function executeRun(
         } else if (outcome.status === "unverified") {
           unverified += 1;
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: outcome.detail, decision: "Not counted as submitted: no employer reference was returned.", finishedAt: nowIso() });
+          notify({
+            kind: "application_submission_unverified",
+            dedupeKey: `submission_unverified:${runId}:${item.jobId}`,
+            subject: `Submission unverified: ${item.job.title}`,
+            body: `${item.job.company} did not return a confirmation reference. ${outcome.detail} It is not counted as submitted and must not be retried blindly.`,
+          });
         } else {
           intervention += 1;
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", error: outcome.detail, decision: "Queued for human intervention; nothing was recorded as submitted.", finishedAt: nowIso() });
+          notify({
+            kind: "application_intervention",
+            dedupeKey: `intervention:${runId}:${item.jobId}`,
+            subject: `Application needs your attention: ${item.job.title}`,
+            body: `${item.job.company} was not submitted. ${outcome.detail}`,
+          });
         }
       }
     }
@@ -1112,6 +1239,24 @@ export async function executeRun(
     });
 
     runStatus = failures.length > 0 || warnings.length > 0 ? "completed_with_warnings" : "completed";
+    if (submitted > 0) {
+      notify({
+        userId,
+        kind: "application_submitted",
+        dedupeKey: `submitted:${runId}`,
+        subject: `${submitted} application${submitted === 1 ? "" : "s"} submitted and verified`,
+        body: `${submitted} submission(s) returned employer evidence. ${unverified} unverified and ${intervention} awaiting intervention. No unverified result is counted as successful.`,
+      });
+    }
+    if (intervention > 0) {
+      notify({
+        userId,
+        kind: "application_intervention",
+        dedupeKey: `intervention:${runId}`,
+        subject: `${intervention} application${intervention === 1 ? "" : "s"} need attention`,
+        body: "A submission, CAPTCHA, MFA or quality gate requires human intervention. Nothing ambiguous was counted as submitted.",
+      });
+    }
     const report = `pending:${runId}`;
     run("UPDATE recruitment_runs SET status = ?, finished_at = ?, report = ?, error = ? WHERE id = ?", [
       runStatus,
@@ -1120,6 +1265,7 @@ export async function executeRun(
       failures.length ? failures.join(" | ").slice(0, 4000) : null,
       runId,
     ]);
+    closeOpenAssignments(runId, "completed", "Stage reached its terminal result; no background work remains for this assignment.", workflowId);
     pushState(runId, runStatus, `${discovery.inserted} discovered · ${qualifiedJobs.length} qualified · ${prepared} prepared · ${submitted} submitted and verified.`);
     const finalReport = buildRunReport(runId, { warnings });
     run("UPDATE recruitment_runs SET report = ? WHERE id = ?", [finalReport, runId]);
@@ -1128,9 +1274,12 @@ export async function executeRun(
     if (!discoveryOnly) recordScheduleRun({ runId, status: runStatus, now: deps.now ?? now });
     notify({
       userId,
-      kind: "recruitment_run",
-      subject: `Recruitment run finished: ${submitted} submitted`,
-      body: `${discovery.inserted} discovered, ${qualifiedJobs.length} qualified (>= ${threshold}%), ${prepared} prepared, ${submitted} submitted with evidence, ${unverified} unverified, ${intervention} needing attention.`,
+      kind: runStatus === "completed_with_warnings" ? "recruitment_partial" : "recruitment_run",
+      dedupeKey: `run_finished:${runId}`,
+      subject: runStatus === "completed_with_warnings"
+        ? `Recruitment run finished with ${failures.length} failure(s) and ${warnings.length} warning(s)`
+        : `Recruitment run finished: ${submitted} submitted`,
+      body: `${discovery.inserted} discovered, ${qualifiedJobs.length} qualified (>= ${threshold}%), ${prepared} prepared, ${submitted} submitted with evidence, ${unverified} unverified, ${intervention} needing attention. ${failures.length} failure(s), ${warnings.length} warning(s). ${failures.slice(0, 3).join(" | ")}`,
     });
     audit({ action: "recruitment.run_completed", entity: "recruitment_run", entityId: runId, detail: `${runStatus}: ${submitted} verified submissions`, userId });
 
@@ -1161,10 +1310,11 @@ export async function executeRun(
       report,
       runId,
     ]);
+    closeOpenAssignments(runId, "failed", "Run terminated before this assignment completed.", workflowId);
     pushState(runId, "failed", message);
     if (workflowId) finishWorkflow(workflowId, "failed", message);
     recordScheduleRun({ runId, status: "failed", error: message, now: deps.now ?? now });
-    notify({ userId, kind: "recruitment_run_failed", subject: "Recruitment run failed", body: message });
+    notify({ userId, kind: "recruitment_run_failed", dedupeKey: `run_failed:${runId}`, subject: "Recruitment run failed", body: message });
     return {
       runId,
       status: "failed",

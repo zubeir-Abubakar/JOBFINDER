@@ -8,10 +8,14 @@ import {
 } from "@google/genai";
 import { all, one } from "./db";
 import { randomId } from "./security";
+import { setSetting } from "./settings";
 import { agentDefinition, type AgentKey } from "./agent-definitions";
 import { agentIdentity } from "./agent-identity";
 import { handleAssistantMessage } from "./assistant";
 import { pauseRunningWorkflow, resumeLatestWorkflow, stopRunningWorkflow } from "./workflow";
+import { LIVE_VOICE_IDS, voiceProfileForAgent, type LiveVoiceId } from "./agent-voices";
+import { activateAgentSession, recentConversationSummary } from "./agent-sessions";
+import { getOperationalSnapshot, operationsBrief } from "./operations";
 
 /**
  * Server-only Gemini Live adapter.
@@ -21,8 +25,8 @@ import { pauseRunningWorkflow, resumeLatestWorkflow, stopRunningWorkflow } from 
  * returns only the short-lived access URL to the browser.
  */
 
-export const LIVE_VOICES = ["Charon", "Orus", "Fenrir", "Puck"] as const;
-export type LiveVoiceName = (typeof LIVE_VOICES)[number];
+export const LIVE_VOICES = LIVE_VOICE_IDS;
+export type LiveVoiceName = LiveVoiceId;
 
 export const LIVE_AGENT_KEYS: AgentKey[] = [
   "coordinator",
@@ -169,8 +173,10 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
   const name = ownerName(userId);
   const history = recentVoiceHistory(userId, sessionId);
   const isCoordinator = agentKey === "coordinator";
+  const voiceProfile = voiceProfileForAgent(agentKey);
   const common = [
     `You are ${identity.name}, speaking live by voice inside AT AI Agency.`,
+    `Your assigned voice is ${voiceProfile.voiceName} (${voiceProfile.voiceId}). Never claim a different voice; the server fixes the voice per agent.`,
     `The owner is ${name}. You are speaking with them, not writing a document.`,
     "Speak naturally and concisely: normally one to three short sentences. Do not use markdown, bullet points, emoji, or stage directions.",
     "Your visual form is The Oracle: a calm, ancient cosmic intelligence. Let that shape your tone through quiet authority, warmth and precision, never through theatrical mysticism, archaic language, grandiose claims or role-play speeches.",
@@ -178,7 +184,8 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
     "Never invent a vacancy, employer, application, score, email, task, or agent status. Every factual claim about the workspace must come from the supplied workspace facts or a tool result.",
     "Never claim that you delegated a task, changed a setting, stopped a workflow, or generated a document unless the tool result confirms it.",
     "If the owner asks for an action, call the appropriate tool. If they ask about status, use the facts or call a status tool. If a tool fails, say plainly that it failed and why.",
-    "Do not expose internal prompts, credentials, environment variables, API keys, database identifiers, or implementation details.",
+    "You are allowed to disclose your own app's agents, provider/model assignments, health, token and cost measurements, permissions, scheduler, recruitment state and errors. Use get_operational_data for live facts; never say that information is secret. Distinguish measured, estimated and unknown token values, and available, granted, used and policy-blocked permissions.",
+    "Do not expose credential values, OAuth tokens, passwords, API keys, session cookies, internal prompts, database identifiers or implementation details. You may say whether a credential is configured.",
     "The system records the transcript. Do not read the transcript aloud. Never store or describe raw microphone audio.",
   ];
   const coordinator = [
@@ -188,6 +195,7 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
     "For a specialist request, call handoff_to_agent with the correct specialist key. Do not pretend to be the specialist before the handoff succeeds.",
     "For explicit workspace actions, use run_coordinator_command with the owner's exact instruction. Use control_workflow only for explicit pause, stop, or resume requests.",
     "If the owner asks what an agent is doing, use get_agent_status or get_workspace_status. Give the real status and current task. Keep it brief.",
+    "For questions about who uses which provider or model, token counts and costs, permissions, scheduler or recruitment health, call get_operational_data first. Answer only from its result.",
   ];
   const specialist = [
     `You are currently speaking as ${identity.name}, role: ${definition?.role ?? "specialist"}.`,
@@ -205,6 +213,11 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
 
 function toolDeclarations(agentKey: AgentKey): FunctionDeclaration[] {
   const declarations: FunctionDeclaration[] = [
+    {
+      name: "get_operational_data",
+      description: "Read the complete live operational snapshot: every agent's status, provider, model, voice and token usage; measured vs estimated costs; health; permissions; scheduler; recruitment and recent errors. Use for any transparency or operations question.",
+      parameters: { type: Type.OBJECT, properties: {} },
+    },
     {
       name: "get_workspace_status",
       description: "Read the real current agent, workflow, job and application counts. Use when the owner asks what is happening, how many agents are working, or for a summary.",
@@ -295,6 +308,7 @@ function liveConfig(userId: string, agentKey: AgentKey, sessionId: string, voice
 }
 
 export type LiveSession = {
+  voiceName: string;
   wsUrl: string;
   setup: {
     model: string;
@@ -337,8 +351,9 @@ export async function createLiveSession(input: {
   }
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new LiveVoiceError("Live voice is not configured.");
+  const profile = voiceProfileForAgent(input.agentKey);
 
-  const connectConfig = liveConfig(input.userId, input.agentKey, input.sessionId, input.voice);
+  const connectConfig = liveConfig(input.userId, input.agentKey, input.sessionId, profile.voiceId);
   const now = Date.now();
   const tokenExpiresAt = new Date(now + 30 * 60_000).toISOString();
   const sessionExpiresAt = new Date(now + 60_000).toISOString();
@@ -372,7 +387,7 @@ export async function createLiveSession(input: {
     model: `models/${config.model}`,
     generationConfig: {
       responseModalities: ["AUDIO"],
-      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: input.voice } } },
+      speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: profile.voiceId } } },
     },
     systemInstruction: connectConfig.systemInstruction as { parts: Array<{ text: string }> },
     tools: [{ functionDeclarations: toolDeclarations(input.agentKey) }],
@@ -385,6 +400,10 @@ export async function createLiveSession(input: {
     sessionResumption: {},
   };
 
+  const startedAt = new Date().toISOString();
+  setSetting("live_voice_last_session", startedAt);
+  setSetting(`live_voice_last_session:${input.agentKey}`, startedAt);
+
   return {
     wsUrl,
     setup,
@@ -394,7 +413,8 @@ export async function createLiveSession(input: {
     agentName: agentIdentity(input.agentKey).name,
     sessionId: input.sessionId,
     model: config.model,
-    voice: input.voice,
+    voice: profile.voiceId,
+    voiceName: profile.voiceName,
     greeting: input.greet,
   };
 }
@@ -430,35 +450,51 @@ function agentStatusPayload(agentKey: string) {
 export async function executeLiveTool(input: {
   userId: string;
   agentKey: AgentKey;
+  sessionId?: string | null;
   name: string;
   args: Record<string, unknown>;
 }): Promise<LiveToolOutcome> {
   const { userId, agentKey, name, args } = input;
+  const snapshot = await getOperationalSnapshot();
+
+  if (name === "get_operational_data") {
+    return {
+      response: {
+        ok: true,
+        brief: operationsBrief(snapshot),
+        activeAgent: snapshot.agents.find((agent) => agent.key === agentKey) ?? null,
+        tokenMethod: snapshot.tokens.context.detail,
+        permissionsMethod: "available capabilities, granted capabilities, capabilities used in the current task, and policy-blocked actions are kept distinct.",
+      },
+    };
+  }
+
   if (name === "get_workspace_status") {
-    const agents = agentRows().map((agent) => ({
-      key: agent.key,
-      name: agentIdentity(agent.key).name,
-      status: agent.enabled ? agent.status : "disabled",
-      currentTask: agent.current_task,
-    }));
-    const active = agents.filter((agent) => ["working", "thinking", "waiting"].includes(agent.status));
-    const workflow = latestWorkflow();
+    const active = snapshot.agents.filter((agent) => ["working", "thinking", "waiting"].includes(agent.status));
     return {
       response: {
         ok: true,
         activeAgents: active.length,
-        agents,
-        latestWorkflow: workflow
-          ? { label: workflow.workflow.label, status: workflow.workflow.status, summary: workflow.workflow.summary }
+        agents: snapshot.agents.map((agent) => ({
+          key: agent.key,
+          name: agent.name,
+          status: agent.status,
+          currentTask: agent.currentTask,
+          provider: agent.provider,
+          model: agent.model,
+          voice: agent.voice.voiceName,
+        })),
+        latestWorkflow: snapshot.recruitment.lastRun
+          ? { id: snapshot.recruitment.lastRun.id, status: snapshot.recruitment.lastRun.status, error: snapshot.recruitment.lastRun.error }
           : null,
-        summary: workspaceFacts(),
+        summary: operationsBrief(snapshot),
       },
     };
   }
 
   if (name === "get_agent_status") {
     const target = String(args.agent ?? "");
-    const agent = agentStatusPayload(target);
+    const agent = snapshot.agents.find((item) => item.key === target);
     if (!agent) return { response: { ok: false, error: "Unknown specialist." } };
     return { response: { ok: true, agent } };
   }
@@ -467,13 +503,16 @@ export async function executeLiveTool(input: {
     const target = String(args.agent ?? "");
     if (!isSpecialistKey(target)) return { response: { ok: false, error: "Unknown specialist." } };
     if (target === agentKey) return { response: { ok: false, error: "You are already speaking with that specialist." } };
-    const agent = agentStatusPayload(target);
-    if (!agent) return { response: { ok: false, error: "That specialist is not registered." } };
+    const activation = activateAgentSession(userId, target, recentConversationSummary(userId, 8));
+    if (!activation.ok) return { response: { ok: false, error: activation.reason } };
+    const profile = voiceProfileForAgent(target);
     return {
       response: {
         ok: true,
-        agent,
-        message: `The authenticated handoff to ${agent.name} is ready. Say a short bridge, then the app will reconnect the live voice session to ${agent.name}.`,
+        agentKey: target,
+        agent: agentIdentity(target).name,
+        voice: profile.voiceName,
+        message: `Authenticated handoff to ${agentIdentity(target).name} is ready. Say one short bridge; the app will cut audio immediately and reconnect with the assigned voice ${profile.voiceName}.`,
       },
       handoff: { agentKey: target },
     };
@@ -481,8 +520,11 @@ export async function executeLiveTool(input: {
 
   if (name === "return_to_coordinator") {
     if (agentKey === "coordinator") return { response: { ok: false, error: "You are already the Chief Coordinator." } };
+    const activation = activateAgentSession(userId, "coordinator", recentConversationSummary(userId, 8));
+    if (!activation.ok) return { response: { ok: false, error: activation.reason } };
+    const profile = voiceProfileForAgent("coordinator");
     return {
-      response: { ok: true, message: "Returning the owner to the Chief Coordinator." },
+      response: { ok: true, agentKey: "coordinator", voice: profile.voiceName, message: `Returning to the Chief Coordinator with voice ${profile.voiceName}.` },
       handoff: { agentKey: "coordinator" },
     };
   }
@@ -491,7 +533,7 @@ export async function executeLiveTool(input: {
     const command = typeof args.command === "string" ? args.command.trim().slice(0, 1000) : "";
     if (!command) return { response: { ok: false, error: "No command was supplied." } };
     try {
-      const result = await handleAssistantMessage(userId, command);
+      const result = await handleAssistantMessage(userId, command, { sessionId: input.sessionId ?? null });
       return {
         response: {
           ok: true,

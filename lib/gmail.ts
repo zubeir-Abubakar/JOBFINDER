@@ -530,81 +530,101 @@ function draftEmail(to: string, subject: string, body: string) {
   return Buffer.from(message, "utf8").toString("base64url");
 }
 
-/**
- * Send one explicitly requested test message through the connected Gmail
- * account. Gmail's message id proves acceptance by the API; it does not prove
- * inbox delivery, so that distinction is carried in `delivery` and `detail`.
- */
-export async function sendGmailTestEmail(to: string): Promise<GmailTestResult> {
-  const recipient = to.trim();
-  const base = {
-    provider: "gmail" as const,
+function sendFailure(recipient: string, status: GmailTestStatus, detail: string): GmailTestResult {
+  return {
+    provider: "gmail",
     recipientMasked: maskEmail(recipient),
+    status,
     messageId: null,
     threadId: null,
     delivery: null,
+    detail,
     at: nowIso(),
   };
-  const fail = (status: GmailTestStatus, detail: string): GmailTestResult => ({ ...base, status, detail });
+}
 
-  if (!validRecipient(recipient)) {
-    return fail("invalid_recipient", "Enter a valid notification email address, then save Notifications before testing.");
-  }
+/**
+ * One Gmail send implementation used by the explicit test and the durable
+ * notification outbox. Gmail's message id proves API acceptance, not inbox
+ * delivery; the latter is never claimed by this application.
+ */
+export async function sendGmailEmail(to: string, subject: string, body: string): Promise<GmailTestResult> {
+  const recipient = to.trim();
+  if (!validRecipient(recipient)) return sendFailure(recipient, "invalid_recipient", "Enter a valid notification email address.");
 
   const missing = gmailMissing();
-  if (missing.length > 0) {
-    return fail("missing_configuration", `Gmail is not ready: ${missing.join(" ")}`);
-  }
+  if (missing.length > 0) return sendFailure(recipient, "missing_configuration", `Gmail is not ready: ${missing.join(" ")}`);
 
   const account = accountStatus();
-  if (!account.connected) {
-    return fail("missing_configuration", "Gmail is not connected. Connect the mailbox from Admin → Email before testing.");
-  }
+  if (!account.connected) return sendFailure(recipient, "missing_configuration", "Gmail is not connected. Connect the mailbox from Admin → Email.");
   if (account.needsReconnect) {
-    return fail(
+    return sendFailure(
+      recipient,
       "permission_denied",
       `Gmail is missing required permissions: ${account.missingScopes.map((scope) => scope.split("/").pop()).join(", ")}. Reconnect Gmail and approve read, draft and send access.`,
     );
   }
 
-  const at = new Date().toISOString();
-  const body = [
-    "This is a test message from Towfiq AI Agents.",
-    "",
-    `Requested at ${at}.`,
-    "If you received this, Gmail accepted the send request from the connected mailbox.",
-    "The application can confirm API acceptance but cannot independently verify inbox delivery.",
-  ].join("\n");
-
   try {
     const sent = await gmailFetch<{ id?: string; threadId?: string }>("/messages/send", {
       method: "POST",
-      body: JSON.stringify({ raw: draftEmail(recipient, "Towfiq AI Agents — Gmail test", body) }),
+      body: JSON.stringify({ raw: draftEmail(recipient, subject, body) }),
     });
-    if (!sent?.id) {
-      return fail("unverified", "Gmail returned a successful response without a message ID. Delivery cannot be confirmed.");
-    }
+    if (!sent?.id) return sendFailure(recipient, "unverified", "Gmail returned a successful response without a message ID. Delivery cannot be confirmed.");
     return {
-      ...base,
+      provider: "gmail",
+      recipientMasked: maskEmail(recipient),
       status: "accepted",
       messageId: sent.id,
       threadId: sent.threadId ?? null,
       delivery: "unverified",
-      detail: "Gmail accepted the test message. Delivery to the mailbox is not independently verified by the application.",
+      detail: "Gmail accepted the message. Delivery to the mailbox is not independently verified by the application.",
+      at: nowIso(),
     };
   } catch (cause) {
     if (cause instanceof GmailProfileError) {
-      if (cause.kind === "expired") return fail("authentication_failed", cause.message);
-      if (cause.kind === "scope") return fail("permission_denied", cause.message);
-      if (cause.kind === "api_disabled") return fail("missing_configuration", cause.message);
-      return fail("api_error", cause.message);
+      if (cause.kind === "expired") return sendFailure(recipient, "authentication_failed", cause.message);
+      if (cause.kind === "scope") return sendFailure(recipient, "permission_denied", cause.message);
+      if (cause.kind === "api_disabled") return sendFailure(recipient, "missing_configuration", cause.message);
+      return sendFailure(recipient, "api_error", cause.message);
     }
     const message = cause instanceof Error ? cause.message : "Gmail send failed.";
     if (/invalid_grant|expired|revoked|refresh token|authorisation|decrypt|unable to authenticate|stored gmail token/i.test(message)) {
-      return fail("authentication_failed", message.slice(0, 500));
+      return sendFailure(recipient, "authentication_failed", message.slice(0, 500));
     }
-    return fail("api_error", message.slice(0, 500));
+    return sendFailure(recipient, "api_error", message.slice(0, 500));
   }
+}
+
+/** Verify the stored OAuth token against Gmail without sending a message. */
+export async function verifyGmailAccess(): Promise<{ ok: boolean; email: string | null; detail: string }> {
+  const missing = gmailMissing();
+  if (missing.length > 0) return { ok: false, email: null, detail: missing.join(" ") };
+  const account = accountStatus();
+  if (!account.connected) return { ok: false, email: null, detail: "Gmail is not connected." };
+  if (account.needsReconnect) return { ok: false, email: account.email, detail: "Gmail must be reconnected because required scopes are missing." };
+  try {
+    const profile = await gmailFetch<{ emailAddress?: string }>("/profile");
+    if (!profile.emailAddress) return { ok: false, email: account.email, detail: "Gmail returned no mailbox identity." };
+    return { ok: true, email: profile.emailAddress, detail: "Stored OAuth token refreshed and Gmail profile accepted it." };
+  } catch (cause) {
+    return { ok: false, email: account.email, detail: cause instanceof Error ? cause.message.slice(0, 500) : "Gmail authentication failed." };
+  }
+}
+
+/**
+ * Send one explicitly requested test message through the connected Gmail
+ * account. Exactly one API send call is made.
+ */
+export async function sendGmailTestEmail(to: string): Promise<GmailTestResult> {
+  const body = [
+    "This is a test message from Towfiq AI Agents.",
+    "",
+    `Requested at ${new Date().toISOString()}.`,
+    "If you received this, Gmail accepted the send request from the connected mailbox.",
+    "The application can confirm API acceptance but cannot independently verify inbox delivery.",
+  ].join("\n");
+  return sendGmailEmail(to, "Towfiq AI Agents — Gmail test", body);
 }
 
 /** Persist and audit the result so the Settings card shows the last real outcome. */
