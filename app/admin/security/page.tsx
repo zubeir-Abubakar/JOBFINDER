@@ -54,7 +54,7 @@ export default async function AdminSecurityPage({
               <div>
                 <label className="label" htmlFor="max_login_attempts">Max login attempts per window</label>
                 <input id="max_login_attempts" name="max_login_attempts" type="number" min={3} max={20} className="input" defaultValue={security.max_login_attempts} />
-                <p className="hint">Enforced by the in-process limiter (8 per 10 minutes per IP and account).</p>
+                <p className="hint">Enforced from failed sign-in audit events for the account or IP over a rolling 15-minute window. Restarts do not reset it.</p>
               </div>
               <div className="flex items-end">
                 <SubmitButton className="btn btn-primary">Save session policy</SubmitButton>

@@ -945,7 +945,8 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       <button
         type="button"
         className={`header-cta voice-trigger ${open ? "active" : ""}`}
-        aria-label="Open live voice"
+        aria-label="Open AT Voice Assistant"
+        title="AT Voice Assistant"
         aria-expanded={open}
         onClick={handleTrigger}
       >

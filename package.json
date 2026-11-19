@@ -7,7 +7,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "backup": "node scripts/backup.mjs"
+  },
+  "engines": {
+    "node": ">=24 <26"
   },
   "keywords": [],
   "author": "",

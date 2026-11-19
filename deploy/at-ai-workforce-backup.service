@@ -1,0 +1,23 @@
+[Unit]
+Description=AT AI Workforce database and uploads backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=atworkforce
+Group=atworkforce
+WorkingDirectory=/opt/at-ai-workforce
+EnvironmentFile=/opt/at-ai-workforce/.env
+Environment=NODE_ENV=production
+Environment=BACKUP_RETENTION_DAYS=30
+ExecStart=/usr/bin/npm run backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/at-ai-workforce/data

@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Brand, Icon } from "./icons";
 import { ThemeToggle } from "./ThemeToggle";
 import { AgentAvatar } from "./AgentAvatar";
@@ -55,18 +55,42 @@ export function AppShell({
   const nav = variant === "admin" ? adminNav : ownerNav;
   const home = variant === "admin" ? "/admin" : "/dashboard";
 
+  useEffect(() => {
+    setOpen(false);
+  }, [pathname]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.body.classList.add("nav-open");
+    window.addEventListener("keydown", onKey);
+    return () => {
+      document.body.classList.remove("nav-open");
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   return (
     <div className="shell">
       {open ? (
         <button
           aria-label="Close navigation"
           onClick={() => setOpen(false)}
-          className="fixed inset-0 z-40 bg-black/50 md:hidden"
-          style={{ border: 0 }}
+          className="nav-backdrop"
         />
       ) : null}
-      <aside className={`sidebar ${open ? "open" : ""}`}>
-        <Brand href={home} />
+      <aside id="app-navigation" className={`sidebar ${open ? "open" : ""}`}>
+        <div className="sidebar-brand-row">
+          <Brand href={home} />
+          <div className="sidebar-brand-actions mobile-only">
+            <ThemeToggle compact />
+            <button type="button" className="drawer-close" onClick={() => setOpen(false)} aria-label="Close navigation">
+              ✕
+            </button>
+          </div>
+        </div>
         <nav className="flex flex-col gap-0.5 overflow-y-auto">
           {nav.map((item, index) =>
             "group" in item ? (
@@ -85,6 +109,11 @@ export function AppShell({
               </Link>
             ),
           )}
+          {variant === "app" && user.role === "admin" ? (
+            <Link href="/admin" className="nav-link" onClick={() => setOpen(false)}>
+              <Icon name="admin" /> Admin console
+            </Link>
+          ) : null}
         </nav>
         <div className="mt-auto">
           <div className="card-quiet p-3">
@@ -111,28 +140,37 @@ export function AppShell({
 
       <div className="main">
         <header className="topbar">
-          <div className="flex items-center gap-2">
-            <button type="button" className="btn btn-ghost btn-sm mobile-only" onClick={() => setOpen(true)} aria-label="Open navigation">
-              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8">
+          <div className="topbar-left flex items-center gap-2">
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm mobile-only mobile-menu-toggle"
+              onClick={() => setOpen(true)}
+              aria-label="Open navigation"
+              aria-expanded={open}
+              aria-controls="app-navigation"
+            >
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" strokeWidth="1.8">
                 <path d="M4 7h16M4 12h16M4 17h16" />
               </svg>
             </button>
-            <span className="text-[11px] font-semibold uppercase tracking-[0.08em]" style={{ color: "var(--muted)" }}>
+            <span className="topbar-context text-[11px] font-semibold uppercase tracking-[0.08em]" style={{ color: "var(--muted)" }}>
               {variant === "admin" ? "Administrator console" : "Recruitment operations"}
             </span>
           </div>
           <div className="header-actions">
             {variant === "app" ? <CoordinatorLiveVoice initialMessages={assistantMessages} /> : null}
             {variant === "admin" ? (
-              <Link href="/dashboard" className="btn btn-ghost btn-sm">
+              <Link href="/dashboard" className="btn btn-ghost btn-sm header-role-link">
                 Owner workspace
               </Link>
             ) : user.role === "admin" ? (
-              <Link href="/admin" className="btn btn-ghost btn-sm">
+              <Link href="/admin" className="btn btn-ghost btn-sm header-admin-link">
                 Admin console
               </Link>
             ) : null}
-            <ThemeToggle />
+            <span className="topbar-utility">
+              <ThemeToggle />
+            </span>
             <span className="badge badge-neutral header-account" title={`${user.name} · ${user.email}`}>
               <UserAvatar name={user.name} src={user.avatarUrl} size={18} />
               <span>{user.email}</span>
@@ -145,12 +183,14 @@ export function AppShell({
                   aria-label={unreadCount > 0 ? `Inbox, ${unreadCount} unread message${unreadCount === 1 ? "" : "s"}` : "Inbox"}
                 >
                   <Icon name="mail" size={15} />
-                  <span className="header-cta-label">Inbox</span>
+                  <span className="header-cta-label header-label-desktop">Inbox</span>
+                  <span className="header-cta-label header-label-mobile">Inbox</span>
                   {unreadCount > 0 ? <span className="header-unread" aria-hidden>{unreadCount > 9 ? "9+" : unreadCount}</span> : null}
                 </Link>
-                <Link href="/assistant" className="header-cta header-ai" aria-label="AI Assistance">
+                <Link href="/assistant" className="header-cta header-ai" aria-label="AI messages">
                   <AgentAvatar agentKey="coordinator" status="idle" size={26} />
-                  <span className="header-cta-label">AI Assistance</span>
+                  <span className="header-cta-label header-label-desktop">AI Assistance</span>
+                  <span className="header-cta-label header-label-mobile">AI Message</span>
                 </Link>
               </>
             ) : null}

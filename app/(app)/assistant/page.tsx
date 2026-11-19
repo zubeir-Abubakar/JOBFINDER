@@ -59,8 +59,8 @@ export default async function AssistantPage({
         }
       />
 
-      <div className="split">
-        <section className="card" style={{ overflow: "hidden" }}>
+      <div className="split assistant-layout">
+        <section className="card assistant-chat-card" style={{ overflow: "hidden" }}>
           <div className="card-head">
             <div className="flex items-center gap-3">
               <AgentAvatar agentKey={active.agentKey} status={runtime?.status ?? "idle"} size={42} />
@@ -95,7 +95,7 @@ export default async function AssistantPage({
               </form>
             </div>
           </div>
-          <div className="chat-scroll">
+          <div className="chat-scroll assistant-thread">
             {messages.length === 0 ? (
               <div className="mx-auto max-w-md text-center">
                 <div className="mx-auto mb-3 flex justify-center">
@@ -135,7 +135,7 @@ export default async function AssistantPage({
               })
             )}
           </div>
-          <form action={sendChatMessageAction} style={{ borderTop: "1px solid var(--line)", padding: 12 }}>
+          <form action={sendChatMessageAction} className="assistant-composer" style={{ borderTop: "1px solid var(--line)", padding: 12 }}>
             <div className="flex items-end gap-2">
               <textarea
                 name="message"
@@ -151,7 +151,7 @@ export default async function AssistantPage({
           </form>
         </section>
 
-        <div className="stack">
+        <div className="stack assistant-side">
           <section className="card">
             <div className="card-head">
               <div>

@@ -116,7 +116,7 @@ export default async function InboxPage({
         </div>
       </section>
 
-      <section className="card">
+      <section className="card inbox-thread">
         <div className="card-head">
           <div>
             <h2>Recruiter correspondence</h2>

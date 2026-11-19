@@ -4,6 +4,7 @@ import { all, getDb, nowIso, one, run, v } from "./db";
 import { newToken, passwordIssues, sha256, verifyPassword } from "./security";
 import { getSetting } from "./settings";
 import { audit } from "./audit";
+import { loginThrottleState } from "./login-throttle";
 
 export const SESSION_COOKIE = "atw_session";
 
@@ -59,9 +60,28 @@ export async function login(
   password: string,
   remember: boolean,
 ): Promise<{ ok: true; role: string; mustChangePassword: boolean } | { ok: false; error: string }> {
-  const credential = verifyLoginCredentials(email, password);
   const normalised = email.trim().toLowerCase();
   const ip = await clientIp();
+  const security = getSetting<{ session_days: number; remember_days: number; max_login_attempts: number }>("security", {
+    session_days: 7,
+    remember_days: 30,
+    max_login_attempts: 8,
+  });
+  const attemptLimit = Math.min(20, Math.max(3, Number(security.max_login_attempts) || 8));
+  const throttle = loginThrottleState({ email: normalised, ip, limit: attemptLimit });
+  if (throttle.blocked) {
+    audit({
+      action: "login.blocked",
+      entity: "user",
+      entityId: normalised,
+      detail: `Rate limited after ${throttle.attempts} failed attempt(s)`,
+      ip,
+    });
+    const minutes = Math.max(1, Math.ceil(throttle.retryAfterSeconds / 60));
+    return { ok: false, error: `Too many failed attempts. Try again in ${minutes} minute${minutes === 1 ? "" : "s"}.` };
+  }
+
+  const credential = verifyLoginCredentials(email, password);
   const requestHeaders = await headers();
   const userAgent = requestHeaders.get("user-agent") ?? "";
 
@@ -77,7 +97,6 @@ export async function login(
   }
 
   const token = newToken();
-  const security = getSetting<{ session_days: number; remember_days: number }>("security", { session_days: 7, remember_days: 30 });
   const days = remember ? security.remember_days ?? 30 : security.session_days ?? 7;
   const expires = new Date(Date.now() + days * 86400_000);
   run("INSERT INTO sessions (token_hash, user_id, created_at, expires_at, ip, user_agent) VALUES (?, ?, ?, ?, ?, ?)", [

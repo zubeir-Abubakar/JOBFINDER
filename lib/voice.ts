@@ -37,12 +37,24 @@ export function voiceConfig(): VoiceConfig {
   if (!enabled) issues.push("FreeLLMAPI is disabled (FREELLMAPI_ENABLED=false).");
   if (!baseUrl) issues.push("FREELLMAPI_BASE_URL is not set.");
   if (!key) issues.push("The FreeLLMAPI API key is not configured.");
+  const ttsModel = process.env.FREELLMAPI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
+  const sttModel = process.env.FREELLMAPI_STT_MODEL || "whisper-1";
+  const voiceAllowed = (process.env.FREELLMAPI_VOICE_ALLOWED_MODELS ?? "")
+    .split(",")
+    .map((model) => model.trim())
+    .filter(Boolean);
+  if (voiceAllowed.length > 0 && !voiceAllowed.includes(ttsModel)) {
+    issues.push(`Speech model ${ttsModel} is not in FREELLMAPI_VOICE_ALLOWED_MODELS.`);
+  }
+  if (voiceAllowed.length > 0 && !voiceAllowed.includes(sttModel)) {
+    issues.push(`Transcription model ${sttModel} is not in FREELLMAPI_VOICE_ALLOWED_MODELS.`);
+  }
   return {
     configured: issues.length === 0,
     baseUrl,
-    ttsModel: process.env.FREELLMAPI_TTS_MODEL || "gemini-2.5-flash-preview-tts",
+    ttsModel,
     voice: process.env.FREELLMAPI_TTS_VOICE || "Charon",
-    sttModel: process.env.FREELLMAPI_STT_MODEL || "whisper-1",
+    sttModel,
     issues,
   };
 }
