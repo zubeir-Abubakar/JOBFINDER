@@ -1,12 +1,15 @@
 import type { Metadata, Viewport } from "next";
+import { headers } from "next/headers";
 import "./globals.css";
+import { DiagnosticsBoot } from "@/components/DiagnosticsBoot";
 import { ServiceWorkerRegistrar } from "@/components/ServiceWorkerRegistrar";
 
 export const metadata: Metadata = {
-  title: "Towfiq AI Agents",
+  title: "AT AI Workforce",
   description: "Multi-agent AI recruitment operations platform.",
-  applicationName: "Towfiq AI Agents",
+  applicationName: "AT AI Workforce",
   manifest: "/manifest.webmanifest",
+  formatDetection: { telephone: false, email: false, address: false },
   icons: {
     icon: [
       { url: "/icons/icon-192.png", sizes: "192x192", type: "image/png" },
@@ -16,7 +19,7 @@ export const metadata: Metadata = {
   },
   appleWebApp: {
     capable: true,
-    title: "Towfiq AI Agents",
+    title: "AT Workforce",
     statusBarStyle: "black-translucent",
   },
 };
@@ -33,11 +36,18 @@ export const viewport: Viewport = {
 
 const themeScript = `(function(){try{var t=localStorage.getItem('atw-theme');var d=t?t==='dark':true;document.documentElement.classList.toggle('dark',d);}catch(e){}})();`;
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const nonce = (await headers()).get("x-nonce") ?? undefined;
   return (
     <html lang="en" suppressHydrationWarning>
       <head>
-        <script dangerouslySetInnerHTML={{ __html: themeScript }} />
+        {/* These must not depend on React hydration. If a client chunk fails,
+            the worker still registers and PWA installation remains possible.
+            Manual scripts need the per-request nonce explicitly; strict-dynamic
+            does not cover parser-inserted scripts. */}
+        <script src="/pwa-bootstrap.js" defer nonce={nonce} />
+        <DiagnosticsBoot nonce={nonce} />
+        <script nonce={nonce} dangerouslySetInnerHTML={{ __html: themeScript }} />
       </head>
       <body suppressHydrationWarning>
         {children}

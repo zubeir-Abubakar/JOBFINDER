@@ -19,7 +19,7 @@ export async function startWorkflowAction(formData: FormData): Promise<void> {
 
 export async function pauseWorkflowAction(): Promise<void> {
   const user = await requireUser();
-  const message = await pauseRunningWorkflow();
+  const message = await pauseRunningWorkflow(user);
   audit({ action: "workflow.pause_requested", entity: "workflow", detail: message, userId: user.id });
   revalidatePath("/agents");
   redirect(`/agents?ok=${encodeURIComponent(message)}`);
@@ -27,7 +27,7 @@ export async function pauseWorkflowAction(): Promise<void> {
 
 export async function stopWorkflowAction(): Promise<void> {
   const user = await requireUser();
-  const message = await stopRunningWorkflow();
+  const message = await stopRunningWorkflow(user);
   audit({ action: "workflow.stop_requested", entity: "workflow", detail: message, userId: user.id });
   revalidatePath("/agents");
   redirect(`/agents?ok=${encodeURIComponent(message)}`);
@@ -35,7 +35,7 @@ export async function stopWorkflowAction(): Promise<void> {
 
 export async function resumeWorkflowAction(): Promise<void> {
   const user = await requireUser();
-  const result = await resumeLatestWorkflow(user.id);
+  const result = await resumeLatestWorkflow(user);
   revalidatePath("/agents");
   redirect(`/agents?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
 }
@@ -43,7 +43,7 @@ export async function resumeWorkflowAction(): Promise<void> {
 export async function retryWorkflowAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("workflow_id") ?? "");
-  const result = await retryWorkflow(user.id, id);
+  const result = await retryWorkflow(user, id);
   revalidatePath("/agents");
   redirect(`/agents?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
 }

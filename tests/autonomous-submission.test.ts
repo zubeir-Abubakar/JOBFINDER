@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { openVacancyVerification } from "./helpers/open-vacancy.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -128,6 +129,9 @@ const runs = await import("../lib/recruitment-run.ts");
 const profileModule = await import("../lib/profile.ts");
 
 db.getDb();
+// This fixture exercises real (local) form delivery; production defaults remain
+// a dry run. The fixture must opt out explicitly.
+db.run("UPDATE settings SET value = 'false' WHERE key = 'recruitment_dry_run'");
 db.run("UPDATE profiles SET email = ?, phone = ?, work_authorisation = ? WHERE id = 1", [
   "ada@example.com",
   "+41 79 000 00 00",
@@ -193,9 +197,18 @@ function makeJob(input: { id: string; title: string; company: string; path: stri
     ],
   );
   const applicationId = `app_${input.id}`;
+  const readiness = JSON.stringify({
+    ready: true,
+    state: "ready_for_submission",
+    reasons: [],
+    items: [],
+    checkedAt: new Date().toISOString(),
+    engine: "test-readiness",
+  });
   db.run(
-    "INSERT INTO applications (id, job_id, status, method, last_update, created_at) VALUES (?, ?, 'ready_to_submit', 'candidate_form', ?, ?)",
-    [applicationId, input.id, new Date().toISOString(), new Date().toISOString()],
+    `INSERT INTO applications (id, job_id, status, method, readiness, readiness_checked_at, last_update, created_at)
+     VALUES (?, ?, 'ready_to_submit', 'candidate_form', ?, ?, ?, ?)`,
+    [applicationId, input.id, readiness, new Date().toISOString(), new Date().toISOString(), new Date().toISOString()],
   );
   return { jobId: input.id, applicationId };
 }
@@ -289,13 +302,13 @@ function fakePackage(jobId: string) {
   };
 }
 
-test("defaults are 85%, 7 days, 3/day, and activation is deliberately absent", () => {
+test("defaults are 85%, 7 days, 5/day, and activation is deliberately absent", () => {
   const current = policy.getRecruitmentPolicy();
   assert.equal(current.minMatchScore, 85);
-  assert.equal(current.maxSubmissionsPerDay, 3);
+  assert.equal(current.maxSubmissionsPerDay, 5);
   assert.equal(current.freshnessDays, 7);
-  assert.equal(current.autonomousSubmission, true);
-  assert.equal(current.requirePerApplicationApproval, false);
+  assert.equal(current.autonomousSubmission, false);
+  assert.equal(current.requirePerApplicationApproval, true);
   assert.equal(current.activatedAt, null);
   assert.equal(current.active, false);
 });
@@ -317,6 +330,9 @@ test("before activation no application leaves the app", async () => {
 test("one blocked application does not stop another qualifying application", async () => {
   policy.activateStandingAuthorisation("test-owner");
   assert.equal(policy.getRecruitmentPolicy().active, true);
+  // Keep the cap out of the way for the channel/evidence tests; the dedicated
+  // daily-limit tests below lower it deliberately.
+  policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 10 });
   const salary = makeJob({
     id: "run_salary",
     title: "Senior QA Automation Engineer",
@@ -356,6 +372,7 @@ test("one blocked application does not stop another qualifying application", asy
           evidence: {},
         }) as unknown as import("../lib/scoring.ts").JobAnalysis,
       prepare: async (jobId) => fakePackage(jobId),
+      verifyVacancy: async () => openVacancyVerification(),
     },
   });
   assert.equal(outcome.simulated, 0);
@@ -418,6 +435,83 @@ test("a straightforward candidate form is completed from verified data only", as
   assert.equal(stored?.status, "submitted");
   assert.equal(stored?.submission_status, "verified");
   assert.equal(stored?.confirmation_ref, "APP-2026-0042");
+});
+
+test("an application cannot bypass the persisted readiness gate", async () => {
+  const { jobId, applicationId } = makeJob({
+    id: "not_ready_job",
+    title: "Senior QA Automation Engineer",
+    company: "Not Ready AG",
+    path: "/apply",
+  });
+  db.run(
+    "UPDATE applications SET readiness = ? WHERE id = ?",
+    [JSON.stringify({ ready: false, state: "blocked", reasons: ["fixture blocked"] }), applicationId],
+  );
+  const before = posts.length;
+  const outcome = await submission.submitApplication(submissionInput(jobId, applicationId));
+  assert.equal(outcome.status, "blocked");
+  assert.match(outcome.detail, /readiness/i);
+  assert.equal(posts.length, before, "a non-ready application is never posted");
+  const stored = db.one<{ status: string }>("SELECT status FROM applications WHERE id = ?", [applicationId]);
+  assert.equal(stored?.status, "ready_to_submit", "the refusal does not pretend the application was sent");
+});
+
+test("atomic claim prevents concurrent workers from sending the same vacancy twice", async () => {
+  const { jobId, applicationId } = makeJob({
+    id: "race_job",
+    title: "Senior QA Automation Engineer",
+    company: "Race Form AG",
+    path: "/apply",
+  });
+  const before = posts.length;
+  const input = submissionInput(jobId, applicationId);
+  const [first, second] = await Promise.all([
+    submission.submitApplication(input),
+    submission.submitApplication(input),
+  ]);
+  const verified = [first, second].filter((outcome) => outcome.status === "verified");
+  assert.equal(verified.length, 1, "exactly one worker may send");
+  assert.equal([first, second].filter((outcome) => outcome.status === "blocked").length, 1);
+  assert.equal(posts.length, before + 1, "the vacancy is posted exactly once");
+  const verifiedAttempts = db.one<{ c: number }>(
+    "SELECT COUNT(*) AS c FROM submission_attempts WHERE job_id = ? AND status = 'verified'",
+    [jobId],
+  );
+  assert.equal(verifiedAttempts?.c, 1);
+  const activeClaims = db.one<{ c: number }>(
+    "SELECT COUNT(*) AS c FROM submission_attempts WHERE job_id = ? AND status = 'submitting'",
+    [jobId],
+  );
+  assert.equal(activeClaims?.c, 0, "the winning claim was finalised, not left stale");
+});
+
+test("a stale submitting lease is recovered as unknown and never retried", async () => {
+  const { jobId, applicationId } = makeJob({
+    id: "stale_job",
+    title: "Senior QA Automation Engineer",
+    company: "Stale Claim AG",
+    path: "/apply",
+  });
+  const staleAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  db.run("UPDATE applications SET status = 'submitting' WHERE id = ?", [applicationId]);
+  db.run(
+    `INSERT INTO submission_attempts (id, application_id, job_id, channel, status, attempted_at)
+     VALUES ('sub_stale_fixture', ?, ?, 'candidate_form', 'submitting', ?)`,
+    [applicationId, jobId, staleAt],
+  );
+  const before = posts.length;
+  const outcome = await submission.submitApplication(submissionInput(jobId, applicationId));
+  assert.equal(outcome.status, "blocked");
+  assert.equal(posts.length, before, "a stale lease is not a safe retry");
+  const stored = db.one<{ status: string; submission_status: string | null }>(
+    "SELECT status, submission_status FROM applications WHERE id = ?",
+    [applicationId],
+  );
+  assert.equal(stored?.status, "submission_unverified");
+  assert.equal(stored?.submission_status, "unverified");
+  const stale = db.one<{ status: string }>("SELECT status FROM submission_attempts WHERE id = 'sub_stale_fixture'");
+  assert.equal(stale?.status, "unverified");
 });
 
 test("an unknown essential answer, salary, notice and relocation all trigger intervention", async () => {
@@ -558,6 +652,24 @@ test("the daily cap stops document preparation once today's verified submissions
   assert.equal(outcome.prepared, 0);
   assert.equal(prepareCalls, 0);
   assert.ok(outcome.warnings.some((warning) => /daily limit|daily cap/i.test(warning)));
+  policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 3 });
+});
+
+test("a direct submission is blocked at the daily cap without losing its ready state", async () => {
+  policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 1 });
+  const { jobId, applicationId } = makeJob({
+    id: "direct_cap_job",
+    title: "Senior QA Automation Engineer",
+    company: "Direct Cap AG",
+    path: "/apply",
+  });
+  const before = posts.length;
+  const outcome = await submission.submitApplication(submissionInput(jobId, applicationId));
+  assert.equal(outcome.status, "blocked");
+  assert.match(outcome.detail, /daily limit/i);
+  assert.equal(posts.length, before, "the cap is enforced immediately before sending");
+  const stored = db.one<{ status: string }>("SELECT status FROM applications WHERE id = ?", [applicationId]);
+  assert.equal(stored?.status, "ready_to_submit", "the package remains queued for the next day");
   policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 3 });
 });
 

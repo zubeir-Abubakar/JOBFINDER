@@ -1,6 +1,8 @@
 import { all, nowIso, one, run, v } from "./db";
 import { randomId } from "./security";
 import { htmlToText } from "./scoring";
+import { classifyVacancy } from "./vacancy-classification";
+import { requestJson, type SourceAttemptDiagnostic, type SourceErrorCategory } from "./source-http";
 
 export type JobRow = {
   id: string;
@@ -24,6 +26,8 @@ export type JobRow = {
   ai_note: string | null;
   duplicate_of: string | null;
   raw: string | null;
+  last_seen_at: string | null;
+  last_seen_source: string | null;
 };
 
 const QA_TITLE = /\b(qa|quality assurance|test(ing)? engineer|test automation|sdet|software test|test lead|test manager|automation engineer)\b/i;
@@ -56,6 +60,10 @@ export type ResearchResult = {
   rejectedSamples: Array<{ title: string; company: string; reason: string }>;
   sourceNote: string;
   error?: string;
+  errorCategory?: SourceErrorCategory;
+  attempts: number;
+  durationMs: number;
+  diagnostics: SourceAttemptDiagnostic[];
 };
 
 const PLACEHOLDER_COMPANY = /^(company\s+[a-z]|company\s+\d+|employer\s+[a-z]|example(\s+(company|employer|inc|ltd))?|sample(\s+company)?|test\s+company|acme(\s+corp(oration)?)?|placeholder)$/i;
@@ -103,6 +111,9 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
     rejectionReasons: {},
     rejectedSamples: [],
     sourceNote: "Source: Arbeitnow public job board API — link back to Arbeitnow.com required.",
+    attempts: 0,
+    durationMs: 0,
+    diagnostics: [],
   };
 
   const reject = (title: string, company: string, reason: string) => {
@@ -118,25 +129,30 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
     result.error = "The Arbeitnow source is disabled. Enable it under Job discovery → Sources.";
     return result;
   }
-  const baseUrl = source.url || "https://www.arbeitnow.com/api/job-board-api";
+  // An explicit environment URL supports isolated E2E fixtures without
+  // changing the persisted production source configuration.
+  const baseUrl = process.env.ARBEITNOW_API_URL || source.url || "https://www.arbeitnow.com/api/job-board-api";
 
   for (let page = 1; page <= pages; page += 1) {
-    let payload: { data?: ArbeitnowJob[] };
     result.requests += 1;
-    try {
-      const response = await fetch(`${baseUrl}?page=${page}`, {
-        headers: { Accept: "application/json", "User-Agent": "AT-AI-Workforce/1.0 (personal job search)" },
-        cache: "no-store",
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!response.ok) throw new Error(`Job source responded ${response.status}`);
-      result.responses += 1;
-      payload = (await response.json()) as { data?: ArbeitnowJob[] };
-    } catch (error) {
-      result.error = error instanceof Error ? error.message : "Job source could not be reached.";
+    const request = await requestJson<{ data?: ArbeitnowJob[] }>(`${baseUrl}?page=${page}`, {
+      headers: { "User-Agent": "AT-AI-Workforce/2.4 (personal job search)" },
+      timeoutMs: 25_000,
+      // A valid second page can be just under 10 MB. The shared reader keeps
+      // the read bounded; this connector opts into the increased allowance.
+      maxResponseBytes: 12 * 1024 * 1024,
+      label: "Arbeitnow",
+    });
+    result.attempts += request.attempts;
+    result.durationMs += request.durationMs;
+    result.diagnostics.push(...request.diagnostics);
+    if (!request.ok) {
+      result.error = request.error ?? "Job source could not be reached.";
+      result.errorCategory = request.errorCategory ?? "unknown";
       break;
     }
-    const batch = payload.data ?? [];
+    result.responses += 1;
+    const batch = request.data?.data ?? [];
     result.pages += 1;
     result.fetched += batch.length;
 
@@ -146,6 +162,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
       if (!created || Date.now() - created.getTime() <= 7 * 86400_000) result.fresh += 1;
       const location = item.location ?? "";
       const remote = Boolean(item.remote);
+      const plain = htmlToText(item.description ?? "");
       const isSwiss = SWISS.test(location) || SWISS.test(item.title) || SWISS.test(item.description?.slice(0, 1500) ?? "");
       const titleOk = QA_TITLE.test(item.title);
       if (!titleOk) {
@@ -156,12 +173,22 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
         reject(item.title, item.company_name, "Outside Switzerland and not remote");
         continue;
       }
+      const classification = classifyVacancy({
+        title: item.title ?? "",
+        company: item.company_name ?? "",
+        location,
+        description: plain,
+      });
+      if (!classification.isQa) {
+        reject(item.title, item.company_name, `Not a hands-on QA/SDET role (classified as ${classification.label})`);
+        continue;
+      }
       const invalid = vacancyValidationError({
         title: item.title ?? "",
         company: item.company_name ?? "",
         location,
         url: item.url,
-        description: htmlToText(item.description ?? ""),
+        description: plain,
       });
       if (invalid) {
         reject(item.title, item.company_name, invalid);
@@ -170,6 +197,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
 
       const existing = one<{ id: string }>("SELECT id FROM jobs WHERE source = 'arbeitnow' AND external_id = ?", [item.slug]);
       if (existing) {
+        run("UPDATE jobs SET last_seen_at = ?, last_seen_source = ? WHERE id = ?", [nowIso(), "arbeitnow", existing.id]);
         result.duplicates += 1;
         continue;
       }
@@ -178,15 +206,15 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
         [item.title, item.company_name],
       );
       if (nearDuplicate) {
+        run("UPDATE jobs SET last_seen_at = ?, last_seen_source = ? WHERE id = ?", [nowIso(), "arbeitnow", nearDuplicate.id]);
         result.duplicates += 1;
         continue;
       }
 
       const id = `job_${randomId()}`;
-      const plain = htmlToText(item.description ?? "");
       run(
-        `INSERT INTO jobs (id, source, external_id, title, company, location, remote, employment_type, salary, url, description, posted_at, discovered_at, status, raw)
-         VALUES (?, 'arbeitnow', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'new', ?)`,
+        `INSERT INTO jobs (id, source, external_id, title, company, location, remote, employment_type, salary, url, description, posted_at, discovered_at, status, raw, last_seen_at, last_seen_source)
+         VALUES (?, 'arbeitnow', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'new', ?, ?, 'arbeitnow')`,
         [
           id,
           item.slug,
@@ -200,6 +228,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
           item.created_at ? new Date(item.created_at * 1000).toISOString() : null,
           nowIso(),
           JSON.stringify(item).slice(0, 20000),
+          nowIso(),
         ],
       );
       result.inserted += 1;

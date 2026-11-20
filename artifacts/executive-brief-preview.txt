@@ -1,0 +1,92 @@
+AT AI WORKFORCE
+01 · DAILY EXECUTIVE BRIEF
+20 November 2026 · Europe/Zurich
+Reporting period: 20 Nov 2026, 00:00 – 21 Nov 2026, 00:00
+
+Hello Test,
+
+02 · EXECUTIVE SUMMARY
+8 of 8 registered agents produced a structured report. 1 application was verified as submitted; 3 vacancies qualified; 1 application remains blocked; 1 application remains in the preparation queue. 1 task failure was recorded. Reconciliation requires attention: 1 execution failure was recorded by the run ledger. Resolve the exceptions before increasing throughput or enabling further automation.
+Run TEST-DATA-2026-11-20: Completed; 3 discovered, 3 qualified, 1 verified submission(s).
+Reporting reconciliation: 1 execution failure was recorded by the run ledger.
+
+03 · WORKFORCE PERFORMANCE METRICS
+Jobs discovered: 3 — Stored in the reporting period.
+Jobs qualified: 3 — Met every qualification rule.
+Submitted + verified: 1 — Employer evidence only.
+Applications blocked: 1 — Current queue needing action.
+Applications pending: 1 — Current preparation queue.
+Agents reporting: 8 / 8 — Reconciled with the run ledger.
+Policy: Automatic submission paused; threshold 85%; dry run enabled.
+
+04 · AGENT-BY-AGENT ACTIVITY
+- Chief Coordinator (Orchestrator): Completed; 0 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST coordinator assignment
+  Latest evidence: TEST coordinator output recorded.
+- Job Research Agent (Discovery): Completed; 1 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST research assignment
+  Latest evidence: TEST research output recorded.
+- Job Analysis Agent (Matching): Completed; 0 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST analysis assignment
+  Latest evidence: TEST analysis output recorded.
+- CV Optimisation Agent (Documents): Completed; 1 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST cv assignment
+  Latest evidence: TEST cv output recorded.
+- ATS Quality Control Agent (Assurance): Failed; 0 completed, 1 failed, 0 open.
+  Report: Reported a failure; inspect the recorded error.
+  Latest assignment: TEST ats assignment
+  Latest evidence: TEST ats output recorded.
+  Needs attention: TEST fixture warning: one source returned no readable postings.
+- Cover Letter Agent (Documents): Completed; 0 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST cover assignment
+  Latest evidence: TEST cover output recorded.
+- Application Agent (Submission): Completed; 1 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST application assignment
+  Latest evidence: TEST application output recorded.
+- Email & Tracking Agent (Tracking): Completed; 0 completed, 0 failed, 0 open.
+  Report: Reconciled with persisted execution records.
+  Latest assignment: TEST email assignment
+  Latest evidence: TEST email output recorded.
+
+05 · COMPLETED TASKS AND ACHIEVEMENTS
+Completed tasks recorded: 3
+- research: Search configured TEST sources
+- cv: Tailor CV for [TEST] Northstar
+- application: Submit verified TEST package
+- 1 application has verified employer evidence; first recorded: [TEST] Northstar Payments AG — [TEST] Senior QA Automation Engineer.
+- 3 vacancies met every qualification rule in the reporting period.
+- 2 tailored CV or cover-letter documents were generated.
+- All 8 registered agents produced a record in the run ledger.
+
+06 · BLOCKED EXCEPTIONS AND INVESTIGATIONS
+Blocked applications: 1; open investigations: 1; failed tasks: 1; failed submissions: 0; failed runs: 0.
+- [TEST] Alpine Ledger AG — [TEST] QA Lead: Human Intervention Required. Do you require visa sponsorship? Owner answer required: Do you require visa sponsorship? [app_preview_2]
+- ats — TEST source quality check: TEST fixture warning: one source returned no readable postings. [task_preview_failed]
+
+07 · COORDINATOR'S ASSESSMENT
+8 of 8 registered agents produced a structured report. 1 application was verified as submitted; 3 vacancies qualified; 1 application remains blocked; 1 application remains in the preparation queue. 1 task failure was recorded. Reconciliation requires attention: 1 execution failure was recorded by the run ledger. Resolve the exceptions before increasing throughput or enabling further automation.
+
+08 · NEXT OPERATIONAL PRIORITIES
+1. Reconcile the agent ledger with the execution records before relying on the reported coverage.
+2. Resolve 1 blocked application and 1 open investigation; do not retry an unverified submission blindly.
+3. Review 1 failed task before the next scheduled execution.
+4. Continue processing 1 pending application through the normal safety and quality gates.
+5. Automatic submission is paused. Qualifying applications will wait until the standing authorisation is explicitly reactivated.
+6. Next recruitment run: 21 Nov 2026, 10:00 (Europe/Zurich). The application must be running at that time.
+
+09 · DASHBOARD ACCESS
+Open the AT AI Workforce dashboard: https://app.example.test/dashboard
+
+10 · COORDINATOR SIGNATURE
+Chief Coordinator
+AT AI Workforce
+Autonomous Recruitment & Workforce Operations
+
+Generated 20 Nov 2026, 17:00 (Europe/Zurich).
+Counts come from persisted records. A submission is counted only with verified employer evidence. Missing records are identified as missing, not converted to zero.

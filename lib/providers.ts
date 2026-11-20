@@ -95,6 +95,8 @@ export type GenerateInput = {
   source?: Exclude<AiCallSource, "legacy">;
   priority?: AiPriority;
   maxWaitMs?: number;
+  /** Optional streaming callback. A partial provider answer must not be retried. */
+  onDelta?: (delta: string) => void;
 };
 
 export class ProvidersUnavailableError extends Error {
@@ -1044,7 +1046,110 @@ function providerHttpFailure(
   return new AiProviderError(provider, `Provider HTTP ${status}: ${message}`, status === 408 || status === 425 || status >= 500, status);
 }
 
+async function callFreeLlmStreaming(input: GenerateInput & { onDelta: (delta: string) => void }): Promise<GenerateResult> {
+  const c = config().freellmapi;
+  try {
+    assertPermittedModel(c.model);
+  } catch (error) {
+    throw new AiProviderConfigError("freellmapi", error instanceof Error ? error.message : "FreeLLMAPI model policy rejected the request.");
+  }
+  const started = Date.now();
+  const response = await fetch(`${c.base}/chat/completions`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${c.key}`, "Content-Type": "application/json" },
+    signal: timeout(45_000),
+    body: JSON.stringify({
+      model: c.model,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [
+        { role: "system", content: input.system },
+        { role: "user", content: input.prompt },
+      ],
+      temperature: input.temperature ?? 0.2,
+      max_tokens: input.maxTokens ?? 800,
+    }),
+  });
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let payload: { error?: { message?: string } } = {};
+    try { payload = JSON.parse(raw) as { error?: { message?: string } }; } catch {}
+    throw providerHttpFailure("freellmapi", response.status, payload.error?.message ?? raw.slice(0, 300) ?? `FreeLLMAPI HTTP ${response.status}`, response.headers, payload);
+  }
+  if (!response.body) throw new AiProviderError("freellmapi", "FreeLLMAPI returned no streaming body.", true);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let model = c.model;
+  let usagePayload: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } | null = null;
+  let routedVia: RoutedVia = null;
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+    const payload = JSON.parse(data) as {
+      model?: string;
+      choices?: Array<{ delta?: { content?: string }; text?: string; message?: { content?: string } }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } };
+      _routed_via?: { platform?: string; model?: string };
+    };
+    if (payload.model) model = payload.model;
+    if (payload.usage) usagePayload = payload.usage;
+    if (payload._routed_via) routedVia = { platform: payload._routed_via.platform ?? null, model: payload._routed_via.model ?? null };
+    const delta = payload.choices?.[0]?.delta?.content ?? payload.choices?.[0]?.text ?? "";
+    if (delta) {
+      text += delta;
+      input.onDelta(delta);
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline).replace(/\r$/, "");
+      buffer = buffer.slice(newline + 1);
+      processLine(line);
+      newline = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.trim()) processLine(buffer);
+  if (!text.trim()) throw new AiProviderError("freellmapi", "FreeLLMAPI returned an empty completion.", true);
+  try {
+    assertPinnedResolution(c.model, model);
+  } catch (error) {
+    throw new AiProviderConfigError("freellmapi", error instanceof Error ? error.message : "FreeLLMAPI returned an unpinned model.");
+  }
+  const usage = usagePayload as {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+  } | null;
+  const usageSource = usage ? "provider" as const : "estimated" as const;
+  return {
+    text: text.trim(),
+    provider: "freellmapi",
+    model,
+    usage: {
+      promptTokens: usage?.prompt_tokens ?? estimateTokens(input.prompt),
+      completionTokens: usage?.completion_tokens ?? estimateTokens(text),
+      totalTokens: usage?.total_tokens ?? estimateTokens(input.prompt) + estimateTokens(text),
+    },
+    usageSource,
+    cachedTokens: Number(usage?.prompt_tokens_details?.cached_tokens ?? 0),
+    latencyMs: Date.now() - started,
+    costChf: null,
+    costStatus: "unverified",
+    routedVia,
+  };
+}
+
 async function callFreeLlm(input: GenerateInput): Promise<GenerateResult> {
+  if (input.onDelta) return callFreeLlmStreaming(input as GenerateInput & { onDelta: (delta: string) => void });
   const c = config().freellmapi;
   try {
     assertPermittedModel(c.model);
@@ -1122,7 +1227,87 @@ function ollamaModelFor(input: GenerateInput): string {
   return input.technical ? c.coderModel : c.model;
 }
 
+async function callOllamaStreaming(input: GenerateInput & { onDelta: (delta: string) => void }): Promise<GenerateResult> {
+  const c = config().ollama;
+  if (!c.enabled) throw new AiProviderConfigError("ollama", "Ollama fallback is disabled (OLLAMA_ENABLED is not true).");
+  if (!c.base) throw new AiProviderConfigError("ollama", "OLLAMA_BASE_URL is not set.");
+  const model = ollamaModelFor(input);
+  const configurationName = input.technical ? "OLLAMA_CODER_MODEL" : "OLLAMA_MODEL";
+  if (!model) throw new AiProviderConfigError("ollama", `${configurationName} is not set.`);
+  const started = Date.now();
+  const response = await fetch(`${c.base}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: timeout(c.timeoutMs),
+    body: JSON.stringify({
+      model,
+      stream: true,
+      keep_alive: "5m",
+      messages: [
+        { role: "system", content: input.system },
+        { role: "user", content: input.prompt },
+      ],
+      options: { temperature: input.temperature ?? 0.2, num_predict: input.maxTokens ?? 800, num_ctx: 4096 },
+    }),
+  });
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    const message = raw.slice(0, 300) || `Ollama HTTP ${response.status}`;
+    if (response.status === 404 || /model.*not found|no such model/i.test(message)) {
+      throw new AiProviderConfigError("ollama", `${model} is not installed or could not be loaded. Run: ollama pull ${model}`);
+    }
+    throw providerHttpFailure("ollama", response.status, message);
+  }
+  if (!response.body) throw new AiProviderError("ollama", "Ollama returned no streaming body.", true);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let promptTokens = 0;
+  let completionTokens = 0;
+  const processLine = (line: string) => {
+    if (!line.trim()) return;
+    const payload = JSON.parse(line) as { message?: { content?: string }; prompt_eval_count?: number; eval_count?: number; error?: string };
+    if (payload.error) throw new AiProviderError("ollama", payload.error, false);
+    const delta = payload.message?.content ?? "";
+    if (delta) { text += delta; input.onDelta(delta); }
+    if (typeof payload.prompt_eval_count === "number") promptTokens = payload.prompt_eval_count;
+    if (typeof payload.eval_count === "number") completionTokens = payload.eval_count;
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline).replace(/\r$/, "");
+      buffer = buffer.slice(newline + 1);
+      processLine(line);
+      newline = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.trim()) processLine(buffer);
+  if (!text.trim()) throw new AiProviderError("ollama", "Ollama returned an empty completion.", true);
+  return {
+    text: text.trim(),
+    provider: "ollama",
+    model,
+    usage: {
+      promptTokens: promptTokens || estimateTokens(input.prompt),
+      completionTokens: completionTokens || estimateTokens(text),
+      totalTokens: promptTokens + completionTokens || estimateTokens(input.prompt) + estimateTokens(text),
+    },
+    usageSource: promptTokens && completionTokens ? "provider" : "estimated",
+    cachedTokens: 0,
+    latencyMs: Date.now() - started,
+    costChf: null,
+    costStatus: "unverified",
+    routedVia: null,
+  };
+}
+
 async function callOllama(input: GenerateInput): Promise<GenerateResult> {
+  if (input.onDelta) return callOllamaStreaming(input as GenerateInput & { onDelta: (delta: string) => void });
   const c = config().ollama;
   if (!c.enabled) throw new AiProviderConfigError("ollama", "Ollama fallback is disabled (OLLAMA_ENABLED is not true).");
   if (!c.base) throw new AiProviderConfigError("ollama", "OLLAMA_BASE_URL is not set.");
@@ -1276,6 +1461,11 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
     );
   }
 
+  let streamed = false;
+  const onDelta = input.onDelta
+    ? (delta: string) => { streamed = true; input.onDelta?.(delta); }
+    : undefined;
+  const attemptInput = onDelta ? { ...input, onDelta } : input;
   const release = await acquireAiSlot(input.priority ?? 1, input.maxWaitMs ?? 60_000);
   try {
     const errors: string[] = [];
@@ -1294,7 +1484,7 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
           const started = Date.now();
           try {
-            const result = await callFreeLlm(input);
+            const result = await callFreeLlm(attemptInput);
             recordProviderSuccess("freellmapi", result.model);
             clearGatewayCooldown();
             completedUsage(input, result);
@@ -1313,6 +1503,7 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
             announceQuota("freellmapi", primaryModel, failure.kind, cooldown.until);
             errors.push(`FreeLLMAPI attempt ${attempt}: ${failure.message}`);
             primaryError = error;
+            if (streamed) throw new ProvidersUnavailableError(`FreeLLMAPI stream interrupted after a partial response: ${failure.message}. No duplicate fallback was attempted.`);
 
             if (failure.kind === "authentication") {
               throw new AiProviderConfigError("freellmapi", failure.message);
@@ -1354,7 +1545,7 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
 
     const fallbackStarted = Date.now();
     try {
-      const result = await callOllama(input);
+      const result = await callOllama(attemptInput);
       recordProviderSuccess("ollama", result.model);
       completedUsage(input, result);
       if (errors.length > 0) announceFallback(primaryModel, result);

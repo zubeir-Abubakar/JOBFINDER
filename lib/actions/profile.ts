@@ -142,6 +142,19 @@ export async function deleteSkillAction(formData: FormData): Promise<void> {
 
 export async function saveSkillLevelsAction(formData: FormData): Promise<void> {
   const user = await requireUser();
+  // Delete is submitted through the same form using an explicit intent. A
+  // nested delete form is invalid HTML, and a named formAction button causes a
+  // React server/client attribute mismatch on this page.
+  const intent = String(formData.get("intent") ?? "");
+  if (intent.startsWith("delete:")) {
+    const id = Number(intent.slice("delete:".length));
+    if (Number.isFinite(id)) {
+      run("UPDATE skills SET deleted_at = ? WHERE id = ?", [nowIso(), id]);
+      audit({ action: "skill.deleted", entity: "skill", entityId: String(id), userId: user.id });
+    }
+    revalidatePath("/profile");
+    redirect("/profile?ok=Skill+removed+successfully");
+  }
   const ids = formData.getAll("skill_id");
   const levels = formData.getAll("level");
   let updated = 0;

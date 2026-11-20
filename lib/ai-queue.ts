@@ -1,5 +1,6 @@
-import { all, nowIso, one, run } from "./db";
+import { all, getDb, nowIso, one, run } from "./db";
 import { randomId } from "./security";
+import { heartbeatRuntimeWorker, startRuntimeWorker, stopRuntimeWorker } from "./runtime-state";
 import {
   AiRateLimitedError,
   ProvidersUnavailableError,
@@ -241,14 +242,25 @@ export function startAiQueue(): void {
   const current = state();
   if (!current.started) {
     current.started = true;
-    // A process restart must not strand work that was in-flight. The job is
-    // requeued, not failed, so no pending advisory work is discarded.
+    startRuntimeWorker("ai_queue", "Durable advisory inference queue");
+    // Recover only a genuinely stale processing claim. A live worker in another
+    // process keeps its lease; requeueing every processing row would duplicate
+    // advisory work across instances.
     run(
-      "UPDATE ai_jobs SET status = 'queued', available_at = ?, last_error = COALESCE(last_error, 'Interrupted by server restart; requeued.') WHERE status = 'processing'",
-      [nowIso()],
+      "UPDATE ai_jobs SET status = 'queued', available_at = ?, last_error = COALESCE(last_error, 'Interrupted by a stale worker lease; requeued.') WHERE status = 'processing' AND started_at < ?",
+      [nowIso(), new Date(Date.now() - 10 * 60_000).toISOString()],
     );
   }
+  heartbeatRuntimeWorker("ai_queue");
   schedulePump(0);
+}
+
+export function stopAiQueue(): void {
+  const current = state();
+  if (current.timer) clearTimeout(current.timer);
+  current.timer = undefined;
+  current.started = false;
+  stopRuntimeWorker("ai_queue", "Stopped with the application process");
 }
 
 async function pumpAiQueue(): Promise<void> {
@@ -257,6 +269,7 @@ async function pumpAiQueue(): Promise<void> {
   current.pumping = true;
   try {
     for (;;) {
+      heartbeatRuntimeWorker("ai_queue");
       const cooling = gatewayCooldownStatus();
       if (cooling.remainingMs > 0) {
         schedulePump(cooling.remainingMs + 100);
@@ -278,10 +291,10 @@ async function pumpAiQueue(): Promise<void> {
         return;
       }
 
-      run(
-        "UPDATE ai_jobs SET status = 'processing', started_at = COALESCE(started_at, ?), last_error = NULL WHERE id = ?",
-        [nowIso(), job.id],
-      );
+      const claimed = getDb()
+        .prepare("UPDATE ai_jobs SET status = 'processing', started_at = COALESCE(started_at, ?), last_error = NULL WHERE id = ? AND status IN ('queued','rate_limited')")
+        .run(nowIso(), job.id);
+      if (Number(claimed.changes) !== 1) continue;
       try {
         const result = await executeJob(job);
         run(
@@ -344,7 +357,6 @@ export type AiQueueSnapshot = {
 };
 
 export function aiQueueSnapshot(): AiQueueSnapshot {
-  startAiQueue();
   const counts: Record<AiJobStatus, number> = {
     queued: 0,
     processing: 0,

@@ -1,5 +1,6 @@
-import { redirect } from "next/navigation";
-import { hasAnyUser } from "@/lib/auth";
+import { headers } from "next/headers";
+import { notFound, redirect } from "next/navigation";
+import { setupPageState } from "@/lib/setup-security";
 import { Brand } from "@/components/icons";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { SetupForm } from "@/components/SetupForm";
@@ -7,7 +8,9 @@ import { SetupForm } from "@/components/SetupForm";
 export const dynamic = "force-dynamic";
 
 export default async function SetupPage() {
-  if (hasAnyUser()) redirect("/login");
+  const state = setupPageState(await headers());
+  if (state.closed) redirect("/login");
+  if (!state.allowed) notFound();
   return (
     <div className="auth-wrap">
       <aside className="auth-aside">
@@ -48,7 +51,7 @@ export default async function SetupPage() {
             </div>
             <ThemeToggle compact />
           </div>
-          <SetupForm />
+          <SetupForm tokenRequired={state.tokenRequired} />
         </div>
       </main>
     </div>

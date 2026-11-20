@@ -13,6 +13,9 @@ import { capabilitiesForAgent, permissionBrief, type AgentCapability } from "./a
 import { notificationQueueSnapshot } from "./notify";
 import { recoverySnapshot } from "./recruitment-recovery";
 import { nextProviderRetryAt, providerHealthSnapshot } from "./provider-health";
+import { deliveryStateMessage } from "./notify";
+import { latestExecutiveBriefDelivery } from "./executive-brief";
+import { operationalHealthSnapshot } from "./runtime-health";
 
 /**
  * Read-only operational intelligence.
@@ -108,7 +111,9 @@ export type OperationalSnapshot = {
   providerCooldowns: ReturnType<typeof providerHealthSnapshot>;
   nextProviderRetryAt: string | null;
   notifications: ReturnType<typeof notificationQueueSnapshot>;
+  executiveBrief: ReturnType<typeof latestExecutiveBriefDelivery>;
   recovery: ReturnType<typeof recoverySnapshot>;
+  runtime: ReturnType<typeof operationalHealthSnapshot>;
   emailTest: { status?: string; messageId?: string | null; delivery?: string | null; detail?: string; at?: string } | null;
   geminiLive: {
     configured: boolean;
@@ -374,8 +379,8 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
     return {
       key: row.key as AgentKey,
       name: agentIdentity(row.key).name,
-      role: row.role,
-      description: row.description,
+      role: agentIdentity(row.key).title,
+      description: agentIdentity(row.key).responsibilities,
       enabled: row.enabled === 1,
       status: currentStatus(row, availability),
       currentTask: row.current_task,
@@ -427,7 +432,9 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   );
   const providerCooldowns = providerHealthSnapshot();
   const notificationQueue = notificationQueueSnapshot();
+  const executiveBrief = latestExecutiveBriefDelivery();
   const recoveryQueue = recoverySnapshot();
+  const runtime = operationalHealthSnapshot();
   const emailTest = getSetting<OperationalSnapshot["emailTest"]>("email_test_last", null);
 
   const db = (() => {
@@ -577,7 +584,9 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
     providerCooldowns,
     nextProviderRetryAt: nextProviderRetryAt(),
     notifications: notificationQueue,
+    executiveBrief,
     recovery: recoveryQueue,
+    runtime,
     emailTest,
     geminiLive: {
       configured: liveConfigured,
@@ -674,7 +683,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
     },
     permissions: {
       summary: permissionBrief(),
-      byAgent: agents.map((agent) => ({ agentKey: agent.key, name: agent.name, capabilities: agent.capabilities })),
+      byAgent: agents.map((agent) => ({ agentKey: agent.key, name: agent.name, title: agent.role, capabilities: agent.capabilities })),
     },
     credentials: {
       freeLlmApiKeyConfigured: Boolean(process.env.FREELLMAPI_API_KEY?.trim()),
@@ -717,7 +726,9 @@ export function operationsBrief(snapshot: OperationalSnapshot): string {
     `Sources: ${sources}.`,
     `Health: ${snapshot.health.status}; ${snapshot.health.detail} Failed tasks today ${snapshot.health.failedTasksToday}. Notification provider: ${snapshot.health.notificationProvider.detail} Backup: ${snapshot.health.backup.status} — ${snapshot.health.backup.detail}`,
     `Latest recruitment run: ${snapshot.recruitment.lastRun ? `${snapshot.recruitment.lastRun.id} ${snapshot.recruitment.lastRun.status}, failures ${snapshot.recruitment.lastRun.failures}, warnings ${snapshot.recruitment.lastRun.warnings}, error ${snapshot.recruitment.lastRun.error ?? "none"}` : "none"}. Recovery pending ${snapshot.recovery.pending}; next retry ${snapshot.nextProviderRetryAt ?? snapshot.recovery.nextRetryAt ?? "none"}.`,
-    `Notification outbox: pending ${snapshot.notifications.counts.pending}, retry ${snapshot.notifications.counts.retry_scheduled}, sent ${snapshot.notifications.counts.sent}, failed ${snapshot.notifications.counts.failed}; last accepted ${snapshot.notifications.lastAccepted?.finished_at ?? "never"}; last error ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
+    `Runtime: database ${snapshot.runtime.database.integrity} v${snapshot.runtime.database.schemaVersion}; scheduler worker ${snapshot.runtime.scheduler.worker?.effectiveStatus ?? "missing"}; workers ${snapshot.runtime.workers.map((worker) => `${worker.name}=${worker.effectiveStatus}`).join(", ") || "none"}; running tasks ${snapshot.runtime.queues.runningTasks.length}; failed tasks today ${snapshot.runtime.agents.failedTasksToday}; notification failures ${snapshot.runtime.recruitment.notificationFailures}; submission failures ${snapshot.runtime.recruitment.submissionFailures}; unknown ${snapshot.runtime.recruitment.submissionUnknown}; last successful inference ${snapshot.runtime.providers.lastSuccessfulInferenceAt ?? "never"}.`,
+    `Notification outbox: pending ${snapshot.notifications.counts.pending}, retry ${snapshot.notifications.counts.retry_scheduled}, accepted-by-Gmail ${snapshot.notifications.counts.sent}, failed ${snapshot.notifications.counts.failed}; last accepted ${snapshot.notifications.lastAccepted?.finished_at ?? "never"}; last error ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
+    `Executive Brief delivery: state=${snapshot.executiveBrief.state}; report=${snapshot.executiveBrief.reportId}; outbox=${snapshot.executiveBrief.outboxId ?? "none"}; gmailMessage=${snapshot.executiveBrief.messageId ?? "none"}; sentFolderObserved=${snapshot.executiveBrief.sentObservedAt ?? "no"}; evidence=${snapshot.executiveBrief.deliveryEvidence ?? "none"}; error=${snapshot.executiveBrief.lastError ?? "none"}. ${deliveryStateMessage(snapshot.executiveBrief.state, snapshot.executiveBrief.lastError ?? snapshot.executiveBrief.detail)}`,
     `Permissions: ${snapshot.permissions.summary}`,
   ].join("\n");
 }
@@ -770,18 +781,20 @@ export function answerFromOperations(
     ].join("\n");
   }
 
-  if (/\b(gmail|email|notification|daily report)\b/.test(text) && /\b(sent|delivery|delivered|authenticated|auth|error|status|report|accepted)\b/.test(text)) {
-    const lastRunMail = snapshot.notifications.latest.find((row) => ["recruitment_run", "recruitment_run_failed", "recruitment_partial"].includes(row.kind));
+  if (/\b(gmail|email|notification|daily report|executive brief|delivery)\b/.test(text) && /\b(sent|delivery|delivered|authenticated|auth|error|status|report|accepted|bounce|queued|folder)\b/.test(text)) {
+    const brief = snapshot.executiveBrief;
     return [
+      deliveryStateMessage(brief.state, brief.lastError ?? brief.detail),
+      `Executive Brief: report ${brief.reportId}; outbox ${brief.outboxId ?? "not created"}; state ${brief.state}; Gmail message ${brief.messageId ?? "none"}; thread ${brief.threadId ?? "none"}; attempts ${brief.attempts}.`,
+      `Sent-folder verification: ${brief.sentObservedAt ? `observed at ${brief.sentObservedAt} — ${brief.sentVerification ?? "presence recorded"}` : brief.sentVerification ?? "not observed"}. Delivery evidence: ${brief.deliveryEvidence ?? "none"}.`,
+      `Last error: ${brief.lastError ?? "none"}. Next retry: ${brief.nextRetryAt ?? "none"}. Bounce evidence: ${brief.bounceInfo ?? "none"}.`,
       `Gmail: ${snapshot.health.notificationProvider.connected ? "connected" : "not connected"}; OAuth configuration ${snapshot.health.notificationProvider.configured ? "ready" : "incomplete"}. ${snapshot.health.notificationProvider.detail}`,
-      `Last test email: ${snapshot.emailTest ? `${snapshot.emailTest.status ?? "unknown"} at ${snapshot.emailTest.at ?? "unknown"}; message id ${snapshot.emailTest.messageId ?? "none"}; delivery ${snapshot.emailTest.delivery ?? "not applicable"}` : "none recorded"}.`,
-      `Daily run email: ${lastRunMail ? `${lastRunMail.status} (${lastRunMail.delivery ?? "no delivery state"}) at ${lastRunMail.finished_at ?? lastRunMail.created_at}; Gmail message id ${lastRunMail.provider_message_id ?? "none"}` : "no delivery record"}.`,
-      `Outbox: ${snapshot.notifications.counts.pending} pending, ${snapshot.notifications.counts.retry_scheduled} retry scheduled, ${snapshot.notifications.counts.sent} accepted by Gmail, ${snapshot.notifications.counts.failed} failed. Last delivery error: ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
+      `Outbox: ${snapshot.notifications.counts.pending} pending, ${snapshot.notifications.counts.retry_scheduled} retry scheduled, ${snapshot.notifications.counts.sent} accepted by Gmail, ${snapshot.notifications.counts.failed} failed.`,
     ].join("\n");
   }
 
   if (focusAgent && /\b(your|you|current status|working on|current task|assigned voice|provider|model|voice)\b/.test(text)) {
-    return `${focusAgent.name}: availability ${focusAgent.availability.available ? "online" : `unavailable (${focusAgent.availability.dependency}: ${focusAgent.availability.reason})`}; task ${focusAgent.status}${focusAgent.currentTask ? ` on “${focusAgent.currentTask}”` : " — no task assigned"}; last outcome ${focusAgent.lastTaskOutcome ?? "none"}${focusAgent.lastTaskTitle ? ` (${focusAgent.lastTaskTitle})` : ""}. Configured provider ${focusAgent.configuredProvider ?? "not configured"}${focusAgent.configuredModel ? ` / ${focusAgent.configuredModel}` : ""} (${focusAgent.configuredProviderStatus}). Actual provider ${focusAgent.provider ?? "not used yet"}${focusAgent.model ? ` / ${focusAgent.model}` : ""} (${focusAgent.providerStatus}). Assigned voice ${focusAgent.voice.voiceName}; tools: ${focusAgent.tools.join(", ") || "none"}. Tokens today ${focusAgent.tokenUsageToday.toLocaleString("en-GB")}; measurement ${focusAgent.usageSource === "provider" ? "provider-reported" : focusAgent.usageSource === "estimated" ? "estimated" : "unknown/not yet measured"}.`;
+    return `${focusAgent.name} — ${focusAgent.role}: availability ${focusAgent.availability.available ? "online" : `unavailable (${focusAgent.availability.dependency}: ${focusAgent.availability.reason})`}; task ${focusAgent.status}${focusAgent.currentTask ? ` on “${focusAgent.currentTask}”` : " — no task assigned"}; last outcome ${focusAgent.lastTaskOutcome ?? "none"}${focusAgent.lastTaskTitle ? ` (${focusAgent.lastTaskTitle})` : ""}. Configured provider ${focusAgent.configuredProvider ?? "not configured"}${focusAgent.configuredModel ? ` / ${focusAgent.configuredModel}` : ""} (${focusAgent.configuredProviderStatus}). Actual provider ${focusAgent.provider ?? "not used yet"}${focusAgent.model ? ` / ${focusAgent.model}` : ""} (${focusAgent.providerStatus}). Assigned voice ${focusAgent.voice.voiceName}; tools: ${focusAgent.tools.join(", ") || "none"}. Tokens today ${focusAgent.tokenUsageToday.toLocaleString("en-GB")}; measurement ${focusAgent.usageSource === "provider" ? "provider-reported" : focusAgent.usageSource === "estimated" ? "estimated" : "unknown/not yet measured"}.`;
   }
 
   if (
@@ -854,7 +867,7 @@ export function answerFromOperations(
   const recruitmentIntent = /\b(recruit|scheduler|next run|submission|applications?|vacanc\w*|verified|unverified|blocked|discovery|source)\b/.test(text);
   if (!recruitmentIntent && /\b(health|healthy|system status|database|scheduler|next run|operational|degraded)\b/.test(text)) {
     const s = snapshot.recruitment.scheduler;
-    return `System health is ${snapshot.health.status}. ${snapshot.health.detail} Database schema v${snapshot.database.schemaVersion}. Scheduler ${s.enabled ? "enabled" : "disabled"}; next run ${formatInZone(s.nextRunAt, s.timezone)}; last status ${s.lastStatus ?? "never"}. Notification provider: ${snapshot.health.notificationProvider.detail} Backup ${snapshot.health.backup.status}: ${snapshot.health.backup.detail} Gemini Live: ${snapshot.geminiLive.detail}`;
+    return `System health is ${snapshot.runtime.status}. ${snapshot.runtime.detail} Database schema v${snapshot.runtime.database.schemaVersion} (${snapshot.runtime.database.integrity}). Scheduler ${s.enabled ? "enabled" : "disabled"}; next run ${formatInZone(s.nextRunAt, s.timezone)}; last status ${s.lastStatus ?? "never"}; ticker ${snapshot.runtime.scheduler.tickerRunning ? "running" : "not running"}; persisted worker ${snapshot.runtime.scheduler.worker?.effectiveStatus ?? "missing"}. Workers: ${snapshot.runtime.workers.map((worker) => `${worker.name} ${worker.effectiveStatus}`).join(", ") || "none"}. Notification provider: ${snapshot.health.notificationProvider.detail} Backup ${snapshot.health.backup.status}: ${snapshot.health.backup.detail} Gemini Live: ${snapshot.geminiLive.detail}`;
   }
   if (/\b(permissions?|capabilit(?:y|ies)|tools?|allowed|prohibit|can .* access|can .* send|can .* modify|shell|credentials?)\b/.test(text)) {
     return snapshot.permissions.summary;

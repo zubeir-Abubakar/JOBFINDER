@@ -46,7 +46,7 @@ export async function saveAutomationAction(formData: FormData): Promise<void> {
   // The floor is enforced here as well as in the scoring engine: a stored value
   // below 85% would otherwise be displayed as if it were the active threshold.
   setSetting("min_match_score", effectiveMinMatchScore(formData.get("min_match_score")));
-  setSetting("max_applications_per_day", Math.min(10, Math.max(1, Number(formData.get("max_applications_per_day") ?? 3))));
+  setSetting("max_applications_per_day", Math.min(10, Math.max(1, Number(formData.get("max_applications_per_day") ?? 5))));
   setSetting("search_frequency", String(formData.get("search_frequency") ?? "daily"));
   setSetting("duplicate_detection", formData.get("duplicate_detection") === "on");
   audit({ action: "settings.automation", entity: "settings", detail: `Approval mode: ${formData.get("approval_mode") === "on"}`, userId: user.id });

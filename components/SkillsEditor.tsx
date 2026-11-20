@@ -2,7 +2,7 @@
 
 import { skillLevelLabel, type SkillLevel } from "@/lib/profile-options";
 import type { Skill } from "@/lib/profile";
-import { addSkillAction, deleteSkillAction, saveSkillLevelsAction } from "@/lib/actions/profile";
+import { addSkillAction, saveSkillLevelsAction } from "@/lib/actions/profile";
 import { SubmitButton } from "./SubmitButton";
 import { Icon } from "./icons";
 
@@ -39,9 +39,8 @@ export function SkillsEditor({ skills }: { skills: Skill[] }) {
                 </select>
                 <SubmitButton
                   className="btn btn-sm btn-danger skill-remove"
-                  formAction={deleteSkillAction}
-                  name="id"
-                  value={skill.id}
+                  name="intent"
+                  value={`delete:${skill.id}`}
                   confirm={`Remove ${skill.name} from your skills?`}
                 >
                   ×

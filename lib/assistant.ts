@@ -3,10 +3,14 @@ import { getProfileData } from "./profile";
 import { analysePendingJobs, analyseSingleJob, generateApplicationPackage, pauseAllAgents, runDiscovery, setAgentPaused } from "./agents";
 import { cleanupExpiredDocuments } from "./retention";
 import { statusLabel } from "./application-status";
-import { agentIdentity } from "./agent-identity";
+import { agentIdentity, agentIdentityForName, agentKeysMentioned, agentRoster } from "./agent-identity";
 import { generateText } from "./providers";
 import { runGmailTestEmail } from "./gmail";
 import { answerFromOperations, getOperationalSnapshot, operationsBrief } from "./operations";
+import { latestWorkflowSnapshotForUser } from "./workflow-view";
+import { latestPausedWorkflow, workflowActor } from "./workflow";
+import { latestExecutiveBriefDelivery, refreshLatestExecutiveBriefDelivery, sendExecutiveBriefNow } from "./executive-brief";
+import { isProfileQuestion, profileBrief } from "./profile-brief";
 
 export type AssistantPendingAction = "cleanup_expired";
 export type AssistantResult = { reply: string; taskIds: string[]; agentKeys?: string[]; pendingAction?: AssistantPendingAction };
@@ -22,30 +26,28 @@ const HELP = `I can talk through your workspace and act on it. Try:
 • "Generate a tailored CV for <company or job title>"
 • "Review application packages"
 • "Show recruiter messages"
-• "Transfer me to the research agent" / "Take me back to the coordinator"
+• "Connect me to ${agentIdentity("research").name}" / "Return to ${agentIdentity("coordinator").name}"
 • "How many tokens did we use today?" / "Is the system healthy?"
-• "Pause the research agent" / "Resume all agents"
+• "Pause ${agentIdentity("research").name}" / "Resume all agents"
 • "Prioritise Lausanne and Geneva"
-• "Daily report"`;
-
-const AGENT_ALIASES: Array<[string, RegExp]> = [
-  ["coordinator", /\b(coordinator|chief)\b/],
-  ["research", /\b(research|discovery|job search)\b/],
-  ["analysis", /\b(analysis|analyst|scoring)\b/],
-  ["cv", /\b(cv|resume)\b/],
-  ["ats", /\b(ats|quality control|quality assurance)\b/],
-  ["cover", /\b(cover letter|cover)\b/],
-  ["application", /\b(application agent|applications agent)\b/],
-  ["email", /\b(email|tracking|inbox)\b/],
-];
+• "Daily report"
+• "Send me today's Executive Brief now"
+• "Has my Executive Brief been delivered?"`;
 
 function normalise(text: string): string {
   return text.toLowerCase().trim();
 }
 
 function resolveAgent(text: string): string | null {
-  for (const [key, pattern] of AGENT_ALIASES) if (pattern.test(text)) return key;
-  return null;
+  const exact = agentIdentityForName(text);
+  if (exact) return exact.key;
+  const mentions = agentKeysMentioned(text);
+  return mentions.length === 1 ? mentions[0] : null;
+}
+
+function identityMentioned(text: string) {
+  const ordered = [...agentRoster()].sort((a, b) => b.name.length - a.name.length);
+  return ordered.find((identity) => new RegExp(`\\b${identity.name}\\b`, "i").test(text)) ?? null;
 }
 
 function recentContext(userId: string, current: string): string {
@@ -80,20 +82,14 @@ function ownerName(userId: string): string {
 
 function agentSnapshot() {
   return all<{ key: string; name: string; status: string; enabled: number; current_task: string | null; last_run_at: string | null }>(
-    "SELECT key, name, status, enabled, current_task, last_run_at FROM agents ORDER BY sort",
-  );
+    "SELECT key, status, enabled, current_task, last_run_at FROM agents ORDER BY sort",
+  ).map((agent) => ({ ...agent, name: agentIdentity(agent.key).name }));
 }
 
-function latestWorkflow() {
-  const workflow = one<{ id: string; label: string; status: string; summary: string | null; error: string | null; created_at: string; finished_at: string | null }>(
-    "SELECT id, label, status, summary, error, created_at, finished_at FROM workflows ORDER BY created_at DESC LIMIT 1",
-  );
-  if (!workflow) return null;
-  const tasks = all<{ agent_key: string; title: string; status: string; output: string | null; error: string | null }>(
-    "SELECT agent_key, title, status, output, error FROM tasks WHERE workflow_id = ? ORDER BY created_at LIMIT 20",
-    [workflow.id],
-  );
-  return { workflow, tasks };
+function latestWorkflow(userId: string) {
+  const snapshot = latestWorkflowSnapshotForUser(workflowActor(userId));
+  if (!snapshot.workflow) return null;
+  return { workflow: snapshot.workflow, tasks: snapshot.tasks.slice(0, 20) };
 }
 
 function todaySnapshot() {
@@ -119,9 +115,9 @@ function todaySnapshot() {
   return { jobs, apps, tasks, messages };
 }
 
-function workspaceFacts(): string {
+function workspaceFacts(userId: string): string {
   const agents = agentSnapshot();
-  const workflow = latestWorkflow();
+  const workflow = latestWorkflow(userId);
   const today = todaySnapshot();
   return [
     `Agents: ${agents.map((a) => `${a.name}=${a.enabled ? a.status : "disabled"}`).join("; ")}.`,
@@ -139,7 +135,7 @@ function localGreeting(userId: string): string {
   return `Good ${part}, ${ownerName(userId).split(" ")[0]}. ${working.length ? `${working.length} agent(s) are currently active.` : "No agent is executing right now."} I can answer questions about the workspace or run a supported recruitment action. What would you like to do?`;
 }
 
-async function conversationalReply(userId: string, message: string, snapshot?: Awaited<ReturnType<typeof getOperationalSnapshot>>, sessionId?: string | null): Promise<string> {
+async function conversationalReply(userId: string, message: string, snapshot?: Awaited<ReturnType<typeof getOperationalSnapshot>>, sessionId?: string | null, onDelta?: (delta: string) => void): Promise<string> {
   const context = recentContext(userId, message);
   const live = snapshot ?? await getOperationalSnapshot();
   try {
@@ -151,16 +147,19 @@ async function conversationalReply(userId: string, message: string, snapshot?: A
       priority: 0,
       maxWaitMs: 8000,
       sessionId: sessionId ?? null,
+      onDelta,
       system:
-        "You are the Chief Coordinator of a recruitment workspace. You may converse naturally, but every factual statement must be copied from the supplied workspace facts and operational snapshot; do not infer or add state changes, completed setup, enabled agents or next steps that are not literally present. Never invent vacancies, employers, applications, messages, scores, token totals or outcomes. Never claim an action was executed. Never say you cannot disclose your own application's agents, models, provider status, token usage, permissions or health: answer from the snapshot, while never exposing credential values. If a measurement is unavailable, say exactly what is unavailable. If the owner requests an operation, describe it as an available command and wait. Be warm, concise and practical. Use 2 short paragraphs at most.",
-      prompt: `Owner message: ${message}\n\nWorkspace facts:\n${workspaceFacts()}\n\nOperational snapshot:\n${operationsBrief(live)}\n\nRecent conversation:\n${context}`,
+        `You are ${agentIdentity("coordinator").name}, the ${agentIdentity("coordinator").title} of a recruitment workspace. Use the agents' names in normal conversation, not internal keys: ${agentRoster().map((agent) => agent.name).join(", ")}. ` +
+        "You may converse naturally, but every factual statement must be copied from the supplied workspace facts and operational snapshot; do not infer or add state changes, completed setup, enabled agents or next steps that are not literally present. Never invent vacancies, employers, applications, messages, scores, token totals or outcomes. Never claim an action was executed. Email delivery state must be copied from the supplied Executive Brief delivery fact: Gmail API acceptance is not inbox delivery, and an outbox row marked sent is not proof of delivery. Never say email sent, report delivered or check your inbox unless the persisted state is delivery_confirmed. Never say you cannot disclose your own application's agents, models, provider status, token usage, permissions or health: answer from the snapshot, while never exposing credential values. If a measurement is unavailable, say exactly what is unavailable. If the owner requests an operation, describe it as an available command and wait. If the owner greets you or asks how you are, answer briefly and naturally first; do not turn a greeting into a recruitment report. Do not introduce yourself again after the first turn, and never prefix a reply with your own name. Be warm, concise and practical. Use 2 short paragraphs at most.",
+      prompt: `Owner message: ${message}\n\nWorkspace facts:\n${workspaceFacts(userId)}\n\nOperational snapshot:\n${operationsBrief(live)}\n\nRecent conversation:\n${context}`,
       maxTokens: 700,
       temperature: 0.4,
     });
     return result.text.trim();
-  } catch {
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message : "the configured text provider is unavailable";
     if (/^(hi|hello|hey|good morning|good afternoon|good evening)\b/.test(normalise(message))) return localGreeting(userId);
-    return `I can answer from the live operational snapshot even while the AI provider is unavailable. ${operationsBrief(live)}\n\nTell me what you would like to review, or use “help” for commands.`;
+    return `I couldn't complete that answer because ${reason.slice(0, 260)}. Your conversation is preserved — try again in a moment.`;
   }
 }
 
@@ -171,7 +170,7 @@ function taskAgentKeys(): string[] {
 export async function handleAssistantMessage(
   userId: string,
   message: string,
-  options: { sessionId?: string | null } = {},
+  options: { sessionId?: string | null; onDelta?: (delta: string) => void } = {},
 ): Promise<AssistantResult> {
   const text = normalise(message);
   const taskIds: string[] = [];
@@ -197,6 +196,52 @@ export async function handleAssistantMessage(
     return { reply: "Cancelled. Nothing was deleted or changed.", taskIds };
   }
 
+  // Profile and CV questions are answered from the stored account records and
+  // the extracted original CV, without sending personal data to a text model.
+  if (isProfileQuestion(message)) {
+    return { reply: profileBrief(), taskIds, agentKeys: ["coordinator"] };
+  }
+
+  const briefRequest = /\b(executive|daily)\s+(brief|report)\b/.test(text) || /\bexecutive brief\b/.test(text);
+  const emailDeliveryQuestion =
+    /\b(email|brief|report)\b/.test(text) &&
+    /\b(sent|delivered|delivery|accepted|bounce|bounced|inbox|queued|generated)\b/.test(text) &&
+    /\b(has|was|is|did|status|check|where|when|verify)\b/.test(text) &&
+    !/\btest email\b/.test(text);
+
+  if (briefRequest && /\b(send|email|deliver|resend|send again|retry|now)\b/.test(text)) {
+    const result = await sendExecutiveBriefNow({
+      userId,
+      source: "coordinator",
+      resend: /\b(resend|send again|try again|retry)\b/.test(text),
+    });
+    const details = [
+      result.message,
+      `Report ID: ${result.reportId}. Outbox ID: ${result.outboxId ?? "not created"}.`,
+      `Delivery state: ${result.state}.`,
+    ];
+    if (result.messageId) details.push(`Gmail message ID: ${result.messageId}.`);
+    if (result.lastError) details.push(`Recorded error: ${result.lastError}`);
+    if (result.canResend) details.push("A deliberate resend is available after correcting the cause.");
+    return { reply: details.join("\n"), taskIds, agentKeys: ["email", "coordinator"] };
+  }
+
+  if (briefRequest || emailDeliveryQuestion) {
+    const latest = briefRequest || /\b(verify|sent folder|inbox)\b/.test(text)
+      ? await refreshLatestExecutiveBriefDelivery()
+      : latestExecutiveBriefDelivery();
+    const details = [
+      latest.message,
+      `Report ID: ${latest.reportId}. Outbox ID: ${latest.outboxId ?? "not created"}. State: ${latest.state}.`,
+    ];
+    if (latest.messageId) details.push(`Gmail message ID: ${latest.messageId}${latest.threadId ? `; thread ${latest.threadId}` : ""}.`);
+    if (latest.sentVerification) details.push(`Sent-folder check: ${latest.sentVerification}`);
+    if (latest.lastError) details.push(`Last error: ${latest.lastError}`);
+    if (latest.nextRetryAt) details.push(`Next retry: ${latest.nextRetryAt}.`);
+    if (latest.canResend) details.push("The previous attempt definitively failed, was blocked, or bounced. Ask me to resend after correcting the cause; I will not resend automatically.");
+    return { reply: details.join("\n"), taskIds, agentKeys: ["email", "coordinator"] };
+  }
+
   if (/\b(send|trigger|run)\b.*\b(test|verification)\b.*\b(email|gmail)\b|\b(test email|verify gmail|gmail test)\b/.test(text)) {
     const to = (one<{ email: string | null }>("SELECT email FROM profiles WHERE id = 1")?.email ?? "").trim();
     if (!to) {
@@ -213,19 +258,58 @@ export async function handleAssistantMessage(
     };
   }
 
-  if (/^(hi|hello|hey|good morning|good afternoon|good evening)\b/.test(text)) {
-    return { reply: localGreeting(userId), taskIds, agentKeys: ["coordinator"] };
+  const mentioned = identityMentioned(message);
+  if (mentioned) {
+    if (/\b(what|which|who)\b.*\b(submission|submit)\b/.test(text) && /\b(responsible|handles?|does)\b/.test(text)) {
+      const noor = agentIdentity("application");
+      return {
+        reply: `${noor.name} handles application submission and confirmation verification. ${noor.title}.`,
+        taskIds,
+        agentKeys: ["application"],
+      };
+    }
+    if (/\b(what|who)\b.*\b(is|does|do)\b.*\b(do|responsible|role)\b/.test(text) || /\bwhat does\b/.test(text)) {
+      return {
+        reply: `${mentioned.name} is your ${mentioned.title}. ${mentioned.responsibilities}`,
+        taskIds,
+        agentKeys: [mentioned.key],
+      };
+    }
+    if (/\b(what|which)\b.*\b(has|have|did)\b.*\b(done|do|worked|completed)\b/.test(text) || /\bwhat has\b/.test(text)) {
+      const today = new Date().toISOString().slice(0, 10);
+      const done = all<{ title: string; status: string; output: string | null; error: string | null; finished_at: string | null }>(
+        "SELECT title, status, output, error, finished_at FROM tasks WHERE agent_key = ? AND date(COALESCE(finished_at, created_at)) = ? ORDER BY created_at DESC LIMIT 12",
+        [mentioned.key, today],
+      );
+      if (done.length === 0) {
+        return {
+          reply: `${mentioned.name} has no task recorded today. I will not invent work for ${mentioned.name}.`,
+          taskIds,
+          agentKeys: [mentioned.key],
+        };
+      }
+      const completed = done.filter((task) => task.status === "completed");
+      const failed = done.filter((task) => task.status === "failed");
+      return {
+        reply: `${mentioned.name} has ${done.length} task(s) recorded today: ${completed.length} completed, ${failed.length} failed.\n${done
+          .slice(0, 8)
+          .map((task) => `• ${task.title} — ${task.status}${task.error ? `: ${task.error}` : ""}`)
+          .join("\n")}`,
+        taskIds,
+        agentKeys: [mentioned.key],
+      };
+    }
+    if (/\b(who is|tell me about|introduce)\b/.test(text)) {
+      return { reply: mentioned.introduction, taskIds, agentKeys: [mentioned.key] };
+    }
   }
 
-  if (/^(how are you|how are things|how's it going|what are you doing)\b/.test(text)) {
-    const latest = latestWorkflow();
-    const status = latest
-      ? `The latest workflow is “${latest.workflow.label}” and is ${latest.workflow.status}. ${latest.workflow.summary ?? latest.workflow.error ?? ""}`
-      : "No workflow has run yet.";
-    return { reply: `I’m ready and focused on your recruitment workspace. ${status}`.trim(), taskIds, agentKeys: ["coordinator"] };
+  if (/\b(which|who)\b.*\b(ai|agent)\b.*\b(submission|submit)\b/.test(text)) {
+    const noor = agentIdentity("application");
+    return { reply: `${noor.name} handles application submission and confirmation verification.`, taskIds, agentKeys: ["application"] };
   }
 
-  if (/\b(which|who)\b.*\b(agents?|workforce)\b.*\b(working|active|busy)\b/.test(text) || /\bwhat are you doing\b/.test(text)) {
+  if (/\b(which|who)\b.*\b(agents?|workforce)\b.*\b(working|active|busy)\b/.test(text)) {
     const agents = agentSnapshot();
     const active = agents.filter((a) => a.status === "working" || a.status === "thinking");
     const paused = agents.filter((a) => a.status === "paused");
@@ -240,7 +324,7 @@ export async function handleAssistantMessage(
   }
 
   if (/\b(explain|summar|what happened|status of)\b.*\b(latest|last|recent)?\b.*\bworkflow\b/.test(text) || /\blatest workflow\b/.test(text)) {
-    const latest = latestWorkflow();
+    const latest = latestWorkflow(userId);
     if (!latest) return { reply: "No workflow has run yet. Start a job search from the dashboard when you are ready.", taskIds };
     return {
       reply: `${latest.workflow.label} — ${latest.workflow.status}.\n${latest.workflow.summary ?? latest.workflow.error ?? "No summary was recorded."}\n\nSteps:\n${latest.tasks.map((task, i) => `${i + 1}. ${agentIdentity(task.agent_key).shortName}: ${task.title} — ${task.status}${task.error ? ` (${task.error})` : ""}`).join("\n") || "No task records."}`,
@@ -263,7 +347,7 @@ export async function handleAssistantMessage(
     const failed = one<{ agent_key: string; title: string; error: string | null }>(
       "SELECT agent_key, title, error FROM tasks WHERE status = 'failed' ORDER BY created_at DESC LIMIT 1",
     );
-    const pausedWorkflow = one<{ label: string }>("SELECT label FROM workflows WHERE status = 'paused' ORDER BY created_at DESC LIMIT 1");
+    const pausedWorkflow = latestPausedWorkflow(workflowActor(userId));
     const newJobs = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NULL")?.c ?? 0;
     const totalJobs = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs")?.c ?? 0;
     const next = paused.length
@@ -501,7 +585,7 @@ export async function handleAssistantMessage(
     };
   }
 
-  if (/\bdaily report|weekly report|report\b/.test(text)) {
+  if (/\b(?:daily|weekly)\s+report\b/.test(text) || text === "report") {
     const since = new Date(Date.now() - 86400_000).toISOString();
     const discovered = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE discovered_at >= ?", [since])?.c ?? 0;
     const strong = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_flag = 'strong'")?.c ?? 0;
@@ -530,7 +614,11 @@ export async function handleAssistantMessage(
     };
   }
 
-  if (/\b(find|search|discover|look for)\b/.test(text)) {
+  const discoveryAction =
+    /^(?:please\s+)?(?:find|search|discover|look for)\b/.test(text) ||
+    /\b(?:can|could|would|please)\s+you\s+(?:find|search|discover|look for)\b/.test(text) ||
+    /\b(?:run|start|trigger)\s+(?:a\s+)?(?:job\s+)?search\b/.test(text);
+  if (discoveryAction) {
     const requested = Number(text.match(/(\d{1,3})\s*(?:jobs|vacanc)/)?.[1] ?? 20);
     const pages = Math.min(5, Math.max(1, Math.ceil(requested / 40)));
     const outcome = await runDiscovery(userId, pages);
@@ -550,5 +638,5 @@ export async function handleAssistantMessage(
   const snapshot = await getOperationalSnapshot();
   const operational = answerFromOperations(message, snapshot);
   if (operational) return { reply: operational, taskIds, agentKeys: ["coordinator"] };
-  return { reply: await conversationalReply(userId, message, snapshot, options.sessionId), taskIds, agentKeys: ["coordinator"] };
+  return { reply: await conversationalReply(userId, message, snapshot, options.sessionId, options.onDelta), taskIds, agentKeys: ["coordinator"] };
 }

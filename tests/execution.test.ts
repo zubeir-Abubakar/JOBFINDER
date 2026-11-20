@@ -61,6 +61,10 @@ test("submission stays blocked without approval or an employer reference", () =>
     submissionBlockedReason({ found: true, approvalMode: false, approvedAt: null, confirmation: "REF", status: "submitted" }) ?? "",
     /already recorded/,
   );
+  assert.match(
+    submissionBlockedReason({ found: true, approvalMode: false, approvedAt: null, confirmation: "REF", status: "acknowledged" }) ?? "",
+    /already recorded/,
+  );
   assert.equal(
     submissionBlockedReason({ found: true, approvalMode: true, approvedAt: "2026-11-17T16:00:00.000Z", confirmation: "REF", status: "awaiting_approval" }),
     null,

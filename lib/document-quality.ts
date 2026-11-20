@@ -1,7 +1,18 @@
 import type { CoverLetterContent, TailoredCv } from "./document-ai";
 import type { MasterCv } from "./master-cv";
+import type { JobAnalysis } from "./scoring";
+import {
+  claimsNoSponsorship,
+  claimsRequiresSponsorship,
+  hasGenericCoverLanguage,
+  hasKeywordStuffing,
+  hasSwissPermitB,
+  mentionsSalaryExpectation,
+  unsupportedTechClaims,
+  workAuthorisationRequired,
+} from "./claim-validation";
 
-export type QualitySeverity = "error" | "warning";
+export type QualitySeverity = "error" | "warning" | "info";
 
 export type QualityIssue = {
   severity: QualitySeverity;
@@ -63,7 +74,7 @@ function issue(severity: QualitySeverity, code: string, message: string): Qualit
 
 function finalise(checks: QualityCheck[], issues: QualityIssue[], metrics: DocumentQuality["metrics"]): DocumentQuality {
   const errors = issues.filter((item) => item.severity === "error").length;
-  const warnings = issues.length - errors;
+  const warnings = issues.filter((item) => item.severity === "warning").length;
   const score = Math.max(0, Math.min(100, 100 - errors * 20 - warnings * 5));
   const status: DocumentQuality["status"] = errors > 0 || score < 70 ? "failed" : warnings > 0 || score < 90 ? "warning" : "passed";
   return { status, score, checks, issues, metrics, checkedAt: new Date().toISOString() };
@@ -118,6 +129,25 @@ export function validateCvQuality(
   const keyMismatch = output.roles.filter((role) => !master.roles.some((item) => item.key === role.key));
   checks.push(check("No invented employment entries", keyMismatch.length === 0, keyMismatch.length ? `${keyMismatch.length} unrecognised roles` : "Every output role maps to the master CV"));
   if (keyMismatch.length > 0) issues.push(issue("error", "invented_roles", `Unrecognised roles: ${keyMismatch.map((role) => role.title).join("; ")}`));
+
+  const namePresent = Boolean(master.name.trim()) && text.includes(normalise(master.name));
+  checks.push(check("Candidate identity preserved", namePresent, namePresent ? "The master CV name is extractable" : "The master CV name is missing"));
+  if (!namePresent) issues.push(issue("error", "missing_name", "The generated CV does not carry the candidate name from the master CV."));
+
+  const missingDates = master.roles.filter((role) => {
+    const years = role.dates.match(/\b(?:19|20)\d{2}\b/g) ?? [];
+    return years.some((year) => !text.includes(year));
+  });
+  checks.push(check("Employment dates preserved", missingDates.length === 0, missingDates.length ? `Missing dates: ${missingDates.map((role) => role.title).join("; ")}` : "Every master-CV employment year is extractable"));
+  if (missingDates.length > 0) issues.push(issue("error", "missing_dates", `Employment dates were lost for: ${missingDates.map((role) => role.title).join("; ")}`));
+
+  const unsupportedTech = unsupportedTechClaims(
+    extractedText,
+    master.sourceText,
+    master.skillGroups.flatMap((group) => group.values),
+  );
+  checks.push(check("No unsupported technology claims", unsupportedTech.length === 0, unsupportedTech.length ? `Unsupported: ${unsupportedTech.join(", ")}` : "Every technology maps to the master CV"));
+  if (unsupportedTech.length > 0) issues.push(issue("error", "unsupported_technology", `The generated CV mentions technologies absent from the master CV: ${unsupportedTech.join(", ")}.`));
 
   checks.push(check("Bullet-level history preserved", outputBullets >= originalBullets, `${outputBullets}/${originalBullets} bullets retained`));
   if (outputBullets < originalBullets) issues.push(issue("error", "lost_bullets", `${originalBullets - outputBullets} original achievement bullets are missing.`));
@@ -176,10 +206,10 @@ export function validateCvQuality(
   if (educationMissing.length > 0) issues.push(issue("error", "missing_education", `Missing education: ${educationMissing.map((item) => item.title).join("; ")}`));
 
   if (output.warnings.length > 0) {
-    for (const warning of output.warnings) issues.push(issue("warning", "ai_fallback", warning));
+    for (const warning of output.warnings) issues.push(issue("info", "ai_provenance", warning));
   }
   if (!output.tailoredWithAi) {
-    issues.push(issue("warning", "deterministic_tailoring", "AI revision was unavailable or rejected; the complete master CV was used with deterministic prioritisation."));
+    issues.push(issue("info", "deterministic_tailoring", "AI revision was unavailable or rejected; the complete master CV was used with deterministic prioritisation. Provenance is recorded, but it does not lower factual document quality."));
   }
 
   return finalise(checks, issues, {
@@ -197,7 +227,7 @@ export function validateCoverQuality(
   output: CoverLetterContent,
   extractedText: string,
   pages: number,
-  job: { title: string; company: string },
+  job: { title: string; company: string; description?: string; analysis?: JobAnalysis | null },
 ): DocumentQuality {
   const text = normalise(extractedText);
   const letter = output.paragraphs.join(" ");
@@ -210,7 +240,9 @@ export function validateCoverQuality(
     .split(/[^a-z0-9+#.]+/)
     .filter((token) => token.length > 2 && !/^(the|and|for|with|senior|junior|m|f|d|w)$/.test(token));
   const roleHits = roleTokens.filter((token) => text.includes(token)).length;
-  const hasRole = text.includes(normalise(job.company)) && (text.includes(normalise(job.title)) || (roleTokens.length > 0 && roleHits / roleTokens.length >= 0.6));
+  const hasRole =
+    text.includes(normalise(job.company)) &&
+    (text.includes(normalise(job.title)) || (roleTokens.length > 0 && roleHits / roleTokens.length >= 0.6));
   const hasDate = /\b(?:19|20)\d{2}\b/.test(extractedText);
   checks.push(check("Header and target role present", hasName && hasRole, hasName ? "Candidate header and target role are extractable" : "Candidate header is missing"));
   if (!hasName) issues.push(issue("error", "missing_header", "The cover letter header is missing the candidate name."));
@@ -218,15 +250,36 @@ export function validateCoverQuality(
   checks.push(check("Dated letter", hasDate, hasDate ? "A four-digit year is present" : "No letter date is extractable"));
   if (!hasDate) issues.push(issue("warning", "missing_date", "The cover letter has no extractable date."));
 
-  checks.push(check("Letter length", outputWords >= 150 && outputWords <= 380, `${outputWords} words`));
-  if (outputWords < 150) issues.push(issue("error", "too_short", "The cover letter is too short to present evidence."));
-  if (outputWords > 380) issues.push(issue("error", "too_long", "The cover letter is too long for a concise application."));
+  checks.push(check("Letter length", outputWords >= 180 && outputWords <= 320, `${outputWords} words; target 180–320`));
+  if (outputWords < 180) issues.push(issue("error", "too_short", `The cover letter is too short (${outputWords} words); the evidence-led target is 180–320.`));
+  if (outputWords > 320) issues.push(issue("error", "too_long", `The cover letter is too long (${outputWords} words); keep it within 180–320.`));
 
-  const generic = /^(i am writing to (?:apply|express)|i am excited to apply|as a (?:seasoned|passionate|results-driven) professional)/i.test(
-    output.paragraphs[0] ?? "",
+  const genericOpening = hasGenericCoverLanguage(output.paragraphs[0] ?? "");
+  checks.push(check("No generic opening", !genericOpening, genericOpening ? "Generic opening detected" : "Opens with a role-specific argument"));
+  if (genericOpening) issues.push(issue("error", "generic_opening", "The opening uses generic application language."));
+
+  const genericFiller = output.paragraphs.slice(1).some((paragraph) => hasGenericCoverLanguage(paragraph));
+  checks.push(check("No generic AI phrasing", !genericFiller, genericFiller ? "Generic filler was detected in the body" : "Body paragraphs use vacancy-specific evidence"));
+  if (genericFiller) issues.push(issue("warning", "generic_phrasing", "The body contains generic or repetitive AI-style phrasing."));
+
+  const stuffed = hasKeywordStuffing(letter, 6);
+  checks.push(check("No keyword stuffing", !stuffed, stuffed ? "A long comma-separated keyword run was detected" : "Skills are integrated into sentences"));
+  if (stuffed) issues.push(issue("error", "keyword_stuffing", "The cover letter contains a keyword list rather than integrated evidence."));
+
+  const requirementTerms = [...new Set((job.analysis?.matched ?? []).map((item) => normalise(item)).filter(Boolean))].slice(0, 6);
+  const requirementHits = requirementTerms.filter((term) => text.includes(term)).length;
+  const requiredHits = Math.min(2, requirementTerms.length);
+  const requirementsAddressed = requirementTerms.length === 0 || requirementHits >= requiredHits;
+  checks.push(
+    check(
+      "Addresses vacancy requirements",
+      requirementsAddressed,
+      requirementTerms.length
+        ? `${requirementHits}/${requirementTerms.length} analysed requirements are referenced${requiredHits ? `; at least ${requiredHits} required` : ""}`
+        : "No analysed requirement terms were supplied",
+    ),
   );
-  checks.push(check("No generic opening", !generic, generic ? "Generic opening detected" : "Opens with a role-specific argument"));
-  if (generic) issues.push(issue("error", "generic_opening", "The opening is generic."));
+  if (!requirementsAddressed) issues.push(issue("warning", "requirements_not_addressed", "The letter does not address enough of the vacancy's analysed requirements."));
 
   const sourceMetrics = new Set(metricTokens(master.sourceText));
   const titleMetrics = new Set(metricTokens(`${job.title} ${job.company}`));
@@ -235,6 +288,41 @@ export function validateCoverQuality(
   checks.push(check("Achievements are verified", outputMetrics.length > 0 && inventedMetrics.length === 0, outputMetrics.length ? `${outputMetrics.length} verified metric(s): ${outputMetrics.join(", ")}` : "No measurable achievement cited"));
   if (outputMetrics.length === 0) issues.push(issue("error", "no_evidence", "No measurable, verified achievement is cited."));
   if (inventedMetrics.length > 0) issues.push(issue("error", "invented_metrics", `Unsupported metrics: ${inventedMetrics.join(", ")}`));
+
+  const unsupportedTech = unsupportedTechClaims(
+    letter,
+    master.sourceText,
+    master.skillGroups.flatMap((group) => group.values),
+  );
+  checks.push(check("No unsupported technology claims", unsupportedTech.length === 0, unsupportedTech.length ? `Unsupported: ${unsupportedTech.join(", ")}` : "Every technology maps to the master CV"));
+  if (unsupportedTech.length > 0) issues.push(issue("error", "unsupported_technology", `The cover letter mentions technologies absent from the master CV: ${unsupportedTech.join(", ")}.`));
+
+  const permitB = hasSwissPermitB(master.permit);
+  const authorisationRequired = workAuthorisationRequired(job.description ?? "");
+  const sponsorshipClaim = claimsRequiresSponsorship(letter);
+  const noSponsorshipClaim = claimsNoSponsorship(letter);
+  const authorisationMentioned = /\b(?:permit\s*b|work\s+authoris|work\s+authoriz|right\s+to\s+work|sponsorship)\b/i.test(letter);
+  const authorisationOk = !sponsorshipClaim && (!authorisationRequired || !permitB || authorisationMentioned);
+  checks.push(
+    check(
+      "Work authorisation is accurate",
+      authorisationOk,
+      sponsorshipClaim && permitB
+        ? "A sponsorship requirement conflicts with the verified Permit B"
+        : authorisationRequired && permitB && !authorisationMentioned
+          ? "The vacancy asks about work authorisation; the verified Permit B is not stated"
+          : noSponsorshipClaim
+            ? "The letter states that no employer sponsorship is required"
+            : "No inaccurate authorisation claim was found",
+    ),
+  );
+  if (sponsorshipClaim && permitB) issues.push(issue("error", "authorisation_conflict", "The letter says employer sponsorship is required, but the verified profile holds a Swiss Permit B with work authorisation."));
+  if (authorisationRequired && permitB && !authorisationMentioned) issues.push(issue("warning", "authorisation_omitted", "The vacancy asks about work authorisation; state the verified Swiss Permit B and that no employer sponsorship is required."));
+  if (authorisationRequired && !permitB) issues.push(issue("warning", "authorisation_unverified", "The vacancy asks about work authorisation, but no verified permit is recorded in the profile."));
+
+  const salaryMentioned = mentionsSalaryExpectation(letter);
+  checks.push(check("No unauthorised salary statement", !salaryMentioned, salaryMentioned ? "Salary or compensation is mentioned" : "No salary expectation is stated"));
+  if (salaryMentioned) issues.push(issue("error", "salary_mentioned", "The cover letter mentions salary or compensation without explicit authorisation."));
 
   const contactMissing = master.contact.filter((value) => {
     if (!value.includes("@")) return false;
@@ -248,10 +336,10 @@ export function validateCoverQuality(
   if (pages > 2) issues.push(issue("warning", "cover_too_long", "The cover letter exceeds two pages."));
 
   if (!output.tailoredWithAi) {
-    issues.push(issue("warning", "deterministic_cover", "AI cover-letter revision was unavailable or rejected; the deterministic evidence-led letter was used."));
+    issues.push(issue("info", "deterministic_cover", "AI cover-letter revision was unavailable or rejected; the deterministic evidence-led letter was used. Provenance is recorded without lowering factual quality."));
   }
   if (output.warnings.length > 0) {
-    for (const warning of output.warnings) issues.push(issue("warning", "ai_fallback", warning));
+    for (const warning of output.warnings) issues.push(issue("info", "ai_provenance", warning));
   }
 
   return finalise(checks, issues, {

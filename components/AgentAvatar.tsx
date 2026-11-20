@@ -92,7 +92,7 @@ export function AgentAvatar({
   const [imageFailed, setImageFailed] = useState(false);
   const identity = agentIdentity(agentKey);
   const state = normaliseStatus(status);
-  const alt = `${identity.shortName} agent avatar`;
+  const alt = `${identity.name}, ${identity.title}, agent avatar`;
 
   return (
     <span

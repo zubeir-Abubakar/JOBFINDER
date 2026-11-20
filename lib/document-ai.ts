@@ -1,6 +1,16 @@
 import type { MasterCv, MasterRole } from "./master-cv";
 import type { JobAnalysis } from "./scoring";
 import { generateText } from "./providers";
+import {
+  claimsNoSponsorship,
+  claimsRequiresSponsorship,
+  hasGenericCoverLanguage,
+  hasKeywordStuffing,
+  hasSwissPermitB,
+  mentionsSalaryExpectation,
+  unsupportedTechClaims,
+  workAuthorisationRequired,
+} from "./claim-validation";
 
 export type TailoredCv = {
   summary: string;
@@ -124,6 +134,19 @@ export function deterministicSummary(master: MasterCv, job: JobLike, analysis: J
     .trim();
 }
 
+function requirementPhrase(analysis: JobAnalysis, job: JobLike): string {
+  const matched = [...new Set((analysis.matched ?? []).filter(Boolean))];
+  if (matched.length > 0) return matched.slice(0, 3).join(", ");
+  const responsibility = analysis.classification?.responsibilities?.[0];
+  if (responsibility) return lowerFirst(responsibility.replace(/\.$/, ""));
+  return `the quality needs described in the ${job.title} vacancy`;
+}
+
+function authorisationSentence(master: MasterCv, job: JobLike): string {
+  if (!hasSwissPermitB(master.permit) || !workAuthorisationRequired(job.description)) return "";
+  return "I hold a valid Swiss Permit B with work authorisation and do not require employer sponsorship. ";
+}
+
 export function deterministicCoverLetter(
   master: MasterCv,
   job: JobLike,
@@ -131,28 +154,33 @@ export function deterministicCoverLetter(
 ): CoverLetterContent {
   const keywords = keywordSet(job, analysis);
   const achievements = pickAchievements(master, keywords, 2);
-  const skills = relevantSkills(master, keywords, 5);
+  const skills = relevantSkills(master, keywords, 4);
   const lead = master.roles[0];
   const salutation = "Dear Hiring Team,";
-  const achievementSentence = (achievement: { role: MasterRole; bullet: string }): string =>
-    `${achievement.role.title} at ${achievement.role.company}: ${lowerFirst(achievement.bullet.replace(/\.$/, ""))}.`;
-  const sameRoleEvidence =
-    achievements.length >= 2 && achievements[0].role.key === achievements[1].role.key
-      ? `As ${achievements[0].role.title} at ${achievements[0].role.company}, I ${lowerFirst(achievements[0].bullet.replace(/\.$/, ""))} and ${lowerFirst(achievements[1].bullet.replace(/\.$/, ""))}.`
-      : null;
-  const evidence = sameRoleEvidence
-    ? sameRoleEvidence
-    : achievements.length > 0
-      ? achievements.map(achievementSentence).join(" ")
-      : `At ${lead?.company ?? "my most recent employer"} I owned test planning, automation and release validation for business-critical products.`;
+  const requirements = requirementPhrase(analysis, job);
   const skillPhrase = skills.length > 0 ? skills.join(", ") : "test automation, API testing and release quality";
+  const first = achievements[0];
+  const second = achievements[1];
+  const evidence = first
+    ? `As ${first.role.title} at ${first.role.company}, I ${lowerFirst(first.bullet.replace(/\.$/, ""))}.`
+    : `At ${lead?.company ?? "my most recent employer"} I owned test planning, automation and release validation for business-critical products.`;
+  const secondEvidence = second
+    ? second.role.key === first?.role.key
+      ? `In the same role, I ${lowerFirst(second.bullet.replace(/\.$/, ""))}.`
+      : `Earlier, as ${second.role.title} at ${second.role.company}, I ${lowerFirst(second.bullet.replace(/\.$/, ""))}.`
+    : "";
+  const requirementMap =
+    (analysis.matched ?? []).length > 0
+      ? `That evidence is relevant to the vacancy's focus on ${(analysis.matched ?? []).slice(0, 2).join(" and ")}.`
+      : "The evidence above reflects the technical depth and release ownership described in the vacancy.";
+
   return {
     salutation,
     paragraphs: [
-      `The ${job.title} role at ${job.company} requires someone who can connect technical test depth to dependable delivery. My background is a direct match: ${skillPhrase}.`,
-      `${evidence} Those outcomes show how I work: I turn a quality problem into a measurable improvement, then make the result visible to engineering and release stakeholders. I focus on shortening feedback cycles, improving automation coverage and giving release teams a clear, evidence-based go/no-go decision.`,
-      `I would bring the same discipline to ${job.company}: hands-on testing, practical automation and a clear view of release risk. My experience spans ${skillPhrase}, with a record of working closely with product and engineering rather than testing in isolation.`,
-      `I would welcome the opportunity to discuss how that experience can support ${job.company}'s quality goals.`,
+      `The ${job.title} role at ${job.company} calls for ${requirements}. My verified experience covers ${skillPhrase}, with a record of turning test evidence into release decisions rather than simply adding more checks.`,
+      `${evidence}${secondEvidence ? ` ${secondEvidence}` : ""}`,
+      `${requirementMap} I work by making risk visible early, automating the checks that decide quality and keeping evidence traceable for engineering and product teams. I also make release trade-offs explicit, so decisions are based on evidence rather than opinion and the test approach stays proportionate to the risk.`,
+      `${authorisationSentence(master, job)}I would value the chance to discuss how I can contribute to ${job.company}'s quality engineering work.`,
     ],
     closing: "Sincerely,",
     tailoredWithAi: false,
@@ -392,7 +420,10 @@ RULES:
 - Use one or two achievements from the master CV that are genuinely relevant to this vacancy.
 - Use only verified facts. Never invent employers, tools, certifications, metrics or responsibilities.
 - Mention the employer and role naturally.
+- Address at least two requirements named in the vacancy analysis, using only verified evidence.
 - Explain the measurable impact of the achievements and connect it to the employer's needs.
+- Do not mention salary or compensation.
+- If the vacancy asks about work authorisation or sponsorship, state exactly: "I hold a valid Swiss Permit B with work authorisation and do not require employer sponsorship." Only make that statement when the master CV supports it.
 - End with a confident professional close.
 
 VACANCY AND ANALYSIS:
@@ -412,7 +443,7 @@ ${JSON.stringify({
 
   try {
     const result = await generateText({
-      agentKey: "cv",
+      agentKey: "cover",
       taskId: context.taskId,
       workflowId: context.workflowId,
       source: "task",
@@ -432,16 +463,28 @@ ${JSON.stringify({
     const wordCount = text.split(/\s+/).filter(Boolean).length;
     const source = sourceMetrics(master);
     const usedMetrics = [...new Set(metricsIn(text).map((metric) => metric.toLowerCase()))];
+    const requirementTerms = [...new Set((context.analysis.matched ?? []).map((item) => item.toLowerCase()).filter(Boolean))];
+    const requirementHits = requirementTerms.filter((term) => text.toLowerCase().includes(term)).length;
+    const authorisationAsked = workAuthorisationRequired(context.job.description);
+    const permitB = hasSwissPermitB(master.permit);
+    const authorisationMentioned = /\b(?:permit\s*b|work\s+authoris|work\s+authoriz|right\s+to\s+work|sponsorship)\b/i.test(text);
     const invalid =
       paragraphs.length < 3 ||
       paragraphs.length > 6 ||
-      wordCount < 150 ||
-      wordCount > 380 ||
+      wordCount < 180 ||
+      wordCount > 320 ||
       invalidGenericOpening(paragraphs[0] ?? "") ||
+      hasGenericCoverLanguage(text) ||
+      hasKeywordStuffing(text, 6) ||
+      (requirementTerms.length > 0 && requirementHits < Math.min(2, requirementTerms.length)) ||
       !text.toLowerCase().includes(context.job.company.toLowerCase()) ||
       usedMetrics.length === 0 ||
-      usedMetrics.some((metric) => !source.has(metric));
-    if (invalid) return { ...fallback, provider: result.provider, model: result.model, warnings: ["AI cover letter failed grounding or length checks; deterministic letter retained."] };
+      usedMetrics.some((metric) => !source.has(metric)) ||
+      unsupportedTechClaims(text, master.sourceText, master.skillGroups.flatMap((group) => group.values)).length > 0 ||
+      mentionsSalaryExpectation(text) ||
+      (authorisationAsked && permitB && !authorisationMentioned) ||
+      claimsRequiresSponsorship(text);
+    if (invalid) return { ...fallback, provider: result.provider, model: result.model, warnings: ["AI cover letter failed grounding, length or vacancy-targeting checks; deterministic letter retained."] };
     const salutation = cleanString(parsed.salutation) ?? fallback.salutation;
     const closing = cleanString(parsed.closing) ?? fallback.closing;
     return { salutation, paragraphs, closing, tailoredWithAi: true, provider: result.provider, model: result.model, warnings: [] };

@@ -12,6 +12,9 @@
  * for human intervention rather than driven through a browser.
  */
 
+import { assertPublicHttpUrl } from "./outbound-url";
+import { readLimitedText, safeFetch } from "./safe-http";
+
 export type CandidateField = {
   name: string;
   label: string;
@@ -80,6 +83,12 @@ export type CandidateFormResult = {
 };
 
 type FetchLike = typeof fetch;
+
+function candidateTransport(): FetchLike {
+  return (process.env.NODE_ENV === "production" || process.env.ATW_SAFE_OUTBOUND === "true"
+    ? (safeFetch as unknown as FetchLike)
+    : fetch);
+}
 
 const SECURITY_PATTERNS: Array<[RegExp, string]> = [
   [/recaptcha|hcaptcha|i['’]m not a robot|i am not a robot|captcha/i, "The application form contains a CAPTCHA, which is never bypassed."],
@@ -400,7 +409,9 @@ function cookieHeader(response: Response): string | null {
 function absolute(raw: string, pageUrl: string): string | null {
   try {
     const url = new URL(raw, pageUrl);
-    return /^https?:$/.test(url.protocol) ? url.href : null;
+    if (!/^https?:$/.test(url.protocol)) return null;
+    assertPublicHttpUrl(url.href);
+    return url.href;
   } catch {
     return null;
   }
@@ -415,7 +426,7 @@ export async function prepareCandidateForm(input: {
   authorised?: Record<string, string>;
   fetchImpl?: FetchLike;
 }): Promise<CandidateFormPlan> {
-  const fetchImpl = input.fetchImpl ?? fetch;
+  const fetchImpl = input.fetchImpl ?? candidateTransport();
   const empty: CandidateFormPlan = {
     status: "failed",
     detail: "The application form could not be read.",
@@ -427,6 +438,16 @@ export async function prepareCandidateForm(input: {
     blockers: [],
     cookies: null,
   };
+  try {
+    assertPublicHttpUrl(input.pageUrl);
+  } catch {
+    return {
+      ...empty,
+      status: "unsupported",
+      detail: "The application page URL is not an allowed public HTTP(S) address.",
+      blockers: ["The application page URL is not public."],
+    };
+  }
   let response: Response;
   try {
     response = await fetchImpl(input.pageUrl, {
@@ -441,7 +462,7 @@ export async function prepareCandidateForm(input: {
   } catch (error) {
     return { ...empty, detail: `The application page could not be loaded: ${error instanceof Error ? error.message : "network error"}.` };
   }
-  const html = (await response.text().catch(() => "")).slice(0, 250_000);
+  const html = await readLimitedText(response, 250_000).catch(() => "");
   const security = detectSecurity(html);
   if (security) return { ...empty, status: "security", detail: security, blockers: [security] };
   if (!response.ok) {
@@ -568,7 +589,20 @@ export async function submitCandidateForm(input: {
       evidence: { blockers: plan.blockers, sent: false },
     };
   }
-  const fetchImpl = input.fetchImpl ?? fetch;
+  try {
+    assertPublicHttpUrl(plan.action);
+  } catch {
+    return {
+      status: "blocked",
+      detail: "The form action is not an allowed public HTTP(S) address; nothing was sent.",
+      httpStatus: null,
+      reference: null,
+      endpoint: plan.action,
+      finalUrl: plan.pageUrl,
+      evidence: { blockers: ["Blocked form action URL."], sent: false },
+    };
+  }
+  const fetchImpl = input.fetchImpl ?? candidateTransport();
   const form = new FormData();
   const decisions = new Map(plan.questions.map((question) => [question.name, question]));
   for (const field of plan.fields) {
@@ -617,7 +651,7 @@ export async function submitCandidateForm(input: {
       cache: "no-store",
     });
     httpStatus = response.status;
-    let text = (await response.text().catch(() => "")).slice(0, 60_000);
+    let text = await readLimitedText(response, 60_000).catch(() => "");
 
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get("location");
@@ -642,7 +676,7 @@ export async function submitCandidateForm(input: {
           cache: "no-store",
         });
         httpStatus = follow.status;
-        text = (await follow.text().catch(() => "")).slice(0, 60_000);
+        text = await readLimitedText(follow, 60_000).catch(() => "");
         finalUrl = follow.url || target;
       } catch (error) {
         return {

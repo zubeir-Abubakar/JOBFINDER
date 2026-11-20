@@ -17,6 +17,7 @@ export function loginThrottleState(input: {
   email: string;
   ip: string;
   limit: number;
+  action?: "login.failed" | "login.mfa_failed";
   now?: Date;
 }): LoginThrottleState {
   const now = input.now ?? new Date();
@@ -25,10 +26,10 @@ export function loginThrottleState(input: {
   const row = one<{ attempts: number; oldest: string | null }>(
     `SELECT COUNT(*) AS attempts, MIN(created_at) AS oldest
      FROM audit_logs
-     WHERE action = 'login.failed'
+     WHERE action = ?
        AND created_at >= ?
        AND (lower(entity_id) = ? OR ip = ?)`,
-    [since, input.email.trim().toLowerCase(), input.ip],
+    [input.action ?? "login.failed", since, input.email.trim().toLowerCase(), input.ip],
   );
   const attempts = Number(row?.attempts ?? 0);
   const blocked = attempts >= limit;

@@ -59,9 +59,9 @@ export function agentEnabled(key: string): boolean {
   return Boolean(row && row.enabled === 1 && row.status !== "paused");
 }
 
-export function createWorkflow(kind: string, label: string): string {
+export function createWorkflow(kind: string, label: string, startedBy: string | null = null): string {
   const id = `wf_${randomId()}`;
-  run("INSERT INTO workflows (id, kind, label, status, created_at) VALUES (?, ?, ?, 'running', ?)", [id, kind, label, nowIso()]);
+  run("INSERT INTO workflows (id, kind, label, status, started_by, created_at) VALUES (?, ?, ?, 'running', ?, ?)", [id, kind, label, startedBy, nowIso()]);
   emitWorkflowEvent({ workflowId: id, type: "workflow.started", agentKey: "coordinator", message: `${label} started. Agents execute sequentially.` });
   return id;
 }
@@ -243,14 +243,14 @@ export async function runDiscovery(userId: string, pages = 2): Promise<WorkflowO
   if (agentsPaused()) {
     return { workflowId: "", status: "paused", summary: "All agents are paused. Resume them before starting a search.", details: [] };
   }
-  const workflowId = createWorkflow("discovery", "Job discovery run");
+  const workflowId = createWorkflow("discovery", "Job discovery run", userId);
   const coordinatorTask = startTask("coordinator", workflowId, "Plan discovery run", `Search ${pages} page(s) of configured sources`);
   const details: string[] = [];
 
   if (!agentEnabled("research")) {
-    failTask(coordinatorTask, "coordinator", "The Job Research Agent is disabled or paused.");
-    finishWorkflow(workflowId, "failed", "Research agent unavailable");
-    return { workflowId, status: "failed", summary: "The Job Research Agent is disabled. Enable it in Agent management.", details };
+    failTask(coordinatorTask, "coordinator", `${agentIdentity("research").name} is disabled or paused.`);
+    finishWorkflow(workflowId, "failed", `${agentIdentity("research").name} unavailable`);
+    return { workflowId, status: "failed", summary: `${agentIdentity("research").name} is disabled. Enable the agent in Agent management.`, details };
   }
   const researchAvailability = agentAvailability("research");
   if (!researchAvailability.available) {
@@ -260,7 +260,7 @@ export async function runDiscovery(userId: string, pages = 2): Promise<WorkflowO
     return { workflowId, status: "failed", summary: message, details };
   }
 
-  completeTask(coordinatorTask, "coordinator", "Discovery workflow planned; research agent assigned.");
+  completeTask(coordinatorTask, "coordinator", `Discovery workflow planned; ${agentIdentity("research").name} assigned.`);
   const researchTask = startTask(
     "research",
     workflowId,
@@ -300,7 +300,7 @@ export async function runDiscovery(userId: string, pages = 2): Promise<WorkflowO
   let analysed = 0;
   if (research.inserted > 0) {
     if (!agentEnabled("analysis")) {
-      details.push("Analysis skipped: the Job Analysis Agent is disabled.");
+      details.push("Analysis skipped: Ali is disabled.");
     } else {
       const analysisTask = startTask("analysis", workflowId, `Score ${research.inserted} new vacancies`, "Weighted match scoring against the verified profile");
       try {
@@ -331,6 +331,7 @@ export async function runDiscovery(userId: string, pages = 2): Promise<WorkflowO
       kind: "strong_match",
       subject: `${strong.length} strong match${strong.length === 1 ? "" : "es"} found`,
       body: strong.map((j) => `${j.title} at ${j.company} — ${j.match_score}%`).join("\n"),
+      email: false,
     });
   }
 
@@ -406,7 +407,7 @@ async function storeArtifact(options: {
   job: JobRow;
   model: DocModel;
   version: string;
-  atsScore: number;
+  atsScore: number | null;
   atsReport: unknown;
   quality: DocumentQuality;
   rendered: RenderedArtifact;
@@ -577,6 +578,7 @@ export type PackageOutcome = {
   message: string;
   applicationId?: string;
   atsScore?: number;
+  readinessState?: string;
   cvDocumentId?: string;
   coverDocumentId?: string;
   warnings: string[];
@@ -591,7 +593,7 @@ export async function generateApplicationPackage(
   const job = one<JobRow>("SELECT * FROM jobs WHERE id = ?", [jobId]);
   if (!job) return { ok: false, message: "Vacancy not found.", warnings: [] };
   if (!agentEnabled("cv") || !agentEnabled("cover")) {
-    return { ok: false, message: "The CV or Cover Letter Agent is disabled. Enable them in Agent management.", warnings: [] };
+    return { ok: false, message: `${agentIdentity("cv").name} or ${agentIdentity("cover").name} is disabled. Enable them in Agent management.`, warnings: [] };
   }
 
   const profile = getProfileData();
@@ -599,7 +601,7 @@ export async function generateApplicationPackage(
     return { ok: false, message: "The master profile is incomplete. Add your name and skills first.", warnings: [] };
   }
 
-  const workflowId = options.workflowId ?? createWorkflow("documents", `Application package · ${job.company}`);
+  const workflowId = options.workflowId ?? createWorkflow("documents", `Application package · ${job.company}`, userId);
   const details: string[] = [];
   const coordinatorTask = options.workflowId ? null : startTask("coordinator", workflowId, "Assign document workflow", `${job.title} at ${job.company}`);
 
@@ -622,7 +624,16 @@ export async function generateApplicationPackage(
   let cvOutput: TailoredCv = aiCv;
   let cvModel = buildCvModel({ master, tailored: cvOutput, job: jobLike });
   let cvText = modelToText(cvModel);
-  let cvAts = assessAts(cvText, job.description ?? "", profile, master.sourceText, master.roles.length);
+  let cvAts = assessAts({
+    text: cvText,
+    jobDescription: job.description ?? "",
+    jobTitle: job.title,
+    jobCompany: job.company,
+    profile,
+    sourceText: master.sourceText,
+    sourceRoleCount: master.roles.length,
+    analysis,
+  });
   let cvArtifact = await renderArtifact(cvModel);
   let cvQuality = validateCvQuality(master, cvOutput, cvArtifact.text, cvArtifact.pages, jobLike);
 
@@ -637,8 +648,17 @@ export async function generateApplicationPackage(
     };
     cvModel = buildCvModel({ master, tailored: cvOutput, job: jobLike });
     cvText = modelToText(cvModel);
-    cvAts = assessAts(cvText, job.description ?? "", profile, master.sourceText, master.roles.length);
     cvArtifact = await renderArtifact(cvModel);
+    cvAts = assessAts({
+      text: cvText,
+      jobDescription: job.description ?? "",
+      jobTitle: job.title,
+      jobCompany: job.company,
+      profile,
+      sourceText: master.sourceText,
+      sourceRoleCount: master.roles.length,
+      analysis,
+    });
     cvQuality = validateCvQuality(master, cvOutput, cvArtifact.text, cvArtifact.pages, jobLike);
   }
 
@@ -686,27 +706,34 @@ export async function generateApplicationPackage(
   let coverOutput: CoverLetterContent = aiCover;
   let coverModel = buildCoverLetterModel({ master, cover: coverOutput, job: jobLike });
   let coverText = modelToText(coverModel);
-  let coverAts = assessAts(coverText, job.description ?? "", profile, master.sourceText, master.roles.length);
   let coverArtifact = await renderArtifact(coverModel);
-  let coverQuality = validateCoverQuality(master, coverOutput, coverArtifact.text, coverArtifact.pages, jobLike);
+  let coverQuality = validateCoverQuality(master, coverOutput, coverArtifact.text, coverArtifact.pages, { ...jobLike, analysis });
 
   if (coverQuality.status === "failed") {
     coverOutput = deterministicCoverLetter(master, jobLike, analysis);
     coverModel = buildCoverLetterModel({ master, cover: coverOutput, job: jobLike });
     coverText = modelToText(coverModel);
-    coverAts = assessAts(coverText, job.description ?? "", profile, master.sourceText, master.roles.length);
     coverArtifact = await renderArtifact(coverModel);
-    coverQuality = validateCoverQuality(master, coverOutput, coverArtifact.text, coverArtifact.pages, jobLike);
+    coverQuality = validateCoverQuality(master, coverOutput, coverArtifact.text, coverArtifact.pages, { ...jobLike, analysis });
   }
 
+  // A cover letter is not a CV. Applying the CV ATS structural rubric here is
+  // what produced the misleading Akros 57: the letter has no dedicated
+  // Summary/Skills/Experience sections and is not expected to. Its measurement
+  // is the document-quality gate above; the CV keeps the ATS compatibility score.
+  const coverAtsReport = {
+    measurement: "not_applicable",
+    note: "Cover letters are evaluated for vacancy-specific evidence, targeting and readability. The CV ATS compatibility rubric is not applicable to this document type.",
+    generatedAt: new Date().toISOString(),
+  };
   const coverDocs = await storeArtifact({
     userId,
     kind: "cover_letter",
     job,
     model: coverModel,
     version,
-    atsScore: coverAts.score,
-    atsReport: coverAts,
+    atsScore: null,
+    atsReport: coverAtsReport,
     quality: coverQuality,
     rendered: coverArtifact,
   });
@@ -722,64 +749,89 @@ export async function generateApplicationPackage(
       atsScore: cvAts.score,
       cvDocumentId: cvDocs.pdfId,
       coverDocumentId: coverDocs.pdfId,
-      warnings: [...new Set([...cvAts.warnings, ...coverAts.warnings, ...coverQuality.issues.map((item) => item.message)])],
+      warnings: [...new Set([...cvAts.warnings, ...coverQuality.issues.map((item) => item.message)])],
     };
   }
   completeTask(
     coverTask,
     "cover",
-    `Cover letter v${version} generated. ${coverOutput.tailoredWithAi ? "AI wording passed evidence checks." : "Deterministic evidence-led letter used."} ATS ${coverAts.score}/100, quality ${coverQuality.status} (${coverQuality.score}/100).`,
+    `Cover letter v${version} generated. ${coverOutput.tailoredWithAi ? "AI wording passed evidence checks." : "Deterministic evidence-led letter used."} Document quality ${coverQuality.status} (${coverQuality.score}/100). A CV ATS compatibility score is not applicable.`,
   );
   const combinedQuality = combinePackageQuality(cvQuality, coverQuality);
   const warnings = [...new Set([
     ...cvAts.warnings,
-    ...coverAts.warnings,
     ...combinedQuality.issues.filter((item) => item.severity === "warning").map((item) => item.message),
   ])];
-  details.push(`Cover letter v${version}: PDF + DOCX, ATS ${coverAts.score}/100, quality ${coverQuality.status}`);
+  details.push(`Cover letter v${version}: PDF + DOCX, document quality ${coverQuality.status} (${coverQuality.score}/100)`);
   details.push(`Package quality: ${combinedQuality.status} (${combinedQuality.score}/100)`);
 
   const approval = getSetting<boolean>("approval_mode", true);
+  const bothQualityPassed = cvQuality.status === "passed" && coverQuality.status === "passed";
+  const qualityReviewState = bothQualityPassed ? "documents_ready" : "quality_review_required";
+  const qualityReasons = [
+    ...cvQuality.issues.filter((item) => item.severity !== "info").map((item) => `CV: ${item.message}`),
+    ...coverQuality.issues.filter((item) => item.severity !== "info").map((item) => `Cover letter: ${item.message}`),
+  ];
+  const readiness = {
+    ready: false,
+    state: qualityReviewState,
+    reasons: qualityReasons.length ? qualityReasons : [`Full readiness is evaluated by ${agentIdentity("ats").name} before submission.`],
+    items: [
+      { key: "cv_quality", label: "CV passed its document-quality gate", passed: cvQuality.status === "passed", detail: `${cvQuality.status} (${cvQuality.score}/100)` },
+      { key: "cover_quality", label: "Cover letter passed its document-quality gate", passed: coverQuality.status === "passed", detail: `${coverQuality.status} (${coverQuality.score}/100)` },
+    ],
+    checkedAt: nowIso(),
+    engine: "document-quality-v2",
+  };
+  const nextStatus = bothQualityPassed
+    ? approval
+      ? "awaiting_approval"
+      : "quality_check"
+    : "quality_review_required";
   const existingApp = one<{ id: string; status: string }>("SELECT id, status FROM applications WHERE job_id = ?", [job.id]);
   let applicationId: string;
   if (existingApp) {
     applicationId = existingApp.id;
     run(
-      "UPDATE applications SET cv_document_id = ?, cover_letter_id = ?, status = CASE WHEN status IN ('submitted','acknowledged','interview_invited','interview_completed','offer_received') THEN status ELSE ? END, last_update = ? WHERE id = ?",
-      [cvDocs.pdfId, coverDocs.pdfId, approval ? "awaiting_approval" : "documents_preparing", nowIso(), applicationId],
+      "UPDATE applications SET cv_document_id = ?, cover_letter_id = ?, status = CASE WHEN status IN ('submitted','acknowledged','interview_invited','interview_completed','offer_received') THEN status ELSE ? END, readiness = ?, readiness_checked_at = ?, last_update = ? WHERE id = ?",
+      [cvDocs.pdfId, coverDocs.pdfId, nextStatus, JSON.stringify(readiness).slice(0, 16000), readiness.checkedAt, nowIso(), applicationId],
     );
   } else {
     applicationId = `app_${randomId()}`;
     run(
-      "INSERT INTO applications (id, job_id, status, cv_document_id, cover_letter_id, method, last_update, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO applications (id, job_id, status, cv_document_id, cover_letter_id, method, readiness, readiness_checked_at, last_update, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [
         applicationId,
         job.id,
-        approval ? "awaiting_approval" : "documents_preparing",
+        nextStatus,
         cvDocs.pdfId,
         coverDocs.pdfId,
         "employer_portal",
+        JSON.stringify(readiness).slice(0, 16000),
+        readiness.checkedAt,
         nowIso(),
         nowIso(),
       ],
     );
   }
   run("UPDATE jobs SET status = CASE WHEN status = 'rejected' THEN status ELSE 'documents' END WHERE id = ?", [job.id]);
-  run("UPDATE documents SET status = ? WHERE job_id = ? AND version = ?", [approval ? "awaiting_approval" : "ready", job.id, version]);
+  run("UPDATE documents SET status = ? WHERE job_id = ? AND version = ?", [bothQualityPassed ? (approval ? "awaiting_approval" : "ready") : "quality_review_required", job.id, version]);
 
   notify({
     userId,
     kind: "documents_ready",
-    subject: `Documents ready: ${job.title} at ${job.company}`,
-    body: `ATS self-check ${cvAts.score}/100. ${approval ? "Awaiting your approval before submission." : "Approval mode is off — review before submitting."}`,
+    subject: `${bothQualityPassed ? "Documents ready" : "Documents need review"}: ${job.title} at ${job.company}`,
+    body: `CV ATS compatibility ${cvAts.score}/100. Cover letter quality ${coverQuality.status} (${coverQuality.score}/100). ${bothQualityPassed ? (approval ? "Awaiting your approval before submission." : "Quality checks passed; full readiness is evaluated before submission.") : "The cover-letter quality gate requires review before this package can become ready."}`,
+    email: false,
   });
-  if (!options.workflowId) finishWorkflow(workflowId, "completed", `Package prepared (${flagLabel(analysis.flag)})`);
-  audit({ action: "documents.generated", entity: "job", entityId: job.id, detail: `CV and cover letter v${version} generated`, userId });
+  if (!options.workflowId) finishWorkflow(workflowId, bothQualityPassed ? "completed" : "paused", `Package prepared (${flagLabel(analysis.flag)})`);
+  audit({ action: "documents.generated", entity: "job", entityId: job.id, detail: `CV and cover letter v${version} generated; readiness ${qualityReviewState}`, userId });
   return {
     ok: true,
-    message: `Application package generated. ATS self-check ${cvAts.score}/100.`,
+    message: `Application package generated. Suitability ${analysis.score}% · CV ATS compatibility ${cvAts.score}/100 · cover quality ${coverQuality.status} (${coverQuality.score}/100).`,
     applicationId,
     atsScore: cvAts.score,
+    readinessState: qualityReviewState,
     cvDocumentId: cvDocs.pdfId,
     coverDocumentId: coverDocs.pdfId,
     warnings,

@@ -50,7 +50,7 @@ export default async function DocumentPreviewPage({ params }: { params: Promise<
       </div>
       <PageHead
         title={`${label} · ${doc.display_name.split("·")[0].trim()}`}
-        sub={`${formatBytes(doc.size_bytes)} · ${doc.mime.includes("pdf") ? "PDF" : "DOCX"}${doc.version ? ` · v${doc.version}` : ""}${doc.ats_score !== null ? ` · ATS ${doc.ats_score}/100` : ""}${doc.quality_status ? ` · Quality ${doc.quality_status}${doc.quality_score !== null ? ` (${doc.quality_score}/100)` : ""}` : ""} · created ${formatDateTime(doc.created_at)}`}
+        sub={`${formatBytes(doc.size_bytes)} · ${doc.mime.includes("pdf") ? "PDF" : "DOCX"}${doc.version ? ` · v${doc.version}` : ""}${doc.kind === "tailored_cv" && doc.ats_score !== null ? ` · CV ATS compatibility ${doc.ats_score}/100` : doc.kind === "cover_letter" ? " · CV ATS not applicable" : ""}${doc.quality_status ? ` · Document quality ${doc.quality_status}${doc.quality_score !== null ? ` (${doc.quality_score}/100)` : ""}` : ""} · created ${formatDateTime(doc.created_at)}`}
         actions={
           <>
             <a href={`/api/documents/${doc.id}`} className="btn" download={doc.file_name}>Download original</a>
@@ -66,7 +66,7 @@ export default async function DocumentPreviewPage({ params }: { params: Promise<
           <div className="card-head">
             <div>
               <h2>Document quality gate</h2>
-              <p className="card-sub">Validated against the uploaded original: role and section retention, bullet-level history, contact details, claims, page integrity and extractable text.</p>
+              <p className="card-sub">Validated against the uploaded original: role and section retention, bullet-level history, contact details, claims, page integrity and extractable text. This document-quality result is separate from the CV ATS compatibility score and candidate-to-job suitability.</p>
             </div>
             <span className={`badge ${quality.status === "passed" ? "badge-good" : quality.status === "failed" ? "badge-warn" : "badge-neutral"}`}>
               {quality.status} · {quality.score}/100

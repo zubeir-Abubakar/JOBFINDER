@@ -47,14 +47,16 @@ export default async function AdminAgentsPage({
           <table className="data">
             <thead><tr><th>Agent</th><th>State</th><th>Runs</th><th>Last run</th><th>Controls</th></tr></thead>
             <tbody>
-              {agents.map((agent) => (
+              {agents.map((agent) => {
+                const identity = agentIdentity(agent.key);
+                return (
                 <tr key={agent.key}>
                   <td style={{ minWidth: 240 }}>
                     <div className="flex items-center gap-2.5">
                       <AgentAvatar agentKey={agent.key} status={agent.status} size={38} />
                       <div>
-                        <div className="cell-title">{agent.name}</div>
-                        <div className="cell-sub">{agent.role} · {agent.key}</div>
+                        <div className="cell-title">{identity.name}</div>
+                        <div className="cell-sub">{identity.title} · {agent.key}</div>
                       </div>
                     </div>
                   </td>
@@ -77,7 +79,7 @@ export default async function AdminAgentsPage({
                       </form>
                       <details>
                         <summary className="btn btn-sm" style={{ listStyle: "none", cursor: "pointer" }}>Config</summary>
-                        <form action={saveAgentConfigAction} className="mt-2 stack" style={{ gap: 6, minWidth: 320 }}>
+                        <form action={saveAgentConfigAction} className="mt-2 stack" style={{ gap: 6, minWidth: "min(320px, 100%)" }}>
                           <input type="hidden" name="key" value={agent.key} />
                           <textarea name="config" className="textarea" rows={6} defaultValue={agent.config ?? "{}"} spellCheck={false} style={{ fontFamily: "ui-monospace, monospace", fontSize: 11.5 }} />
                           <SubmitButton className="btn btn-sm" pendingLabel="Saving…">Save JSON</SubmitButton>
@@ -86,7 +88,8 @@ export default async function AdminAgentsPage({
                     </div>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -124,7 +127,7 @@ export default async function AdminAgentsPage({
         <section className="card">
           <div className="card-head"><div><h2>Execution policy</h2></div></div>
           <div className="card-body text-[12px] leading-relaxed stack" style={{ gap: 8, color: "var(--muted)" }}>
-            <p>One workflow runs at a time. The coordinator creates a task record per step and refuses to start while all agents are paused.</p>
+            <p>One workflow runs at a time. {agentIdentity("coordinator").name} creates a task record per step and refuses to start while all agents are paused.</p>
             <p>Retries: a failed discovery or document task leaves its error on the task record; re-running the workflow retries the step. No silent retry loops.</p>
             <p>Agents share one professional profile and never write to each other&apos;s data. Application duplicates are blocked at the database level.</p>
           </div>

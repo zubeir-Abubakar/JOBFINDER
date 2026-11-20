@@ -18,6 +18,8 @@ export function assistantSuggestions(): string[] {
     "Find 20 Senior QA Engineer vacancies in Switzerland",
     "Show me all jobs with a match score above 80%",
     "Review application packages",
+    "Send me today's Executive Brief now",
+    "Has my Executive Brief been delivered?",
     "Show recruiter messages",
   ];
 }

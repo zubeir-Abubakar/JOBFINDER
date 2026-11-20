@@ -4,8 +4,10 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AgentAvatar } from "./AgentAvatar";
 import { agentIdentity } from "@/lib/agent-identity";
+import { WORKFLOW_STAGES as STAGES, type WorkflowStage } from "@/lib/workflow-stages";
 import { formatDateTime } from "@/lib/format";
 import { Icon } from "./icons";
+import type { ExecutionAgent, ExecutionManifest } from "@/lib/execution-manifest";
 
 type FlowTask = {
   id: string;
@@ -34,18 +36,21 @@ type FlowWorkflow = {
   finished_at: string | null;
 };
 type FlowApproval = { id: string; title: string; company: string; match_score: number | null } | null;
-type Snapshot = { workflow: FlowWorkflow | null; tasks: FlowTask[]; approval: FlowApproval; active: boolean };
+type Snapshot = { workflow: FlowWorkflow | null; tasks: FlowTask[]; approval: FlowApproval; active: boolean; execution: ExecutionManifest | null };
 type FlowEvent = { id: number; type: string; agent_key: string | null; message: string | null; created_at: string };
-type FlowStatus = "pending" | "queued" | "working" | "completed" | "failed" | "paused" | "waiting_approval" | "cancelled";
-
-const STAGES: Array<{ key: string; label: string; agents: string[]; hint: string }> = [
-  { key: "coordinator", label: "Coordinator", agents: ["coordinator"], hint: "Plans and sequences the run" },
-  { key: "research", label: "Job Research", agents: ["research"], hint: "Finds traceable vacancies" },
-  { key: "analysis", label: "Job Analysis", agents: ["analysis"], hint: "Scores fit against your profile" },
-  { key: "generation", label: "CV Generation", agents: ["cv", "cover"], hint: "Writes tailored, truthful files" },
-  { key: "quality", label: "Quality & Guardrails", agents: ["ats"], hint: "Checks ATS, claims and completeness" },
-  { key: "review", label: "Review & Approval", agents: ["application", "email"], hint: "Your gate, then tracked delivery" },
-];
+type FlowStatus =
+  | "pending"
+  | "queued"
+  | "working"
+  | "completed"
+  | "completed_zero"
+  | "failed"
+  | "degraded"
+  | "skipped"
+  | "not_executed"
+  | "paused"
+  | "waiting_approval"
+  | "cancelled";
 
 const EVENT_TYPES = [
   "workflow.started",
@@ -72,15 +77,41 @@ function duration(task: FlowTask): string {
 }
 
 function statusLabel(status: FlowStatus): string {
-  return status === "waiting_approval" ? "Waiting for approval" : status.charAt(0).toUpperCase() + status.slice(1);
+  const labels: Record<FlowStatus, string> = {
+    pending: "Pending",
+    queued: "Queued",
+    working: "Running",
+    completed: "Completed",
+    completed_zero: "Completed · zero results",
+    failed: "Failed",
+    degraded: "Degraded",
+    skipped: "Skipped",
+    not_executed: "Not executed",
+    paused: "Paused",
+    waiting_approval: "Waiting for approval",
+    cancelled: "Cancelled",
+  };
+  return labels[status];
 }
 
 function stageTone(status: FlowStatus): string {
   if (status === "working") return "badge-info";
-  if (status === "completed") return "badge-good";
+  if (status === "completed" || status === "completed_zero") return "badge-good";
   if (status === "failed") return "badge-bad";
-  if (status === "paused" || status === "waiting_approval") return "badge-warn";
+  if (status === "paused" || status === "waiting_approval" || status === "degraded") return "badge-warn";
   return "badge-neutral";
+}
+
+function executionStatus(agent: ExecutionAgent | undefined): FlowStatus {
+  if (!agent) return "not_executed";
+  if (agent.state === "RUNNING") return "working";
+  if (agent.state === "COMPLETED") return "completed";
+  if (agent.state === "COMPLETED_WITH_ZERO_RESULTS") return "completed_zero";
+  if (agent.state === "FAILED") return "failed";
+  if (agent.state === "DEGRADED") return "degraded";
+  if (agent.state === "SKIPPED") return "skipped";
+  if (agent.state === "BLOCKED" || agent.state === "DISABLED") return "paused";
+  return "not_executed";
 }
 
 export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
@@ -187,7 +218,7 @@ export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
         <div className="card-head">
           <div>
             <h2>Live AI agents working</h2>
-            <p className="card-sub">No workflow has run yet. Start a job search to watch the six-stage pipeline execute with real task records.</p>
+            <p className="card-sub">No workflow has run yet. Start a job search to watch the eight-agent pipeline execute with real task records.</p>
           </div>
           <span className="badge badge-neutral">Idle</span>
         </div>
@@ -207,14 +238,18 @@ export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
   const workflow = snapshot.workflow;
   const latestByAgent = new Map<string, FlowTask>();
   for (const task of snapshot.tasks) latestByAgent.set(task.agent_key, task);
+  const manifestByAgent = new Map<string, ExecutionAgent>();
+  for (const agent of snapshot.execution?.agents ?? []) manifestByAgent.set(agent.key, agent);
 
   const statusFor = (agentKey: string): FlowStatus => {
+    const execution = manifestByAgent.get(agentKey);
+    if (execution) return executionStatus(execution);
     const task = latestByAgent.get(agentKey);
     if (workflow.status === "stopped" || workflow.status === "cancelled") {
       return task?.status === "completed" || task?.status === "failed" ? (task.status as FlowStatus) : "cancelled";
     }
     if (!task) {
-      return workflow.status === "completed" ? "pending" : workflow.status === "paused" ? "paused" : "pending";
+      return workflow.status === "completed" ? "not_executed" : workflow.status === "paused" ? "paused" : "pending";
     }
     if (task.status === "running" || task.status === "working") return workflow.status === "paused" ? "paused" : "working";
     if (task.status === "completed" || task.status === "failed") return task.status as FlowStatus;
@@ -227,16 +262,21 @@ export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
   const isPaused = workflow.status === "paused";
   const isRunning = workflow.status === "running" || workflow.status === "queued";
 
-  const stageStatus = (stage: (typeof STAGES)[number]): FlowStatus => {
-    if (stage.key === "review" && snapshot.approval) return "waiting_approval";
-    if (stage.key === "review" && workflow.status === "completed") return "completed";
+  const stageStatus = (stage: WorkflowStage): FlowStatus => {
+    if (stage.approvalGate && snapshot.approval) return "waiting_approval";
     const statuses = stage.agents.map(statusFor);
     if (statuses.some((status) => status === "working")) return "working";
     if (statuses.some((status) => status === "failed")) return "failed";
-    if (statuses.length > 0 && statuses.every((status) => status === "completed")) return "completed";
+    if (statuses.some((status) => status === "degraded")) return "degraded";
+    if (statuses.length > 0 && statuses.every((status) => status === "completed" || status === "completed_zero")) {
+      return statuses.some((status) => status === "completed_zero") ? "completed_zero" : "completed";
+    }
     if (isPaused) return "paused";
     if (statuses.some((status) => status === "queued")) return "queued";
-    if (statuses.some((status) => status === "completed")) return "working";
+    if (statuses.some((status) => status === "completed" || status === "completed_zero")) return "degraded";
+    if (statuses.length > 0 && statuses.every((status) => status === "skipped")) return "skipped";
+    if (statuses.some((status) => status === "skipped")) return "skipped";
+    if (statuses.some((status) => status === "not_executed")) return "not_executed";
     return "pending";
   };
 
@@ -253,6 +293,13 @@ export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
             {workflow.label} · started {formatDateTime(workflow.created_at)}
             {workflow.finished_at ? ` · finished ${formatDateTime(workflow.finished_at)}` : ""}
           </p>
+          {snapshot.execution ? (
+            <p className="card-sub" style={{ marginTop: 5 }}>
+              Execution <span className="num">{snapshot.execution.executionId}</span> · {snapshot.execution.succeededAgents}/{snapshot.execution.expectedAgents} succeeded ·{" "}
+              {snapshot.execution.dispatchedAgents} dispatched · {snapshot.execution.skippedAgents} skipped · {snapshot.execution.notExecutedAgents} not executed ·{" "}
+              {snapshot.execution.counts.newJobs} new of {snapshot.execution.counts.postingsScreened} screened
+            </p>
+          ) : null}
         </div>
         <div className="flow-controls">
           <span className={`badge ${isComplete ? "badge-good" : isPaused ? "badge-warn" : workflow.status === "failed" ? "badge-bad" : isRunning ? "badge-info" : "badge-neutral"}`}>
@@ -285,7 +332,7 @@ export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
         <div className="flow-stage-track" role="list" aria-label="Agent execution stages">
           {STAGES.map((stage, index) => {
             const status = stageStatus(stage);
-            const isReview = stage.key === "review";
+            const isReview = Boolean(stage.approvalGate);
             return (
               <div className="flow-stage-item" role="listitem" key={stage.key}>
                 {index > 0 ? <div className={`flow-stage-connector ${status === "working" || status === "waiting_approval" ? "flowing" : ""}`} aria-hidden /> : null}
@@ -331,27 +378,59 @@ export function WorkflowFlow({ autoFocus = false }: { autoFocus?: boolean }) {
                   <div className="flow-agent-stack">
                     {stage.agents.map((key) => {
                       const task = latestByAgent.get(key);
+                      const executionAgent = manifestByAgent.get(key);
                       const status = statusFor(key);
                       const identity = agentIdentity(key);
+                      const avatarStatus = status === "working"
+                        ? "working"
+                        : status === "failed"
+                          ? "failed"
+                          : status === "completed" || status === "completed_zero"
+                            ? "completed"
+                            : "idle";
                       return (
                         <details key={key} className="flow-agent-row" data-status={status}>
                           <summary>
-                            <AgentAvatar agentKey={key} status={status === "working" ? "working" : status === "failed" ? "failed" : status === "completed" ? "completed" : "idle"} size={28} />
+                            <AgentAvatar agentKey={key} status={avatarStatus} size={28} />
                             <span className="flow-agent-copy">
-                              <span className="flow-agent-name">{identity.shortName}</span>
+                              <span className="flow-agent-name">{identity.name}</span>
+                              <span className="flow-agent-title">{identity.title}</span>
                               <span className="flow-agent-state">
-                                {task?.title ?? `${statusLabel(status)} · not assigned in this run`}
+                                {executionAgent
+                                  ? executionAgent.state === "NOT_EXECUTED" || executionAgent.state === "SKIPPED"
+                                    ? `${executionAgent.stateLabel} · ${executionAgent.reason ?? "No assignment recorded"}`
+                                    : executionAgent.assignments.at(-1) ?? `${statusLabel(status)} · no assignment text recorded`
+                                  : task?.title ?? `${statusLabel(status)} · not assigned in this run`}
                               </span>
                             </span>
                             <span className={`flow-agent-dot ${status}`} aria-label={statusLabel(status)} />
                             <span className="flow-agent-chevron" aria-hidden>⌄</span>
                           </summary>
+                          {executionAgent ? (
+                            <div className="flow-agent-details">
+                              <div><span>Actual state</span><strong>{executionAgent.stateLabel}</strong></div>
+                              <div><span>Execution ID</span><strong className="num">{snapshot.execution?.executionId ?? "—"}</strong></div>
+                              <div><span>Records processed</span><strong className="num">{executionAgent.recordsProcessed}</strong></div>
+                              <div><span>Duration</span><strong className="num">{executionAgent.durationMs === null ? "—" : `${Math.round(executionAgent.durationMs / 1000)}s`}</strong></div>
+                              <div><span>Started</span><strong>{formatDateTime(executionAgent.startedAt)}</strong></div>
+                              <div><span>Finished</span><strong>{formatDateTime(executionAgent.finishedAt)}</strong></div>
+                              <div><span>Retry count</span><strong className="num">{executionAgent.retryCount}</strong></div>
+                              <div><span>Dependencies</span><strong>{executionAgent.dependsOn.length ? executionAgent.dependsOn.map((dependency) => agentIdentity(dependency).name).join(", ") : "None"}</strong></div>
+                              <div><span>Handoff from</span><strong>{executionAgent.handoffFrom ? agentIdentity(executionAgent.handoffFrom).name : "None"}</strong></div>
+                              <div><span>Handoff to</span><strong>{executionAgent.handoffTo ? agentIdentity(executionAgent.handoffTo).name : "None"} · {executionAgent.handoffComplete ? "completed" : "not completed"}</strong></div>
+                              {executionAgent.error ? <div className="flow-error">{executionAgent.error}</div> : null}
+                              {executionAgent.output ? <div className="flow-output">{executionAgent.output}</div> : null}
+                              {executionAgent.reason && !executionAgent.output ? <div className="flow-output">{executionAgent.reason}</div> : null}
+                            </div>
+                          ) : null}
                           {task ? (
                             <div className="flow-agent-details">
-                              <div><span>Status</span><strong>{task.status}</strong></div>
+                              <div><span>Task status</span><strong>{task.status}</strong></div>
                               <div><span>Started</span><strong>{formatDateTime(task.started_at)}</strong></div>
                               <div><span>Finished</span><strong>{formatDateTime(task.finished_at)}</strong></div>
                               <div><span>Duration</span><strong className="num">{duration(task)}</strong></div>
+                              <div><span>Retry count</span><strong className="num">{executionAgent?.retryCount ?? 0}</strong></div>
+                              <div><span>Dependencies</span><strong>{executionAgent?.dependsOn.length ? executionAgent.dependsOn.map((dependency) => agentIdentity(dependency).name).join(", ") : "None"}</strong></div>
                               <div><span>Execution</span><strong>{task.execution_mode === "ai" ? `AI · ${task.ai_outcome ?? "unknown"} · ${task.provider ?? "—"} / ${task.model ?? "—"}` : task.execution_mode === "deterministic" ? "Deterministic (no model call)" : "Historical (origin unknown)"}</strong></div>
                               {task.error ? <div className="flow-error">{task.error}</div> : null}
                               {task.output ? <div className="flow-output">{task.output}</div> : null}

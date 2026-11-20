@@ -157,19 +157,19 @@ export default async function ApplicationsPage({
               <tbody>
                 {rows.map((row) => (
                   <tr key={row.id}>
-                    <td>
+                    <td data-label="Employer / role">
                       <Link href={`/applications/${row.id}`} className="cell-title">{row.title}</Link>
                       <div className="cell-sub">{row.company}{row.location ? ` · ${row.location}` : ""}</div>
                     </td>
-                    <td>
+                    <td data-label="Status">
                       <span className={`badge ${statusClass(row.status)}`}>{statusLabel(row.status)}</span>
                       {row.approved_at && !row.submitted_at ? <span className="badge badge-good ml-1">Approved</span> : null}
                     </td>
-                    <td className="cell-sub">{row.submitted_at ? formatDate(row.submitted_at) : "—"}</td>
-                    <td className="cell-sub">{row.method ? row.method.replace(/_/g, " ") : "—"}</td>
-                    <td className="num">{row.match_score ?? "—"}{row.match_score ? "%" : ""}</td>
-                    <td className="cell-sub">{formatDate(row.last_update)}</td>
-                    <td className="text-right"><Link href={`/applications/${row.id}`} className="btn btn-sm">Open</Link></td>
+                    <td className="cell-sub" data-label="Submitted">{row.submitted_at ? formatDate(row.submitted_at) : "—"}</td>
+                    <td className="cell-sub" data-label="Method">{row.method ? row.method.replace(/_/g, " ") : "—"}</td>
+                    <td className="num" data-label="Match">{row.match_score ?? "—"}{row.match_score ? "%" : ""}</td>
+                    <td className="cell-sub" data-label="Last update">{formatDate(row.last_update)}</td>
+                    <td className="text-right" data-label="Action"><Link href={`/applications/${row.id}`} className="btn btn-sm">Open</Link></td>
                   </tr>
                 ))}
               </tbody>

@@ -1,13 +1,23 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { nowIso, one, run, UPLOAD_DIR } from "./db";
+import { all, getDb, nowIso, one, run, UPLOAD_DIR } from "./db";
 import { randomId } from "./security";
 import { audit } from "./audit";
 import { recordApplicationEvent } from "./application-events";
 import { atsCredential, atsTargetFor, submitViaAts } from "./submission-ats";
 import { reconciliationDecision } from "./submission-reconciliation";
 import { prepareCandidateForm, submitCandidateForm, type CandidateDocuments, type CandidateProfile } from "./candidate-forms";
-import { authorisedAnswers, getRecruitmentPolicy } from "./recruitment-policy";
+import { authorisedAnswers, dailySubmissionUsage, getRecruitmentPolicy } from "./recruitment-policy";
+import { readinessAllowsSubmission } from "./application-status";
+import { getSetting } from "./settings";
+import { notify } from "./notify";
+import { assertPublicHttpUrl } from "./outbound-url";
+import { readLimitedText, safeFetch } from "./safe-http";
+
+const outboundTransport = (url: string, init: RequestInit = {}) =>
+  process.env.NODE_ENV === "production" || process.env.ATW_SAFE_OUTBOUND === "true"
+    ? safeFetch(url, init)
+    : fetch(url, init);
 
 /**
  * Application submission with evidence.
@@ -95,6 +105,14 @@ export function submissionEnabled(): boolean {
   return process.env.RECRUITMENT_SUBMISSION_ENABLED !== "false";
 }
 
+/**
+ * Final safety gate. A dry run must stop before the atomic claim and before any
+ * network call, even when an operator accidentally reactivates the policy.
+ */
+export function submissionDryRun(): boolean {
+  return process.env.RECRUITMENT_DRY_RUN === "true" || getSetting<boolean>("recruitment_dry_run", true) === true;
+}
+
 /** Candidate-facing forms are on unless explicitly disabled. Activation is enforced separately. */
 export function candidateFormsEnabled(): boolean {
   return process.env.RECRUITMENT_CANDIDATE_FORMS !== "false";
@@ -156,6 +174,217 @@ export function existingVerifiedSubmission(jobId: string): { id: string; referen
   );
 }
 
+const STALE_CLAIM_MS = 5 * 60_000;
+
+type SubmissionGate =
+  | { ok: true }
+  | { ok: false; detail: string; evidence: Record<string, unknown> };
+
+/**
+ * The persisted status is not enough. A ready flag must also still be the one
+ * produced by the readiness engine; this is the last local gate before a send.
+ */
+function submissionGate(applicationId: string): SubmissionGate {
+  const app = one<{ status: string; readiness: string | null }>(
+    "SELECT status, readiness FROM applications WHERE id = ?",
+    [applicationId],
+  );
+  if (!app) {
+    return { ok: false, detail: "The application record does not exist.", evidence: { applicationId } };
+  }
+  let readinessState: string | null = null;
+  try {
+    const parsed = JSON.parse(app.readiness ?? "{}") as { state?: unknown; ready?: unknown };
+    readinessState = typeof parsed.state === "string" ? parsed.state : null;
+  } catch {
+    readinessState = "unparseable";
+  }
+  if (app.status !== "ready_to_submit") {
+    return {
+      ok: false,
+      detail: `Application status is ${app.status}; only ready_to_submit can be sent automatically.`,
+      evidence: { applicationStatus: app.status, readinessState },
+    };
+  }
+  if (!readinessAllowsSubmission(app.readiness)) {
+    return {
+      ok: false,
+      detail: `The persisted readiness checklist is ${readinessState ?? "missing"}, not ready_for_submission. Re-run the quality check before sending.`,
+      evidence: { applicationStatus: app.status, readinessState },
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * A worker that dies mid-send leaves a `submitting` claim. It is deliberately
+ * treated as ambiguous (not failed and not successful) because the POST may have
+ * reached the employer. A later worker must confirm externally before retrying.
+ */
+export function recoverStaleSubmissionClaims(now: Date = new Date()): number {
+  const cutoff = new Date(now.getTime() - STALE_CLAIM_MS).toISOString();
+  const stale = all<{ id: string; application_id: string; job_id: string }>(
+    "SELECT id, application_id, job_id FROM submission_attempts WHERE status = 'submitting' AND attempted_at < ?",
+    [cutoff],
+  );
+  for (const claim of stale) {
+    const evidence = JSON.stringify({
+      staleClaim: true,
+      claimId: claim.id,
+      recoveredAt: now.toISOString(),
+      reason: "The submission worker did not finish before its lease expired; delivery is unknown.",
+    }).slice(0, 12000);
+    run(
+      "UPDATE submission_attempts SET status = 'unverified', error = ? WHERE id = ? AND status = 'submitting'",
+      ["The submission worker did not finish before its lease expired; delivery is unknown.", claim.id],
+    );
+    run(
+      "UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', submission_evidence = ?, last_update = ? WHERE id = ? AND status = 'submitting'",
+      [evidence, now.toISOString(), claim.application_id],
+    );
+    recordApplicationEvent({
+      applicationId: claim.application_id,
+      type: "submission.recovery",
+      message: "A stale submission claim was recovered as unverified; nothing is counted as submitted.",
+      meta: { claimId: claim.id, jobId: claim.job_id },
+    });
+  }
+  return stale.length;
+}
+
+type ClaimBlockKind = "not_ready" | "duplicate" | "prior" | "daily_limit" | "concurrent" | "storage_error";
+
+type ClaimResult =
+  | { claimed: true; attemptId: string }
+  | { claimed: false; kind: ClaimBlockKind; detail: string; evidence: Record<string, unknown> };
+
+/**
+ * Atomic claim. BEGIN IMMEDIATE serialises the duplicate, readiness, daily-cap
+ * and prior-attempt checks with the `submitting` insert. The partial unique
+ * index on submission_attempts(job_id) is the final race guard.
+ */
+function claimSubmission(input: SubmissionInput, at: string): ClaimResult {
+  const db = getDb();
+  let transactionOpen = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    transactionOpen = true;
+
+    const gate = submissionGate(input.applicationId);
+    if (!gate.ok) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return { claimed: false, kind: "not_ready", detail: gate.detail, evidence: gate.evidence };
+    }
+
+    const duplicate = existingVerifiedSubmission(input.job.id);
+    if (duplicate) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return {
+        claimed: false,
+        kind: "duplicate",
+        detail: `A verified submission already exists for this vacancy (${duplicate.reference ?? duplicate.id}). It will not be sent twice.`,
+        evidence: { duplicateOf: duplicate.id, reference: duplicate.reference },
+      };
+    }
+
+    const usage = dailySubmissionUsage(input.now ?? new Date(at), input.job.id);
+    if (usage.remaining <= 0) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return {
+        claimed: false,
+        kind: "daily_limit",
+        detail: `The daily limit of ${usage.limit} verified submission(s) has been reached. Nothing was sent.`,
+        evidence: { dailyLimit: usage.limit, verifiedToday: usage.verified, dayStart: usage.dayStart },
+      };
+    }
+
+    const prior = one<{ status: string; http_status: number | null; reference: string | null; error: string | null }>(
+      "SELECT status, http_status, reference, error FROM submission_attempts WHERE job_id = ? AND status != 'submitting' ORDER BY attempted_at DESC LIMIT 1",
+      [input.job.id],
+    );
+    const reconciliation = reconciliationDecision(
+      prior ? { status: prior.status, httpStatus: prior.http_status, reference: prior.reference, error: prior.error } : null,
+    );
+    if (reconciliation.action === "blocked") {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return { claimed: false, kind: "prior", detail: reconciliation.reason, evidence: reconciliation.evidence };
+    }
+
+    const active = one<{ id: string }>(
+      "SELECT id FROM submission_attempts WHERE job_id = ? AND status = 'submitting' LIMIT 1",
+      [input.job.id],
+    );
+    if (active) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return {
+        claimed: false,
+        kind: "concurrent",
+        detail: `Another worker already holds the active submission claim for this vacancy (${active.id}). This worker sent nothing.`,
+        evidence: { activeClaim: active.id },
+      };
+    }
+
+    const attemptId = `sub_${randomId()}`;
+    const channel = channelFor(input.job).channel;
+    db.prepare(
+      `INSERT INTO submission_attempts (id, application_id, job_id, run_id, channel, endpoint, status, http_status, reference, evidence, error, attempted_at)
+       VALUES (?, ?, ?, ?, ?, NULL, 'submitting', NULL, NULL, ?, NULL, ?)`,
+    ).run(
+      attemptId,
+      input.applicationId,
+      input.job.id,
+      input.runId ?? null,
+      channel,
+      JSON.stringify({ phase: "claimed", at, channel }).slice(0, 12000),
+      at,
+    );
+    const updated = db
+      .prepare("UPDATE applications SET status = 'submitting', submission_status = 'submitting', last_update = ? WHERE id = ? AND status = 'ready_to_submit'")
+      .run(at, input.applicationId);
+    if (Number(updated.changes) !== 1) {
+      db.exec("ROLLBACK");
+      transactionOpen = false;
+      return {
+        claimed: false,
+        kind: "concurrent",
+        detail: "The application stopped being ready while the claim was being taken; nothing was sent.",
+        evidence: { applicationId: input.applicationId },
+      };
+    }
+    db.exec("COMMIT");
+    transactionOpen = false;
+    return { claimed: true, attemptId };
+  } catch (error) {
+    if (transactionOpen) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // The original error is more useful than a rollback failure.
+      }
+    }
+    const message = error instanceof Error ? error.message : "Unknown claim error";
+    if (/unique constraint/i.test(message)) {
+      return {
+        claimed: false,
+        kind: "concurrent",
+        detail: "Another worker won the atomic submission claim. This worker sent nothing.",
+        evidence: { uniqueConstraint: true },
+      };
+    }
+    return {
+      claimed: false,
+      kind: "storage_error",
+      detail: `The submission claim could not be persisted, so nothing was sent: ${message}`,
+      evidence: { error: message },
+    };
+  }
+}
+
 function fileFor(relativePath: string | null): { buffer: Buffer; name: string } | null {
   if (!relativePath) return null;
   const name = path.basename(relativePath);
@@ -203,7 +432,26 @@ function recordAttempt(input: {
   outcome: SubmissionOutcome;
   error: string | null;
   at: string;
+  /** When present, finalise the atomic `submitting` row instead of adding a second row. */
+  attemptId?: string | null;
 }): void {
+  if (input.attemptId) {
+    run(
+      `UPDATE submission_attempts SET channel = ?, endpoint = ?, status = ?, http_status = ?, reference = ?, evidence = ?, error = ?
+       WHERE id = ?`,
+      [
+        input.channel,
+        input.endpoint,
+        input.outcome.status,
+        input.outcome.httpStatus,
+        input.outcome.reference,
+        input.outcome.evidence ? JSON.stringify(input.outcome.evidence).slice(0, 12000) : null,
+        input.error,
+        input.attemptId,
+      ],
+    );
+    return;
+  }
   run(
     `INSERT INTO submission_attempts (id, application_id, job_id, run_id, channel, endpoint, status, http_status, reference, evidence, error, attempted_at)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -300,10 +548,23 @@ function applyOutcome(input: {
       message: `Employer endpoint accepted the application (${outcome.channel}). Reference: ${outcome.reference ?? "not returned"}.`,
       meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus },
     });
+    notify({
+      kind: "application_submitted",
+      dedupeKey: `submission_verified:${input.applicationId}:${at}`,
+      subject: `Application submitted: ${input.job.title} at ${input.job.company}`,
+      body: `Employer evidence recorded via ${outcome.channel}. Reference: ${outcome.reference ?? "recorded"}.`,
+      email: false,
+    });
     return;
   }
 
-  if (outcome.status === "unverified") {
+  const ambiguousFailure =
+    outcome.status === "failed" &&
+    (outcome.httpStatus === 408 ||
+      outcome.httpStatus === 429 ||
+      (outcome.httpStatus !== null && outcome.httpStatus >= 500) ||
+      (outcome.httpStatus === null && !/nothing was sent|could not be read|missing files?/i.test(outcome.detail)));
+  if (outcome.status === "unverified" || ambiguousFailure) {
     run(
       `UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified',
          submission_evidence = ?, method = ?, applied_channel = ?, run_id = COALESCE(run_id, ?), last_update = ? WHERE id = ?`,
@@ -311,17 +572,32 @@ function applyOutcome(input: {
     );
     recordApplicationEvent({
       applicationId: input.applicationId,
-      type: "submission.unverified",
+      type: ambiguousFailure ? "submission.unknown" : "submission.unverified",
       message: outcome.detail,
-      meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus },
+      meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus, retryBlocked: true },
+    });
+    notify({
+      kind: "application_submission_unverified",
+      dedupeKey: `submission_unverified:${input.applicationId}:${at}`,
+      subject: `Submission ${ambiguousFailure ? "unknown" : "unverified"}: ${input.job.title}`,
+      body: `${input.job.company} did not produce a verified reference. ${outcome.detail} It is not counted as submitted and will not be retried blindly.`,
     });
     return;
   }
 
+  const safeFailure = outcome.status === "failed";
   run(
-    `UPDATE applications SET status = 'human_intervention_required', submission_status = ?, method = ?,
+    `UPDATE applications SET status = ?, submission_status = ?, method = ?,
        submission_evidence = ?, run_id = COALESCE(run_id, ?), last_update = ? WHERE id = ?`,
-    [outcome.status, outcome.channel, JSON.stringify(outcome.evidence ?? {}).slice(0, 12000), input.runId, at, input.applicationId],
+    [
+      safeFailure ? "submission_failed" : "human_intervention_required",
+      safeFailure ? "failed" : "blocked",
+      outcome.channel,
+      JSON.stringify(outcome.evidence ?? {}).slice(0, 12000),
+      input.runId,
+      at,
+      input.applicationId,
+    ],
   );
   recordApplicationEvent({
     applicationId: input.applicationId,
@@ -329,6 +605,14 @@ function applyOutcome(input: {
     message: outcome.detail,
     meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus },
   });
+  if (safeFailure) {
+    notify({
+      kind: "application_failed",
+      dedupeKey: `submission_failed:${input.applicationId}:${at}`,
+      subject: `Submission failed: ${input.job.title}`,
+      body: `${input.job.company} was not contacted successfully. ${outcome.detail}`,
+    });
+  }
 }
 
 /**
@@ -339,9 +623,10 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
   const at = (input.now ?? new Date()).toISOString();
   // Defence in depth: the run checks this too, but a direct call must never be
   // able to send an application before the owner has activated the policy.
+  recoverStaleSubmissionClaims(input.now ?? new Date(at));
   const policy = getRecruitmentPolicy();
   if (!policy.active) {
-    return {
+    const outcome: SubmissionOutcome = {
       status: "blocked",
       channel: channelFor(input.job).channel,
       detail:
@@ -351,7 +636,43 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint: null,
       evidence: { activationRequired: true, policyEngine: policy.engine },
     };
+    recordAttempt({
+      applicationId: input.applicationId,
+      jobId: input.job.id,
+      runId: input.runId ?? null,
+      channel: outcome.channel,
+      endpoint: null,
+      outcome,
+      error: null,
+      at,
+    });
+    return outcome;
   }
+  if (submissionDryRun()) {
+    const outcome: SubmissionOutcome = {
+      status: "blocked",
+      channel: channelFor(input.job).channel,
+      detail: "Dry run is enabled. The package was not sent and no employer was contacted.",
+      httpStatus: null,
+      reference: null,
+      endpoint: null,
+      evidence: { dryRun: true, policyEngine: policy.engine },
+    };
+    recordApplicationEvent({
+      applicationId: input.applicationId,
+      type: "submission.dry_run",
+      message: outcome.detail,
+      meta: { jobId: input.job.id, policyEngine: policy.engine },
+    });
+    audit({
+      action: "application.submission_dry_run",
+      entity: "application",
+      entityId: input.applicationId,
+      detail: `${input.job.title} at ${input.job.company} — no employer contacted.`,
+    });
+    return outcome;
+  }
+
   const duplicate = existingVerifiedSubmission(input.job.id);
   if (duplicate) {
     const outcome: SubmissionOutcome = {
@@ -371,6 +692,30 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint: null,
       outcome,
       error: null,
+      at,
+    });
+    return outcome;
+  }
+
+  const gate = submissionGate(input.applicationId);
+  if (!gate.ok) {
+    const outcome: SubmissionOutcome = {
+      status: "blocked",
+      channel: channelFor(input.job).channel,
+      detail: gate.detail,
+      httpStatus: null,
+      reference: null,
+      endpoint: null,
+      evidence: gate.evidence,
+    };
+    recordAttempt({
+      applicationId: input.applicationId,
+      jobId: input.job.id,
+      runId: input.runId ?? null,
+      channel: outcome.channel,
+      endpoint: null,
+      outcome,
+      error: gate.detail,
       at,
     });
     return outcome;
@@ -408,6 +753,61 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
     applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     return outcome;
   }
+
+  const usage = dailySubmissionUsage(input.now ?? new Date(at), input.job.id);
+  if (usage.remaining <= 0) {
+    const outcome: SubmissionOutcome = {
+      status: "blocked",
+      channel: channelFor(input.job).channel,
+      detail: `The daily limit of ${usage.limit} verified submission(s) has been reached. Nothing was sent.`,
+      httpStatus: null,
+      reference: null,
+      endpoint: null,
+      evidence: { dailyLimit: usage.limit, verifiedToday: usage.verified, dayStart: usage.dayStart },
+    };
+    recordAttempt({
+      applicationId: input.applicationId,
+      jobId: input.job.id,
+      runId: input.runId ?? null,
+      channel: outcome.channel,
+      endpoint: null,
+      outcome,
+      error: null,
+      at,
+    });
+    return outcome;
+  }
+
+  const claim = claimSubmission(input, at);
+  if (!claim.claimed) {
+    const outcome: SubmissionOutcome = {
+      status: "blocked",
+      channel: channelFor(input.job).channel,
+      detail: claim.detail,
+      httpStatus: null,
+      reference: null,
+      endpoint: null,
+      evidence: claim.evidence,
+    };
+    recordAttempt({
+      applicationId: input.applicationId,
+      jobId: input.job.id,
+      runId: input.runId ?? null,
+      channel: outcome.channel,
+      endpoint: null,
+      outcome,
+      error: claim.detail,
+      at,
+    });
+    return outcome;
+  }
+  const claimAttemptId = claim.attemptId;
+  recordApplicationEvent({
+    applicationId: input.applicationId,
+    type: "submission.submitting",
+    message: "An atomic submission claim was recorded; the employer has not yet been contacted.",
+    meta: { attemptId: claimAttemptId, jobId: input.job.id },
+  });
 
   // A supported ATS is used only when its employer-issued credential exists.
   // Without it the generic proxy endpoint (if configured) still applies.
@@ -453,6 +853,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       outcome,
       error: outcome.status === "failed" ? outcome.detail : null,
       at,
+      attemptId: claimAttemptId,
     });
     applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     if (outcome.status === "verified") {
@@ -546,6 +947,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       // delivered the application, so it keeps its error and stays ambiguous.
       error: stoppedBeforeSend ? null : outcome.status === "failed" || outcome.status === "blocked" ? outcome.detail : null,
       at,
+      attemptId: claimAttemptId,
     });
     applyOutcome({
       ...input,
@@ -583,6 +985,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       outcome,
       error: null,
       at,
+      attemptId: claimAttemptId,
     });
     applyOutcome({ ...input, outcome, at: at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     return outcome;
@@ -599,7 +1002,24 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint: null,
       evidence: { instant: at },
     };
-    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint: null, outcome, error: null, at });
+    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint: null, outcome, error: null, at, attemptId: claimAttemptId });
+    applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
+    return outcome;
+  }
+
+  try {
+    assertPublicHttpUrl(endpoint);
+  } catch {
+    const outcome: SubmissionOutcome = {
+      status: "blocked",
+      channel,
+      detail: "The configured submission endpoint is not an allowed public HTTP(S) address; nothing was sent.",
+      httpStatus: null,
+      reference: null,
+      endpoint,
+      evidence: { instant: at, blockedEndpoint: true },
+    };
+    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: outcome.detail, at, attemptId: claimAttemptId });
     applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     return outcome;
   }
@@ -640,7 +1060,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint,
       evidence: { instant: at, missingFiles },
     };
-    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: outcome.detail, at });
+    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: outcome.detail, at, attemptId: claimAttemptId });
     applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     return outcome;
   }
@@ -649,16 +1069,17 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
   let bodyText = "";
   let headers = new Headers();
   try {
-    const response = await fetch(endpoint, {
+    const response = await outboundTransport(endpoint, {
       method: "POST",
       body: form,
       signal: AbortSignal.timeout(45_000),
       headers: { "User-Agent": "AT-AI-Workforce/2.0 (authorised application submission)" },
       cache: "no-store",
+      redirect: "manual",
     });
     httpStatus = response.status;
     headers = response.headers;
-    bodyText = (await response.text()).slice(0, 4000);
+    bodyText = await readLimitedText(response, 4000);
 
     if (!response.ok) {
       const retryable = response.status === 408 || response.status === 429 || response.status >= 500;
@@ -680,6 +1101,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
         outcome,
         error: outcome.detail,
         at,
+        attemptId: claimAttemptId,
       });
       applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
       return outcome;
@@ -709,7 +1131,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
         files: [cv?.name, cover?.name].filter(Boolean),
       },
     };
-    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: null, at });
+    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: null, at, attemptId: claimAttemptId });
     applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     audit({
       action: outcome.status === "verified" ? "application.submitted_automatically" : "application.submission_unverified",
@@ -729,7 +1151,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint,
       evidence: { instant: at, error: message, responseSnippet: bodyText.slice(0, 600) },
     };
-    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: message, at });
+    recordAttempt({ applicationId: input.applicationId, jobId: input.job.id, runId: input.runId ?? null, channel, endpoint, outcome, error: message, at, attemptId: claimAttemptId });
     applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
     return outcome;
   }

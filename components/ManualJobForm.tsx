@@ -43,8 +43,8 @@ export function ManualJobForm() {
       </div>
       <div>
         <label className="label" htmlFor="description">Full job description</label>
-        <textarea id="description" name="description" className="textarea" rows={7} required minLength={40} placeholder="Paste the vacancy text so the analysis agent can extract requirements." />
-        <p className="hint">The analysis agent reads this text. Paste the real posting — never a summary.</p>
+        <textarea id="description" name="description" className="textarea" rows={7} required minLength={40} placeholder="Paste the vacancy text so Ali can extract requirements." />
+        <p className="hint">Ali reads this text. Paste the real posting — never a summary.</p>
       </div>
       <SubmitButton pendingLabel="Adding and analysing…" className="btn btn-primary">
         Add vacancy and analyse

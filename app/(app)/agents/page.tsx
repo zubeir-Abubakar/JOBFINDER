@@ -8,7 +8,6 @@ import {
   resumeAllAction,
   runDiscoveryAction,
   analyseBacklogAction,
-  startWorkflowAction,
   pauseWorkflowAction,
   stopWorkflowAction,
   resumeWorkflowAction,
@@ -20,10 +19,11 @@ import { AgentAvailabilityBadge, AgentAvatar, AgentTaskBadge } from "@/component
 import { WorkflowFlow } from "@/components/WorkflowFlow";
 import { activeWorkflow, latestPausedWorkflow, recoverInterruptedRuns } from "@/lib/workflow";
 import { taskExecutionMeta } from "@/lib/agent-status";
-import { agentIdentity } from "@/lib/agent-identity";
+import { AGENT_IDENTITY_KEYS, agentIdentity, agentNameList } from "@/lib/agent-identity";
 import { agentPresentation } from "@/lib/agent-presentation";
 import { getOperationalSnapshot } from "@/lib/operations";
 import { switchAgentAction } from "@/lib/actions/chat";
+import { startAutonomousRecruitmentAction } from "@/lib/actions/recruitment";
 
 export const dynamic = "force-dynamic";
 type TaskRow = {
@@ -57,20 +57,29 @@ export default async function AgentsPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  await requireUser();
+  const user = await requireUser();
   recoverInterruptedRuns();
   const sp = await searchParams;
   const focus = param(sp.agent);
   const snapshot = await getOperationalSnapshot();
   const agents = snapshot.agents;
+  const workflowScope =
+    user.role === "admin"
+      ? ""
+      : "WHERE (w.started_by = ? OR (w.started_by IS NULL AND (SELECT COUNT(*) FROM users WHERE role = 'owner' AND status = 'active') = 1) OR t.workflow_id IS NULL)";
+  const scopeParams = user.role === "admin" ? [] : [user.id];
   const tasks = all<TaskRow>(
-    "SELECT id, workflow_id, agent_key, title, status, output, error, provider, model, created_at, finished_at, execution_mode, ai_outcome FROM tasks ORDER BY created_at DESC LIMIT 80",
+    `SELECT t.id, t.workflow_id, t.agent_key, t.title, t.status, t.output, t.error, t.provider, t.model, t.created_at, t.finished_at, t.execution_mode, t.ai_outcome
+     FROM tasks t LEFT JOIN workflows w ON w.id = t.workflow_id ${workflowScope} ORDER BY t.created_at DESC LIMIT 80`,
+    scopeParams,
   );
   const workflows = all<WorkflowRow>(
-    "SELECT id, kind, label, status, summary, error, created_at, finished_at FROM workflows ORDER BY created_at DESC LIMIT 10",
+    `SELECT w.id, w.kind, w.label, w.status, w.summary, w.error, w.created_at, w.finished_at
+     FROM workflows w ${workflowScope.replace(" OR t.workflow_id IS NULL", "")} ORDER BY w.created_at DESC LIMIT 10`,
+    scopeParams,
   );
-  const active = activeWorkflow();
-  const paused = latestPausedWorkflow();
+  const active = activeWorkflow(user);
+  const paused = latestPausedWorkflow(user);
   const gateway = snapshot.providers.find((item) => item.name === "freellmapi");
   const ollama = snapshot.providers.find((item) => item.name === "ollama");
   const pending = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NULL")?.c ?? 0;
@@ -90,12 +99,12 @@ export default async function AgentsPage({
       <WorkflowFlow autoFocus={Boolean(param(sp.ok) || param(sp.error))} />
       <PageHead
         title="AI agents"
-        sub="One coordinator, seven specialists. Execution is sequential and runs in the background, so the dashboard stays responsive."
+        sub={`${agentIdentity("coordinator").name} coordinates ${agentNameList(AGENT_IDENTITY_KEYS.filter((key) => key !== "coordinator"))}. Execution is sequential and runs in the background, so the dashboard stays responsive.`}
         actions={
           <>
-            <form action={startWorkflowAction}>
-              <input type="hidden" name="pages" value="2" />
-              <SubmitButton className="btn btn-primary" pendingLabel="Queuing…">
+            <form action={startAutonomousRecruitmentAction}>
+              <input type="hidden" name="return_to" value="/agents" />
+              <SubmitButton className="btn btn-primary" pendingLabel="Starting autonomous run…">
                 <Icon name="agents" /> Start all agents
               </SubmitButton>
             </form>

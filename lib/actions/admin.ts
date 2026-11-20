@@ -9,6 +9,8 @@ import { requireAdmin } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { hashPassword, passwordIssues, randomId } from "@/lib/security";
 import { setSetting } from "@/lib/settings";
+import { INTEGRATION_KEYS, recordIntegrationCheck, testIntegrationConnection, type IntegrationKey } from "@/lib/integrations";
+import { refreshLatestExecutiveBriefDelivery, sendExecutiveBriefNow } from "@/lib/executive-brief";
 
 export async function createUserAction(formData: FormData): Promise<void> {
   const admin = await requireAdmin();
@@ -57,6 +59,19 @@ export async function resetUserPasswordAction(formData: FormData): Promise<void>
   run("DELETE FROM sessions WHERE user_id = ?", [id]);
   audit({ action: "admin.password_reset", entity: "user", entityId: id, userId: admin.id, actor: admin.email });
   revalidatePath("/admin/users");
+  redirect("/admin/users?saved=1");
+}
+
+export async function resetUserMfaAction(formData: FormData): Promise<void> {
+  const admin = await requireAdmin();
+  const id = String(formData.get("id") ?? "");
+  const target = one<{ email: string }>("SELECT email FROM users WHERE id = ?", [id]);
+  if (!target) redirect("/admin/users?error=Account+not+found");
+  run("UPDATE users SET mfa_enabled = 0, mfa_secret = NULL, mfa_pending_secret = NULL, mfa_recovery_hashes = NULL, mfa_last_step = NULL, mfa_enabled_at = NULL WHERE id = ?", [id]);
+  run("DELETE FROM sessions WHERE user_id = ?", [id]);
+  audit({ action: "admin.mfa_reset", entity: "user", entityId: id, detail: target.email, userId: admin.id, actor: admin.email });
+  revalidatePath("/admin/users");
+  revalidatePath("/admin/security");
   redirect("/admin/users?saved=1");
 }
 
@@ -123,6 +138,50 @@ export async function testProvidersAction(): Promise<void> {
   }
   revalidatePath("/admin/ai");
   redirect(`/admin/ai?${ok ? "ok" : "error"}=${encodeURIComponent(detail)}`);
+}
+
+export async function testIntegrationAction(formData: FormData): Promise<void> {
+  const admin = await requireAdmin();
+  const key = String(formData.get("key") ?? "") as IntegrationKey;
+  if (!INTEGRATION_KEYS.includes(key)) redirect("/admin/integrations?error=Unknown+integration");
+  const result = await testIntegrationConnection(key);
+  recordIntegrationCheck(key, result);
+  audit({
+    action: result.status === "success" ? "admin.integration_test" : "admin.integration_test_blocked",
+    entity: "integrations",
+    detail: `${key}: ${result.status} — ${result.detail}`.slice(0, 1000),
+    userId: admin.id,
+    actor: admin.email,
+  });
+  revalidatePath("/admin/integrations");
+  const param = result.status === "success" ? "ok" : result.status === "failed" ? "error" : "notice";
+  redirect(`/admin/integrations?${param}=${encodeURIComponent(result.detail)}`);
+}
+
+function briefRedirect(state: string, detail: string): string {
+  return `/admin/email?brief=${encodeURIComponent(state)}&detail=${encodeURIComponent(detail.slice(0, 900))}`;
+}
+
+export async function sendExecutiveBriefNowAction(formData: FormData): Promise<void> {
+  const admin = await requireAdmin();
+  const resend = String(formData.get("mode") ?? "send") === "resend";
+  const result = await sendExecutiveBriefNow({ userId: admin.id, source: "admin", resend });
+  revalidatePath("/admin/email");
+  redirect(briefRedirect(result.state, result.message));
+}
+
+export async function refreshExecutiveBriefDeliveryAction(): Promise<void> {
+  const admin = await requireAdmin();
+  const result = await refreshLatestExecutiveBriefDelivery();
+  audit({
+    action: "admin.executive_brief_sent_folder_check",
+    entity: "email",
+    entityId: result.outboxId,
+    detail: `${result.state} · ${result.sentVerification ?? result.detail}`.slice(0, 1000),
+    userId: admin.id,
+  });
+  revalidatePath("/admin/email");
+  redirect(briefRedirect(result.state, result.message));
 }
 
 export async function saveEmailConfigAction(formData: FormData): Promise<void> {

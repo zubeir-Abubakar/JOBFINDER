@@ -11,6 +11,7 @@ import { SubmitButton } from "@/components/SubmitButton";
 import { getSetting } from "@/lib/settings";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { DocumentWorkspace } from "@/components/DocumentWorkspace";
+import { agentIdentity } from "@/lib/agent-identity";
 
 export const dynamic = "force-dynamic";
 
@@ -37,6 +38,8 @@ export default async function ApplicationDetailPage({
     notes: string | null;
     last_update: string;
     created_at: string;
+    readiness: string | null;
+    readiness_checked_at: string | null;
     title: string;
     company: string;
     location: string | null;
@@ -51,6 +54,15 @@ export default async function ApplicationDetailPage({
     [id],
   );
   if (!app) notFound();
+
+  type ReadinessView = { state?: string; ready?: boolean; reasons?: string[]; items?: Array<{ label: string; passed: boolean; detail: string }> };
+  let readiness: ReadinessView | null = null;
+  try {
+    readiness = app.readiness ? (JSON.parse(app.readiness) as ReadinessView) : null;
+  } catch {
+    readiness = null;
+  }
+  const readinessLabel = readiness?.state ? readiness.state.replace(/_/g, " ") : readiness?.ready ? "ready for submission" : "not assessed";
 
   const cv = app.cv_document_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cv_document_id]) : null;
   const cover = app.cover_letter_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cover_letter_id]) : null;
@@ -74,7 +86,9 @@ export default async function ApplicationDetailPage({
       id: doc.id,
       label: doc.id === app.cv_document_id ? "Tailored CV" : "Cover letter",
       mime: doc.mime,
-      ats: doc.ats_score,
+      // ATS compatibility is a CV measurement. A cover letter is assessed by
+      // its own quality gate and must not borrow the CV score.
+      ats: doc.id === app.cv_document_id ? doc.ats_score : null,
       version: doc.version,
       quality: doc.quality_status,
       qualityScore: doc.quality_score,
@@ -103,7 +117,12 @@ export default async function ApplicationDetailPage({
           <div>
             <h2>Document review workspace</h2>
             <p className="card-sub">
-              {app.title} at {app.company} · {app.match_score ?? "—"}% match · ATS {cv?.ats_score ?? "—"}/100 · Quality {cv?.quality_status ?? "not checked"}{cv?.quality_score !== null && cv?.quality_score !== undefined ? ` (${cv.quality_score}/100)` : ""}. Review the CV and cover letter here before approving.
+              {app.title} at {app.company} · suitability {app.match_score ?? "—"}% · CV ATS compatibility {cv?.ats_score ?? "—"}/100 · CV quality {cv?.quality_status ?? "not checked"}{cv?.quality_score !== null && cv?.quality_score !== undefined ? ` (${cv.quality_score}/100)` : ""} · cover quality {cover?.quality_status ?? "not checked"}{cover?.quality_score !== null && cover?.quality_score !== undefined ? ` (${cover.quality_score}/100)` : ""}. These are separate measurements, not interchangeable scores.
+            </p>
+            <p className="hint" style={{ marginTop: 6 }}>
+              Readiness: <strong>{readinessLabel}</strong>
+              {app.readiness_checked_at ? ` · checked ${formatDateTime(app.readiness_checked_at)}` : ""}
+              {readiness?.reasons?.length ? ` — ${readiness.reasons.slice(0, 3).join(" ")}` : ""}
             </p>
           </div>
           <div className="row">
@@ -123,7 +142,7 @@ export default async function ApplicationDetailPage({
                 <div>
                   <h2>Submission</h2>
                   <p className="card-sub">
-                    Application Agent · {app.submitted_at
+                    {agentIdentity("application").name} — {agentIdentity("application").title} · {app.submitted_at
                       ? `recorded ${formatDateTime(app.submitted_at)} via ${(app.method ?? "").replace(/_/g, " ")}`
                       : `not submitted${approvalMode ? " — approval mode is on" : ""}`}
                   </p>
@@ -157,7 +176,11 @@ export default async function ApplicationDetailPage({
                       ))}
                     </div>
                   ) : null}
-                  {!app.approved_at ? (
+                  {app.status === "quality_review_required" ? (
+                    <div className="alert alert-warn" style={{ padding: "8px 10px", fontSize: 12 }}>
+                      Quality review is required before this package can be approved. Regenerate the documents after correcting the findings above.
+                    </div>
+                  ) : !app.approved_at ? (
                     <form action={approveApplicationAction}>
                       <input type="hidden" name="id" value={app.id} />
                       <SubmitButton className="btn btn-primary" pendingLabel="Approving…">Approve application package</SubmitButton>
@@ -212,7 +235,7 @@ export default async function ApplicationDetailPage({
                     <div>
                       <div className="text-[12.5px] font-medium">{doc!.kind === "tailored_cv" ? "Tailored CV" : "Cover letter"} · v{doc!.version}</div>
                       <div className="text-[11px]" style={{ color: "var(--muted)" }}>
-                        ATS self-check {doc!.ats_score ?? "—"}/100 · quality {doc!.quality_status ?? "not checked"}{doc!.quality_score !== null ? ` (${doc!.quality_score}/100)` : ""}
+                        {doc!.kind === "tailored_cv" ? `CV ATS compatibility ${doc!.ats_score ?? "—"}/100` : "Cover-letter ATS score not applicable"} · quality {doc!.quality_status ?? "not checked"}{doc!.quality_score !== null ? ` (${doc!.quality_score}/100)` : ""}
                       </div>
                     </div>
                     <a href={`/api/documents/${doc!.id}`} className="btn btn-sm">Download</a>

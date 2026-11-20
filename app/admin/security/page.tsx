@@ -24,6 +24,7 @@ export default async function AdminSecurityPage({
     users: one<{ c: number }>("SELECT COUNT(*) AS c FROM users")?.c ?? 0,
     disabled: one<{ c: number }>("SELECT COUNT(*) AS c FROM users WHERE status != 'active'")?.c ?? 0,
     sessions: one<{ c: number }>("SELECT COUNT(*) AS c FROM sessions WHERE expires_at > datetime('now')")?.c ?? 0,
+    mfa: one<{ c: number }>("SELECT COUNT(*) AS c FROM users WHERE mfa_enabled = 1")?.c ?? 0,
     events: one<{ c: number }>("SELECT COUNT(*) AS c FROM audit_logs")?.c ?? 0,
   };
 
@@ -78,6 +79,7 @@ export default async function AdminSecurityPage({
               <div className="between"><span style={{ color: "var(--muted)" }}>Password hashing</span><span>scrypt · 64-byte key · per-password salt</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Session storage</span><span>SHA-256 token hash in SQLite</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Cookie</span><span>HttpOnly · SameSite=Lax · Secure in production</span></div>
+              <div className="between"><span style={{ color: "var(--muted)" }}>MFA users</span><span className="num">{counts.mfa} / {counts.users}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Role enforcement</span><span>Server-side on every page and action</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>File access</span><span>Authenticated download route only</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Active sessions</span><span className="num">{counts.sessions}</span></div>

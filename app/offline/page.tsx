@@ -2,7 +2,7 @@ import Link from "next/link";
 import { Brand } from "@/components/icons";
 
 export const metadata = {
-  title: "Offline · Towfiq AI Agents",
+  title: "Offline · AT AI Workforce",
 };
 
 export default function OfflinePage() {

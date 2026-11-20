@@ -295,6 +295,22 @@ test("manual sync is attributed to manual and repeated syncs make no extra AI ca
   assert.equal(result.aiChecked, 2);
   assert.equal(result.aiClassified, 2);
 
+  // A real acknowledgement is the only signal that can turn an application
+  // into acknowledged state and create email-confirmation evidence.
+  assert.equal(applicationStatus("app_epsilon"), "acknowledged");
+  assert.equal(
+    one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM submission_attempts WHERE application_id = 'app_epsilon' AND channel = 'email_confirmation' AND status = 'verified'",
+    )?.n,
+    1,
+  );
+  assert.equal(
+    one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM notifications WHERE dedupe_key = 'email_confirmation:app_epsilon:gm5'",
+    )?.n,
+    1,
+  );
+
   const manualUsage = usageRows().filter((row) => row.source === "manual");
   assert.equal(manualUsage.length, 2);
   for (const row of manualUsage) {
@@ -320,6 +336,20 @@ test("manual sync is attributed to manual and repeated syncs make no extra AI ca
   assert.equal(repeat.aiClassified, 0);
   assert.equal(usageRows().length, usageAfterFirst, "a repeat sync must not create duplicate AI calls");
   assert.equal(usageAfterFirst, usageBefore + 2);
+  assert.equal(
+    one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM submission_attempts WHERE application_id = 'app_epsilon' AND channel = 'email_confirmation'",
+    )?.n,
+    1,
+    "a repeated mailbox sync must not duplicate confirmation evidence",
+  );
+  assert.equal(
+    one<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM notifications WHERE dedupe_key = 'email_confirmation:app_epsilon:gm5'",
+    )?.n,
+    1,
+    "a repeated mailbox sync must not duplicate the confirmation notification",
+  );
 });
 
 /* -------------------------------- fallback ------------------------------- */

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { openVacancyVerification } from "./helpers/open-vacancy.ts";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -165,6 +166,9 @@ db.run("UPDATE settings SET value = '60' WHERE key = 'min_match_score'");
 // suite simulates the owner's explicit activation against a local mock endpoint;
 // no employer is contacted. Five is an explicit test override of the 3/day
 // default so the orchestration fixture can exercise four qualifying vacancies.
+// This fixture exercises delivery against a local mock endpoint, so it opts out
+// of the production dry run explicitly.
+db.run("UPDATE settings SET value = 'false' WHERE key = 'recruitment_dry_run'");
 db.run("UPDATE settings SET value = 'true' WHERE key = 'autonomous_submission'");
 db.run("UPDATE settings SET value = 'false' WHERE key = 'approval_mode'");
 db.run("UPDATE settings SET value = '5' WHERE key = 'max_applications_per_day'");
@@ -418,7 +422,7 @@ test("the Chief Coordinator executes discovery, scoring, documents, QA, submissi
   const created = runs.createRecruitmentRun({ trigger: "manual", now: new Date() });
   assert.equal(created.created, true);
   preparedJobs = [];
-  const outcome = await runs.executeRun(created.run.id, { deps: { prepare: fakePackage } });
+  const outcome = await runs.executeRun(created.run.id, { deps: { prepare: fakePackage, verifyVacancy: async () => openVacancyVerification() } });
   completedRunId = created.run.id;
 
   assert.ok(outcome.qualified >= 3, `expected at least three qualifying vacancies, got ${outcome.qualified}`);
@@ -583,6 +587,7 @@ test("a vacancy scoring below 85% is excluded before any document work", async (
       }),
       analyse: () => ({ score: 84, concerns: [] } as unknown as import("../lib/scoring.ts").JobAnalysis),
       prepare: fakePackage,
+      verifyVacancy: async () => openVacancyVerification(),
     },
   });
   assert.equal(outcome.qualified, 0);

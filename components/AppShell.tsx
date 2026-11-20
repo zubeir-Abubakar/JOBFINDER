@@ -9,6 +9,7 @@ import { AgentAvatar } from "./AgentAvatar";
 import { UserAvatar } from "./UserAvatar";
 import { logoutAction } from "@/lib/actions/session";
 import { CoordinatorLiveVoice } from "./CoordinatorLiveVoice";
+import type { AgentKey } from "@/lib/agent-definitions";
 
 const ownerNav = [
   { group: "Recruitment" },
@@ -32,6 +33,7 @@ const adminNav = [
   { href: "/admin/agents", label: "Agent management", icon: "agents" },
   { href: "/admin/ai", label: "AI & API config", icon: "settings" },
   { href: "/admin/email", label: "Email & reports", icon: "mail" },
+  { href: "/admin/integrations", label: "Integrations", icon: "settings" },
   { href: "/admin/storage", label: "Storage & retention", icon: "database" },
   { href: "/admin/security", label: "Security", icon: "shield" },
   { href: "/admin/audit", label: "Audit logs", icon: "logs" },
@@ -43,17 +45,22 @@ export function AppShell({
   variant = "app",
   unreadCount = 0,
   assistantMessages = [],
+  activeAgentKey = "coordinator",
 }: {
   children: React.ReactNode;
   user: { name: string; email: string; role: string; avatarUrl?: string | null };
   variant?: "app" | "admin";
   unreadCount?: number;
   assistantMessages?: Array<{ id: number; role: string; content: string; created_at: string }>;
+  activeAgentKey?: AgentKey;
 }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
   const nav = variant === "admin" ? adminNav : ownerNav;
   const home = variant === "admin" ? "/admin" : "/dashboard";
+  const navActive = (href: string) =>
+    pathname === href ||
+    (href !== "/admin" && href !== "/dashboard" && pathname.startsWith(`${href}/`));
 
   useEffect(() => {
     setOpen(false);
@@ -91,7 +98,7 @@ export function AppShell({
             </button>
           </div>
         </div>
-        <nav className="flex flex-col gap-0.5 overflow-y-auto">
+        <nav aria-label="Primary navigation" className="flex flex-col gap-0.5 overflow-y-auto">
           {nav.map((item, index) =>
             "group" in item ? (
               <div key={`g-${index}`} className="nav-group-label">
@@ -102,7 +109,8 @@ export function AppShell({
                 key={item.href}
                 href={item.href}
                 onClick={() => setOpen(false)}
-                className={`nav-link ${pathname === item.href || (item.href !== "/admin" && item.href !== "/dashboard" && pathname.startsWith(item.href)) ? "active" : ""}`}
+                className={`nav-link ${navActive(item.href) ? "active" : ""}`}
+                aria-current={navActive(item.href) ? "page" : undefined}
               >
                 <Icon name={item.icon!} />
                 {item.label}
@@ -110,7 +118,7 @@ export function AppShell({
             ),
           )}
           {variant === "app" && user.role === "admin" ? (
-            <Link href="/admin" className="nav-link" onClick={() => setOpen(false)}>
+            <Link href="/admin" className={`nav-link ${pathname.startsWith("/admin") ? "active" : ""}`} onClick={() => setOpen(false)} aria-current={pathname.startsWith("/admin") ? "page" : undefined}>
               <Icon name="admin" /> Admin console
             </Link>
           ) : null}
@@ -158,7 +166,7 @@ export function AppShell({
             </span>
           </div>
           <div className="header-actions">
-            {variant === "app" ? <CoordinatorLiveVoice initialMessages={assistantMessages} /> : null}
+            {variant === "app" ? <CoordinatorLiveVoice initialMessages={assistantMessages} initialAgentKey={activeAgentKey} /> : null}
             {variant === "admin" ? (
               <Link href="/dashboard" className="btn btn-ghost btn-sm header-role-link">
                 Owner workspace
@@ -179,15 +187,16 @@ export function AppShell({
               <>
                 <Link
                   href="/inbox"
-                  className="header-cta header-inbox"
+                  className={`header-cta header-inbox ${pathname === "/inbox" ? "active" : ""}`}
                   aria-label={unreadCount > 0 ? `Inbox, ${unreadCount} unread message${unreadCount === 1 ? "" : "s"}` : "Inbox"}
+                  aria-current={pathname === "/inbox" ? "page" : undefined}
                 >
                   <Icon name="mail" size={15} />
                   <span className="header-cta-label header-label-desktop">Inbox</span>
                   <span className="header-cta-label header-label-mobile">Inbox</span>
                   {unreadCount > 0 ? <span className="header-unread" aria-hidden>{unreadCount > 9 ? "9+" : unreadCount}</span> : null}
                 </Link>
-                <Link href="/assistant" className="header-cta header-ai" aria-label="AI messages">
+                <Link href="/assistant" className={`header-cta header-ai ${pathname === "/assistant" ? "active" : ""}`} aria-label="AI messages" aria-current={pathname === "/assistant" ? "page" : undefined}>
                   <AgentAvatar agentKey="coordinator" status="idle" size={26} />
                   <span className="header-cta-label header-label-desktop">AI Assistance</span>
                   <span className="header-cta-label header-label-mobile">AI Message</span>

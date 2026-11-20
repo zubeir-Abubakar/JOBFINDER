@@ -8,13 +8,15 @@ import { audit } from "./audit";
  * Standing authorisation for autonomous recruitment.
  *
  * The policy is persisted in `settings`; the activation timestamp is a separate
- * switch. The policy defaults to automatic submission with a 3/day cap, but a
- * fresh installation is deliberately not activated: the owner must activate the
- * standing authorisation in the dashboard before anything can leave the machine.
- * This is the one gate that is never bypassed by a scheduled or manual run.
+ * switch. Approval is required and autonomous submission is off by default. A
+ * fresh installation is also a dry run and is deliberately not activated: the
+ * owner must explicitly change the policy and activate standing authorisation
+ * before anything can leave the machine. The effective limit is always read
+ * from persisted settings, so an existing owner's cap is never silently raised
+ * or lowered.
  */
 
-export const DEFAULT_MAX_SUBMISSIONS_PER_DAY = 3;
+export const DEFAULT_MAX_SUBMISSIONS_PER_DAY = 5;
 export const MAX_SUBMISSIONS_PER_DAY_LIMIT = 10;
 export const FRESHNESS_DAYS = 7;
 export const RECRUITMENT_POLICY_ENGINE = "standing-authorisation-v1";
@@ -43,7 +45,8 @@ function positiveInt(value: unknown, fallback: number, max: number): number {
 export function getRecruitmentPolicy(): RecruitmentPolicy {
   const activatedAtRaw = getSetting<string | null>("standing_authorisation_activated_at", null);
   const activatedAt = typeof activatedAtRaw === "string" && activatedAtRaw.trim() ? activatedAtRaw : null;
-  const autonomousSubmission = getSetting<boolean>("autonomous_submission", true) === true;
+  const approvalRequired = getSetting<boolean>("approval_mode", true) === true;
+  const autonomousSubmission = getSetting<boolean>("autonomous_submission", false) === true;
   return {
     autonomousSubmission,
     minMatchScore: effectiveMinMatchScore(getSetting<number>("min_match_score", 85)),
@@ -55,9 +58,9 @@ export function getRecruitmentPolicy(): RecruitmentPolicy {
     freshnessDays: FRESHNESS_DAYS,
     verifiedOpenOnly: true,
     blockDuplicates: true,
-    requirePerApplicationApproval: false,
+    requirePerApplicationApproval: approvalRequired,
     activatedAt,
-    active: autonomousSubmission && Boolean(activatedAt),
+    active: autonomousSubmission && !approvalRequired && Boolean(activatedAt),
     engine: RECRUITMENT_POLICY_ENGINE,
   };
 }
@@ -101,7 +104,8 @@ export function saveRecruitmentPolicy(input: {
   const minScore = Math.min(100, effectiveMinMatchScore(input.minMatchScore));
   const maxPerDay = positiveInt(input.maxSubmissionsPerDay, DEFAULT_MAX_SUBMISSIONS_PER_DAY, MAX_SUBMISSIONS_PER_DAY_LIMIT);
   setSetting("autonomous_submission", input.autonomousSubmission);
-  setSetting("approval_mode", false);
+  // Turning automatic submission off must restore the per-application gate.
+  setSetting("approval_mode", !input.autonomousSubmission);
   setSetting("min_match_score", minScore);
   setSetting("max_applications_per_day", maxPerDay);
   setSetting("duplicate_detection", true);

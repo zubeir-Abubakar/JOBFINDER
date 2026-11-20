@@ -13,6 +13,23 @@ import {
   saveRecruitmentPolicy,
 } from "@/lib/recruitment-policy";
 
+/**
+ * Primary recruitment launcher used by the dashboard and agents page. It starts
+ * the same multi-vacancy engine as the scheduler; the legacy single-vacancy
+ * workflow remains a separate, explicitly manual operation.
+ */
+export async function startAutonomousRecruitmentAction(formData: FormData): Promise<void> {
+  const user = await requireUser();
+  const requested = String(formData.get("return_to") ?? "/recruitment");
+  const returnTo = /^\/(?!\/)[a-z0-9/_-]*$/i.test(requested) ? requested : "/recruitment";
+  const result = await startDailyRun({ trigger: "manual", userId: user.id });
+  audit({ action: "recruitment.autonomous_run_started", entity: "recruitment_run", entityId: result.runId ?? null, userId: user.id });
+  revalidatePath("/recruitment");
+  revalidatePath("/dashboard");
+  revalidatePath("/agents");
+  redirect(`${returnTo}?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
+}
+
 export async function runRecruitmentNowAction(): Promise<void> {
   const user = await requireUser();
   const result = await startDailyRun({ trigger: "manual", userId: user.id });

@@ -9,7 +9,9 @@ import { eligibilityLabel } from "@/lib/eligibility";
 import { statusLabel, statusClass } from "@/lib/application-status";
 import { retryRecruitmentRunAction } from "@/lib/actions/recruitment";
 import { buildRunReport, runById, runStateHistory, qualifyingThreshold } from "@/lib/recruitment-run";
+import { buildExecutionManifest } from "@/lib/execution-manifest";
 import { formatInZone } from "@/lib/recruitment-schedule";
+import { agentIdentity } from "@/lib/agent-identity";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +30,7 @@ export default async function RecruitmentRunPage({
   if (!runRow) notFound();
   const report = runRow.report ?? buildRunReport(id);
   const states = runStateHistory(runRow);
+  const manifest = buildExecutionManifest(id);
 
   const jobs = all<{
     id: string; title: string; company: string; location: string | null; match_score: number | null; eligibility: string | null;
@@ -65,7 +68,7 @@ export default async function RecruitmentRunPage({
       </div>
       <PageHead
         title={`Daily recruitment report — ${runRow.run_key.split("#")[0]}`}
-        sub={`${runRow.trigger} · ${formatInZone(runRow.started_at)} → ${formatInZone(runRow.finished_at)} · threshold ${qualifyingThreshold()}%`}
+        sub={`${runRow.trigger} · ${formatInZone(runRow.started_at)} → ${formatInZone(runRow.finished_at)} · threshold ${qualifyingThreshold()}% · execution ${runRow.id}`}
         actions={
           <>
             <span className={`badge ${runRow.status === "completed" ? "badge-good" : runRow.status === "failed" ? "badge-bad" : "badge-warn"}`}>{runRow.status.replace(/_/g, " ")}</span>
@@ -81,15 +84,113 @@ export default async function RecruitmentRunPage({
 
       {param(sp.ok) ? <div className="alert alert-ok mb-4">{param(sp.ok)}</div> : null}
 
-      <section className="stats mb-4">
-        <Stat label="Discovered" value={runRow.jobs_discovered} />
-        <Stat label="Eligible" value={runRow.jobs_eligible} />
-        <Stat label="Qualified" value={runRow.jobs_qualified} tone="good" />
-        <Stat label="Prepared" value={runRow.packages_prepared} />
-        <Stat label="Submitted (verified)" value={runRow.applications_submitted} tone="good" />
-        <Stat label="Unverified" value={runRow.applications_unverified} tone={runRow.applications_unverified ? "warn" : undefined} />
-        <Stat label="Intervention" value={runRow.applications_intervention} tone={runRow.applications_intervention ? "warn" : undefined} />
-      </section>
+      {manifest ? (
+        <>
+          <section className="card mb-4">
+            <div className="card-head">
+              <div>
+                <h2>Execution manifest</h2>
+                <p className="card-sub">The same persisted evidence drives this page, the live workflow and the administrator email.</p>
+              </div>
+              <span className={`badge ${manifest.status === "completed" ? "badge-good" : manifest.status === "failed" ? "badge-bad" : "badge-warn"}`}>{manifest.status.replace(/_/g, " ")}</span>
+            </div>
+            <div className="card-body">
+              <div className="grid g4 mb-3" style={{ gap: 10 }}>
+                <div className="card-quiet p-3"><div className="cell-sub">Expected</div><div className="text-[22px] font-semibold">{manifest.expectedAgents}</div></div>
+                <div className="card-quiet p-3"><div className="cell-sub">Dispatched</div><div className="text-[22px] font-semibold">{manifest.dispatchedAgents}</div></div>
+                <div className="card-quiet p-3"><div className="cell-sub">Succeeded</div><div className="text-[22px] font-semibold">{manifest.succeededAgents}</div></div>
+                <div className="card-quiet p-3"><div className="cell-sub">Orchestration failures / skipped</div><div className="text-[22px] font-semibold">{manifest.notExecutedAgents} / {manifest.skippedAgents}</div></div>
+              </div>
+              <p className="text-[12px] mb-3" style={{ color: "var(--muted)" }}>{manifest.summary} Results received: {manifest.resultsReceived}; rejected: {manifest.resultsRejected}; handoffs completed: {manifest.handoffsCompleted}/{manifest.handoffsExpected}.</p>
+              <div className="table-wrap">
+                <table className="data">
+                  <thead><tr><th>Agent</th><th>Actual state</th><th>Assignment</th><th>Records</th><th>Duration</th><th>Output / issue</th></tr></thead>
+                  <tbody>
+                    {manifest.agents.map((agent) => (
+                      <tr key={agent.key}>
+                        <td className="cell-title">{agent.name}<div className="cell-sub">{agent.role}</div></td>
+                        <td><span className={`badge ${agent.state === "COMPLETED" ? "badge-good" : agent.state === "COMPLETED_WITH_ZERO_RESULTS" ? "badge-info" : agent.state === "FAILED" ? "badge-bad" : agent.state === "RUNNING" ? "badge-info" : agent.state === "SKIPPED" ? "badge-neutral" : agent.state === "NOT_EXECUTED" ? "badge-warn" : "badge-warn"}`}>{agent.stateLabel}</span></td>
+                        <td className="cell-sub">{agent.assignments.at(-1) ?? "No assignment"}</td>
+                        <td className="num">{agent.recordsProcessed}</td>
+                        <td className="num">{agent.durationMs === null ? "—" : `${Math.round(agent.durationMs / 1000)}s`}</td>
+                        <td className="cell-sub">{agent.error ?? agent.output ?? agent.reason ?? "No output recorded"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <section className="stats mb-4">
+            <Stat label="Postings screened" value={manifest.counts.postingsScreened} />
+            <Stat label="Relevant" value={manifest.counts.relevant} />
+            <Stat label="New vacancies" value={manifest.counts.newJobs} />
+            <Stat label="Eligible" value={manifest.counts.eligible} />
+            <Stat label="Qualified" value={manifest.counts.qualified} tone="good" />
+            <Stat label="Prepared" value={manifest.counts.documentsPrepared} />
+            <Stat label="Ready" value={manifest.counts.applicationsReady} />
+            <Stat label="Submitted (verified)" value={manifest.counts.submittedVerified} tone="good" />
+            <Stat label="Unverified" value={manifest.counts.submittedUnverified} tone={manifest.counts.submittedUnverified ? "warn" : undefined} />
+            <Stat label="Intervention" value={manifest.counts.interventions} tone={manifest.counts.interventions ? "warn" : undefined} />
+          </section>
+
+          <section className="card mb-4">
+            <div className="card-head">
+              <div>
+                <h2>Source outcomes</h2>
+                <p className="card-sub">A failed source is never presented as a successful source with zero jobs.</p>
+              </div>
+            </div>
+            <div className="table-wrap">
+              {manifest.sources.length === 0 ? (
+                <Empty title="No source metrics recorded" />
+              ) : (
+                <table className="data">
+                  <thead><tr><th>Source</th><th>Status</th><th>Postings</th><th>Fresh</th><th>Relevant</th><th>Duplicates</th><th>New</th><th>Errors</th></tr></thead>
+                  <tbody>
+                    {manifest.sources.map((source) => (
+                      <tr key={source.key}>
+                        <td className="cell-title">{source.label}</td>
+                        <td><span className={`badge ${source.status === "ok" || source.status === "empty" ? "badge-good" : source.status === "failed" ? "badge-bad" : "badge-warn"}`}>{source.status}</span></td>
+                        <td className="num">{source.postings}</td>
+                        <td className="num">{source.fresh}</td>
+                        <td className="num">{source.relevant}</td>
+                        <td className="num">{source.duplicates}</td>
+                        <td className="num">{source.inserted}</td>
+                        <td className="num">{source.errors}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </section>
+
+          <section className="card mb-4">
+            <div className="card-head">
+              <div>
+                <h2>Warnings and failures</h2>
+                <p className="card-sub">Exact persisted detail, not just a count.</p>
+              </div>
+            </div>
+            <div className="card-body stack" style={{ gap: 8 }}>
+              {manifest.warnings.length === 0 && manifest.failures.length === 0 ? (
+                <Empty title="No warning or failure recorded" />
+              ) : (
+                <>
+                  {manifest.failures.map((failure, index) => (
+                    <div key={`failure-${index}`} className="alert alert-error" style={{ margin: 0 }}><strong>Failure:</strong> {failure}</div>
+                  ))}
+                  {manifest.warnings.map((warning, index) => (
+                    <div key={`warning-${index}`} className="alert alert-info" style={{ margin: 0 }}><strong>Warning:</strong> {warning}</div>
+                  ))}
+                </>
+              )}
+            </div>
+          </section>
+        </>
+      ) : null}
 
       <section className="card mb-4">
         <div className="card-head">
@@ -106,8 +207,8 @@ export default async function RecruitmentRunPage({
       <section className="card mb-4">
         <div className="card-head">
           <div>
-            <h2>Coordinator state history</h2>
-            <p className="card-sub">Every state the Chief Coordinator passed through.</p>
+            <h2>{agentIdentity("coordinator").name} state history</h2>
+            <p className="card-sub">Every state {agentIdentity("coordinator").name} passed through.</p>
           </div>
         </div>
         <div className="card-body">
@@ -129,7 +230,7 @@ export default async function RecruitmentRunPage({
         <div className="card-head">
           <div>
             <h2>Agent execution history</h2>
-            <p className="card-sub">Assignments, retries and the Coordinator's decision for each one.</p>
+            <p className="card-sub">Assignments, retries and {agentIdentity("coordinator").name}&apos;s decision for each one.</p>
           </div>
         </div>
         <div className="table-wrap">
@@ -143,7 +244,7 @@ export default async function RecruitmentRunPage({
               <tbody>
                 {agents.map((agent, index) => (
                   <tr key={index}>
-                    <td className="cell-title">{agent.agent_key}</td>
+                    <td className="cell-title">{agentIdentity(agent.agent_key).name}<div className="cell-sub">{agentIdentity(agent.agent_key).title}</div></td>
                     <td className="cell-sub">{agent.assignment}</td>
                     <td><span className={`badge ${agent.status === "completed" ? "badge-good" : agent.status === "failed" ? "badge-bad" : "badge-warn"}`}>{agent.status}</span></td>
                     <td className="num">{agent.attempt}</td>
