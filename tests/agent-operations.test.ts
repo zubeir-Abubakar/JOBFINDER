@@ -29,13 +29,14 @@ db.run(
   [now],
 );
 
-test("schema v14 persists sessions, provider health and delivery state without rewriting history", () => {
-  assert.equal(db.SCHEMA_VERSION, 14);
-  assert.equal(db.schemaVersion(), 14);
+test("the current schema persists sessions, provider health, MFA, HTML mail and delivery state without rewriting history", () => {
+  assert.equal(db.schemaVersion(), db.SCHEMA_VERSION);
   const tables = db.all<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'").map((row) => row.name);
   assert.ok(tables.includes("agent_sessions"));
   const columns = db.all<{ name: string }>("PRAGMA table_info(provider_usage)").map((row) => row.name);
   for (const column of ["usage_source", "cached_tokens", "session_id"]) assert.ok(columns.includes(column), `${column} missing`);
+  const outboxColumns = db.all<{ name: string }>("PRAGMA table_info(notification_outbox)").map((row) => row.name);
+  assert.ok(outboxColumns.includes("html_body"), "html_body missing");
 });
 
 test("all eight agents have distinct, supported Gemini Live voices", () => {
@@ -194,7 +195,7 @@ test("token rows carry provider/estimated provenance and one attempt per inferen
 test("the live operational snapshot answers without inventing provider or token state", async () => {
   const snapshot = await operations.getOperationalSnapshot();
   assert.equal(snapshot.agentCount, 8);
-  assert.equal(snapshot.database.schemaVersion, 14);
+  assert.equal(snapshot.database.schemaVersion, db.SCHEMA_VERSION);
   assert.ok(snapshot.agents.every((agent) => agent.voice.available));
   assert.equal(snapshot.tokens.today.totalTokens, 200);
   assert.equal(snapshot.tokens.today.costStatus, "unverified");
@@ -208,7 +209,8 @@ test("the live operational snapshot answers without inventing provider or token 
   assert.match(assignments, /configured/i);
   assert.match(assignments, /actual latest/i);
   const focused = operations.answerFromOperations("What is your current status, provider, model and voice?", snapshot, "research") ?? "";
-  assert.match(focused, /Job Research Agent/);
+  assert.match(focused, /Saffa/);
+  assert.match(focused, /Job Research Agent \/ Discovery/);
   assert.match(focused, /Orus/);
   assert.match(focused, /provider/i);
   const mostTokens = operations.answerFromOperations("Which agent uses the most tokens?", snapshot) ?? "";
@@ -233,6 +235,7 @@ test("the live operational snapshot answers without inventing provider or token 
   assert.match(quota, /Next provider retry/);
   const email = operations.answerFromOperations("Was Gmail authenticated and did the daily report email send?", snapshot) ?? "";
   assert.match(email, /Gmail:/);
-  assert.match(email, /Daily run email/);
-  assert.match(operations.operationsBrief(snapshot), /schema v14/);
+  assert.match(email, /Executive Brief/);
+  assert.match(email, /state generated|state queued|state accepted_by_gmail|state sent_folder_observed|state delivery_confirmed/);
+  assert.match(operations.operationsBrief(snapshot), new RegExp(`schema v${db.SCHEMA_VERSION}`));
 });

@@ -1,7 +1,8 @@
 import { DatabaseSync } from "node:sqlite";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { hashPassword, randomId } from "./security.ts";
+import { AGENT_IDENTITIES } from "./agent-identity.ts";
 
 /** Data location is configurable so a verification run can use an isolated database. */
 export const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), "data");
@@ -116,7 +117,14 @@ CREATE TABLE IF NOT EXISTS jobs (
   analysis TEXT,
   ai_note TEXT,
   duplicate_of TEXT,
-  raw TEXT
+  raw TEXT,
+  last_seen_at TEXT,
+  last_seen_source TEXT,
+  expiry_at TEXT,
+  expiry_status TEXT,
+  vacancy_status TEXT,
+  vacancy_verified_at TEXT,
+  vacancy_verification TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON jobs(source, external_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -215,6 +223,7 @@ CREATE TABLE IF NOT EXISTS notifications (
   channel TEXT NOT NULL DEFAULT 'in-app',
   status TEXT NOT NULL DEFAULT 'unread',
   read_at TEXT,
+  report_id TEXT,
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -222,6 +231,13 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS api_rate_limits (
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0,
+  reset_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_rate_limits_reset ON api_rate_limits(reset_at);
 CREATE TABLE IF NOT EXISTS job_sources (
   key TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -335,8 +351,15 @@ CREATE TABLE IF NOT EXISTS recruitment_runs (
   started_at TEXT,
   finished_at TEXT,
   jobs_discovered INTEGER NOT NULL DEFAULT 0,
+  jobs_duplicates INTEGER NOT NULL DEFAULT 0,
+  jobs_filtered INTEGER NOT NULL DEFAULT 0,
   jobs_eligible INTEGER NOT NULL DEFAULT 0,
   jobs_qualified INTEGER NOT NULL DEFAULT 0,
+  sources_checked INTEGER NOT NULL DEFAULT 0,
+  sources_succeeded INTEGER NOT NULL DEFAULT 0,
+  sources_failed INTEGER NOT NULL DEFAULT 0,
+  sources_partial INTEGER NOT NULL DEFAULT 0,
+  discovery_state TEXT,
   packages_prepared INTEGER NOT NULL DEFAULT 0,
   applications_submitted INTEGER NOT NULL DEFAULT 0,
   applications_unverified INTEGER NOT NULL DEFAULT 0,
@@ -377,6 +400,26 @@ CREATE TABLE IF NOT EXISTS schedule_jobs (
   last_error TEXT,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runtime_locks (
+  key TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  meta TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_locks_expiry ON runtime_locks(expires_at);
+CREATE TABLE IF NOT EXISTS runtime_workers (
+  name TEXT PRIMARY KEY,
+  instance_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  stopped_at TEXT,
+  detail TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_workers_heartbeat ON runtime_workers(status, heartbeat_at);
 CREATE TABLE IF NOT EXISTS submission_attempts (
   id TEXT PRIMARY KEY,
   application_id TEXT NOT NULL,
@@ -411,6 +454,10 @@ CREATE TABLE IF NOT EXISTS discovery_source_status (
   fresh INTEGER NOT NULL DEFAULT 0,
   relevant INTEGER NOT NULL DEFAULT 0,
   error TEXT,
+  error_category TEXT,
+  status_code INTEGER,
+  last_attempts INTEGER NOT NULL DEFAULT 0,
+  last_duration_ms INTEGER NOT NULL DEFAULT 0,
   last_checked_at TEXT NOT NULL,
   last_success_at TEXT,
   PRIMARY KEY (source_key, endpoint)
@@ -466,6 +513,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   recipient TEXT NOT NULL,
   subject TEXT NOT NULL,
   body TEXT NOT NULL,
+  html_body TEXT,
   status TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
   available_at TEXT NOT NULL,
@@ -473,6 +521,15 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   provider_message_id TEXT,
   provider_thread_id TEXT,
   delivery TEXT,
+  report_id TEXT,
+  sender TEXT,
+  rfc_message_id TEXT,
+  gmail_response TEXT,
+  sent_observed_at TEXT,
+  sent_verification TEXT,
+  delivery_evidence TEXT,
+  bounce_info TEXT,
+  resend_count INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   created_at TEXT NOT NULL,
   started_at TEXT,
@@ -508,6 +565,15 @@ const g = globalThis as GlobalWithDb;
  */
 let schemaReady = false;
 
+function restrictMode(target: string, mode: number): void {
+  try {
+    chmodSync(target, mode);
+  } catch {
+    // Some filesystems (notably mounted volumes) cannot represent POSIX modes.
+    // The health endpoint reports the actual mode instead of claiming success.
+  }
+}
+
 export function getDb(): DatabaseSync {
   if (g.__atwDb) {
     if (!schemaReady) {
@@ -516,17 +582,34 @@ export function getDb(): DatabaseSync {
     }
     return g.__atwDb;
   }
-  mkdirSync(UPLOAD_DIR, { recursive: true });
-  mkdirSync(TEMP_DIR, { recursive: true });
-  const db = new DatabaseSync(path.join(DATA_DIR, "at-ai-workforce.db"));
+  mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+  restrictMode(DATA_DIR, 0o700);
+  mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+  restrictMode(UPLOAD_DIR, 0o700);
+  mkdirSync(TEMP_DIR, { recursive: true, mode: 0o700 });
+  restrictMode(TEMP_DIR, 0o700);
+  const dbFile = path.join(DATA_DIR, "at-ai-workforce.db");
+  const db = new DatabaseSync(dbFile);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
   ensureSchema(db);
   migrate(db);
   seed(db);
+  restrictMode(dbFile, 0o600);
+  for (const suffix of ["-wal", "-shm"]) restrictMode(`${dbFile}${suffix}`, 0o600);
   g.__atwDb = db;
   schemaReady = true;
   return db;
+}
+
+/** Per-request helper so callers can assert the schema is current. */
+/** Close the process-local handle. Used by restart/recovery verification. */
+export function closeDb(): void {
+  if (g.__atwDb) {
+    g.__atwDb.close();
+    g.__atwDb = undefined;
+    schemaReady = false;
+  }
 }
 
 /** Per-request helper so callers can assert the schema is current. */
@@ -561,14 +644,15 @@ export function v(value: unknown): string | number | null {
 const DEFAULT_SETTINGS: Record<string, unknown> = {
   retention_days: 30,
   auto_delete_expired: true,
-  // Phase 2 autonomy: qualifying applications (>= 85%) are submitted without a
-  // per-application approval gate. Unknown or unsafe answers still queue for a
-  // human, and no submission is ever recorded without employer evidence.
-  approval_mode: false,
-  autonomous_submission: true,
+  // Safe operating defaults. Approval is required, autonomous submission is
+  // off, and every recruitment run is a dry run until the owner explicitly
+  // changes the policy. Unknown or unsafe answers still queue for a human, and
+  // no submission is ever recorded without employer evidence.
+  approval_mode: true,
+  autonomous_submission: false,
   min_match_score: 85,
-  max_applications_per_day: 3,
-  recruitment_dry_run: false,
+  max_applications_per_day: 5,
+  recruitment_dry_run: true,
   recruitment_submission_enabled: true,
   // Phase 2.6: automatic submission defaults on, but a fresh installation is
   // not activated until the owner explicitly activates the standing policy.
@@ -613,64 +697,64 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
 const AGENT_SEED = [
   {
     key: "coordinator",
-    name: "Chief Coordinator",
-    role: "Orchestrator",
+    name: AGENT_IDENTITIES.coordinator.name,
+    role: AGENT_IDENTITIES.coordinator.role,
     description:
       "Owns every recruitment workflow: assigns work to specialist agents, tracks task progress, enforces your rules, retries recoverable failures and produces reports.",
     config: { max_retries: 2, priority: "balanced" },
   },
   {
     key: "research",
-    name: "Job Research Agent",
-    role: "Discovery",
+    name: AGENT_IDENTITIES.research.name,
+    role: AGENT_IDENTITIES.research.role,
     description:
       "Searches configured job sources for QA and test engineering vacancies in Switzerland or remote roles open to Swiss-based candidates, extracts descriptions and blocks duplicates.",
     config: { titles: ["Senior QA Engineer", "QA Automation Engineer", "SDET", "Test Lead"], locations: ["Lausanne", "Geneva", "Zurich", "Bern", "Remote"] },
   },
   {
     key: "analysis",
-    name: "Job Analysis Agent",
-    role: "Matching",
+    name: AGENT_IDENTITIES.analysis.name,
+    role: AGENT_IDENTITIES.analysis.role,
     description:
       "Reads each vacancy against the verified professional profile, scores the match across six weighted dimensions and explains gaps without auto-rejecting on preferred skills alone.",
     config: { weights: { technical: 35, experience: 25, seniority: 15, language: 10, location: 10, salary: 5 } },
   },
   {
     key: "cv",
-    name: "CV Optimisation Agent",
-    role: "Documents",
+    name: AGENT_IDENTITIES.cv.name,
+    role: AGENT_IDENTITIES.cv.role,
     description:
       "Tailors the CV to a vacancy using only verified facts from your master profile, reorders relevant skills and produces ATS-friendly PDF and DOCX files.",
     config: { formats: ["pdf", "docx"] },
   },
   {
     key: "ats",
-    name: "ATS Quality Control Agent",
-    role: "Assurance",
+    name: AGENT_IDENTITIES.ats.name,
+    role: AGENT_IDENTITIES.ats.role,
     description:
       "Audits generated documents for keyword coverage, formatting, section structure, contact details and unsupported claims before anything can be submitted.",
     config: { pass_threshold: 70, block_fabrication: true },
   },
   {
     key: "cover",
-    name: "Cover Letter Agent",
-    role: "Documents",
+    name: AGENT_IDENTITIES.cover.name,
+    role: AGENT_IDENTITIES.cover.role,
     description:
       "Writes vacancy-specific cover letters grounded in your real experience and work authorisation, producing PDF and DOCX files with no invented claims.",
     config: { formats: ["pdf", "docx"] },
   },
   {
     key: "application",
-    name: "Application Agent",
-    role: "Submission",
+    name: AGENT_IDENTITIES.application.name,
+    role: AGENT_IDENTITIES.application.role,
     description:
       "Prepares and submits applications through supported channels. Runs in approval mode by default, verifies eligibility and captures submission confirmations.",
     config: { mode: "approval", supported_channels: ["employer_portal_manual", "email"] },
   },
   {
     key: "email",
-    name: "Email & Tracking Agent",
-    role: "Tracking",
+    name: AGENT_IDENTITIES.email.name,
+    role: AGENT_IDENTITIES.email.role,
     description:
       "Sends notifications, records confirmations, watches for employer responses and keeps application statuses current.",
     config: { provider: "in-app", immediate: true },
@@ -683,7 +767,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 22;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -730,6 +814,14 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "users", "avatar_path", "avatar_path TEXT");
   ensureColumn(db, "users", "avatar_mime", "avatar_mime TEXT");
   ensureColumn(db, "users", "avatar_updated_at", "avatar_updated_at TEXT");
+  // Optional TOTP MFA. Secrets are encrypted with APP_SECRET_KEY; historical
+  // accounts stay disabled until the owner explicitly enrols an authenticator.
+  ensureColumn(db, "users", "mfa_enabled", "mfa_enabled INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "users", "mfa_secret", "mfa_secret TEXT");
+  ensureColumn(db, "users", "mfa_pending_secret", "mfa_pending_secret TEXT");
+  ensureColumn(db, "users", "mfa_recovery_hashes", "mfa_recovery_hashes TEXT");
+  ensureColumn(db, "users", "mfa_last_step", "mfa_last_step INTEGER");
+  ensureColumn(db, "users", "mfa_enabled_at", "mfa_enabled_at TEXT");
   ensureColumn(db, "jobs", "ai_note", "ai_note TEXT");
   // Document quality is stored per file so the UI can show the same gate that
   // accepted or rejected the PDF, rather than a post-hoc advisory note.
@@ -771,11 +863,35 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "applications", "follow_up_at", "follow_up_at TEXT");
   ensureColumn(db, "applications", "interview_status", "interview_status TEXT");
   ensureColumn(db, "applications", "applied_channel", "applied_channel TEXT");
+  // Phase 3: one active send per vacancy. A worker atomically inserts a
+  // `submitting` attempt before any network call; the partial unique index makes
+  // a concurrent second claim fail even when both workers passed the earlier
+  // duplicate/readiness checks.
+  db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_submission_attempts_active_claim ON submission_attempts(job_id) WHERE status = 'submitting'",
+  );
   ensureColumn(db, "documents", "run_id", "run_id TEXT");
   ensureColumn(db, "documents", "master_cv_ref", "master_cv_ref TEXT");
   // Per-source discovery contribution and the run mode (full or discovery only).
   ensureColumn(db, "recruitment_runs", "source_metrics", "source_metrics TEXT");
   ensureColumn(db, "recruitment_runs", "mode", "mode TEXT");
+  // Phase 5 execution reports: the exact warning/failure text is kept with the
+  // run so the dashboard, manifest and email cannot disagree or lose detail.
+  ensureColumn(db, "recruitment_runs", "warnings_json", "warnings_json TEXT");
+  ensureColumn(db, "recruitment_runs", "failures_json", "failures_json TEXT");
+  // Phase 1 source reliability: honest per-run aggregation. Existing runs keep
+  // zero/NULL values rather than being backfilled from less precise data.
+  ensureColumn(db, "recruitment_runs", "jobs_duplicates", "jobs_duplicates INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "jobs_filtered", "jobs_filtered INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "sources_checked", "sources_checked INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "sources_succeeded", "sources_succeeded INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "sources_failed", "sources_failed INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "sources_partial", "sources_partial INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "discovery_state", "discovery_state TEXT");
+  ensureColumn(db, "discovery_source_status", "error_category", "error_category TEXT");
+  ensureColumn(db, "discovery_source_status", "status_code", "status_code INTEGER");
+  ensureColumn(db, "discovery_source_status", "last_attempts", "last_attempts INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "discovery_source_status", "last_duration_ms", "last_duration_ms INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "schedule_jobs", "last_checked_at", "last_checked_at TEXT");
   // Execution provenance per assigned agent. A step that only recorded a task is
   // distinguishable from one that actually called a model, and the serving
@@ -798,9 +914,38 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "tasks", "state_reason", "state_reason TEXT");
   ensureColumn(db, "tasks", "next_retry_at", "next_retry_at TEXT");
   ensureColumn(db, "jobs", "document_state", "document_state TEXT");
+  // A duplicate is evidence that an existing vacancy is still live. Record when
+  // and from which source it was last seen without overwriting its origin.
+  ensureColumn(db, "jobs", "last_seen_at", "last_seen_at TEXT");
+  ensureColumn(db, "jobs", "last_seen_source", "last_seen_source TEXT");
+  // Final vacancy verification is additive: existing jobs keep NULL/unknown
+  // until a run re-reads the employer/listing page. No historical decision is
+  // rewritten, and an absent expiry is stored as unknown rather than invented.
+  ensureColumn(db, "jobs", "expiry_at", "expiry_at TEXT");
+  ensureColumn(db, "jobs", "expiry_status", "expiry_status TEXT");
+  ensureColumn(db, "jobs", "vacancy_status", "vacancy_status TEXT");
+  ensureColumn(db, "jobs", "vacancy_verified_at", "vacancy_verified_at TEXT");
+  ensureColumn(db, "jobs", "vacancy_verification", "vacancy_verification TEXT");
   ensureColumn(db, "notifications", "dedupe_key", "dedupe_key TEXT");
   ensureColumn(db, "notifications", "delivery_status", "delivery_status TEXT");
   ensureColumn(db, "notifications", "provider_message_id", "provider_message_id TEXT");
+  ensureColumn(db, "notifications", "report_id", "report_id TEXT");
+  // Branded HTML is stored beside the plain-text body so a failed delivery can
+  // be retried without rebuilding the report from mutable data.
+  ensureColumn(db, "notification_outbox", "html_body", "html_body TEXT");
+  // Delivery evidence is additive and separate from the worker lifecycle. A
+  // legacy row with delivery='accepted' remains Gmail API acceptance only; it is
+  // never upgraded to inbox delivery by this migration.
+  ensureColumn(db, "notification_outbox", "report_id", "report_id TEXT");
+  ensureColumn(db, "notification_outbox", "sender", "sender TEXT");
+  ensureColumn(db, "notification_outbox", "rfc_message_id", "rfc_message_id TEXT");
+  ensureColumn(db, "notification_outbox", "gmail_response", "gmail_response TEXT");
+  ensureColumn(db, "notification_outbox", "sent_observed_at", "sent_observed_at TEXT");
+  ensureColumn(db, "notification_outbox", "sent_verification", "sent_verification TEXT");
+  ensureColumn(db, "notification_outbox", "delivery_evidence", "delivery_evidence TEXT");
+  ensureColumn(db, "notification_outbox", "bounce_info", "bounce_info TEXT");
+  ensureColumn(db, "notification_outbox", "resend_count", "resend_count INTEGER NOT NULL DEFAULT 0");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_notification_outbox_report ON notification_outbox(report_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(status, next_retry_at)");
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
@@ -863,7 +1008,17 @@ function reconcileAgentAiCounters(db: DatabaseSync): void {
 }
 
 /** Data-only migrations. Runs once per process, after the schema is current. */
+function migrateAgentIdentity(db: DatabaseSync) {
+  // Display names and roles are derived from the immutable key. Historical
+  // rows keep their agent_key, so task and execution relationships never move.
+  const update = db.prepare("UPDATE agents SET name = ?, role = ? WHERE key = ?");
+  for (const identity of Object.values(AGENT_IDENTITIES)) {
+    update.run(identity.name, identity.role, identity.key);
+  }
+}
+
 function migrate(db: DatabaseSync) {
+  migrateAgentIdentity(db);
   backfillUsageAttribution(db);
   reconcileAgentAiCounters(db);
   // Keep the legacy generated advisory separate from deterministic scoring.
@@ -907,12 +1062,12 @@ function migrate(db: DatabaseSync) {
 
 function seed(db: DatabaseSync) {
   const ts = nowIso();
-  const settingCount = db.prepare("SELECT COUNT(*) AS c FROM settings").get() as { c: number };
-  if (!settingCount || settingCount.c === 0) {
-    const stmt = db.prepare("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)");
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-      stmt.run(key, JSON.stringify(value), ts);
-    }
+  // Migrations may have inserted marker rows before seeding. Seed every
+  // missing default individually; INSERT OR IGNORE never overwrites an existing
+  // owner setting, and this still fills defaults on a fresh database.
+  const stmt = db.prepare("INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)");
+  for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+    stmt.run(key, JSON.stringify(value), ts);
   }
 
   const agentCount = db.prepare("SELECT COUNT(*) AS c FROM agents").get() as { c: number };
@@ -1094,8 +1249,8 @@ function migrateAutonomyDefaults(db: DatabaseSync) {
   const write = (key: string, value: unknown) => {
     db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?").run(JSON.stringify(value), nowIso(), key);
   };
-  if (read("approval_mode") === true) write("approval_mode", false);
-  if (read("autonomous_submission") === false) write("autonomous_submission", true);
+  // Never rewrite approval_mode or autonomous_submission here. Those are the
+  // owner's safety switches; startup must not enable autonomous sending.
   if (read("min_match_score") === 60) write("min_match_score", 85);
   db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autonomy_defaults_v2', ?, ?)").run(
     JSON.stringify({ applied_at: nowIso(), version: 2 }),
@@ -1126,9 +1281,10 @@ function migrateStandingAuthorisationDefaults(db: DatabaseSync) {
     if (exists) db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?").run(JSON.stringify(value), nowIso(), key);
     else db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)").run(key, JSON.stringify(value), nowIso());
   };
-  if (read("max_applications_per_day") === 5) write("max_applications_per_day", 3);
-  if (read("autonomous_submission") === false) write("autonomous_submission", true);
-  if (read("approval_mode") === true) write("approval_mode", false);
+  // Preserve an existing stored cap (including a deliberate 3/day or 5/day).
+  // Only ensure a missing value is created; never rewrite the owner's choice.
+  if (read("max_applications_per_day") === undefined) write("max_applications_per_day", 5);
+  // Never rewrite approval_mode or autonomous_submission here either.
   if (read("standing_authorisation_activated_at") === undefined) write("standing_authorisation_activated_at", null);
   if (read("authorised_answers") === undefined) write("authorised_answers", {});
   db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autonomy_defaults_v3', ?, ?)").run(

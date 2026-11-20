@@ -8,6 +8,7 @@ import { all, nowIso, one, run, UPLOAD_DIR } from "@/lib/db";
 import { requireUser } from "@/lib/auth";
 import { randomId, sha256 } from "@/lib/security";
 import { extractFields, extractText } from "@/lib/extract";
+import { detectDocumentType } from "@/lib/document-type";
 import { getSetting, setSetting } from "@/lib/settings";
 import { audit } from "@/lib/audit";
 import { generateApplicationPackage } from "@/lib/agents";
@@ -22,27 +23,19 @@ export async function uploadCvAction(_prev: UploadState | undefined, formData: F
   if (!(file instanceof File) || file.size === 0) return { error: "Choose a PDF, DOCX or TXT file to upload." };
   if (file.size > MAX_BYTES) return { error: "File is larger than 8 MB." };
   const name = file.name.replace(/[^\w.\- ]/g, "_").slice(-140);
-  const lower = name.toLowerCase();
-  const allowed =
-    lower.endsWith(".pdf") ||
-    lower.endsWith(".docx") ||
-    lower.endsWith(".txt") ||
-    file.type === "application/pdf" ||
-    file.type === "text/plain" ||
-    file.type.includes("wordprocessingml");
-  if (!allowed) return { error: "Unsupported file type. Upload PDF, DOCX or TXT." };
-
   const buffer = Buffer.from(await file.arrayBuffer());
+  const detected = detectDocumentType(buffer, name);
+  if (!detected) return { error: "Unsupported or mismatched file content. Upload a real PDF, DOCX or UTF-8 TXT file." };
   let text = "";
   try {
-    text = await extractText(buffer, file.type, name);
+    text = await extractText(buffer, detected.mime, name);
   } catch (error) {
     return { error: error instanceof Error ? error.message : "The document text could not be extracted." };
   }
   if (text.trim().length < 40) return { error: "Almost no text could be extracted. If the CV is a scan, export a text-based PDF first." };
 
   const id = `doc_${randomId()}`;
-  const storedName = `${id}${path.extname(name).toLowerCase() || ".pdf"}`;
+  const storedName = `${id}${detected.extension}`;
   await writeFile(path.join(UPLOAD_DIR, storedName), buffer);
 
   run(
@@ -53,7 +46,7 @@ export async function uploadCvAction(_prev: UploadState | undefined, formData: F
       user.id,
       `Original CV · ${name}`,
       name,
-      file.type || "application/octet-stream",
+      detected.mime,
       storedName,
       buffer.length,
       sha256(text),

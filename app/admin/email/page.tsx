@@ -3,10 +3,11 @@ import { all } from "@/lib/db";
 import { getSettings } from "@/lib/settings";
 import { PageHead, Flash } from "@/components/ui";
 import { formatDateTime, param } from "@/lib/format";
-import { saveEmailConfigAction } from "@/lib/actions/admin";
+import { refreshExecutiveBriefDeliveryAction, saveEmailConfigAction, sendExecutiveBriefNowAction } from "@/lib/actions/admin";
 import { SubmitButton } from "@/components/SubmitButton";
 import { accountStatus } from "@/lib/gmail";
 import { notificationQueueSnapshot } from "@/lib/notify";
+import { executiveBriefHistory, executiveBriefScheduleSnapshot, latestExecutiveBriefDelivery } from "@/lib/executive-brief";
 import { connectGmailAction, disconnectGmailAction, syncGmailAction } from "@/lib/actions/gmail";
 
 export const dynamic = "force-dynamic";
@@ -25,10 +26,21 @@ export default async function AdminEmailPage({
   );
   const gmail = accountStatus();
   const outbox = notificationQueueSnapshot();
+  const briefSchedule = executiveBriefScheduleSnapshot();
+  const briefHistory = executiveBriefHistory(5);
+  const briefDelivery = latestExecutiveBriefDelivery();
+  const briefState = param(sp.brief);
+  const briefDetail = param(sp.detail);
 
   return (
     <>
       <Flash ok={param(sp.ok)} error={param(sp.error)} saved={param(sp.saved)} />
+      {briefState ? (
+        <div className={`alert ${briefState === "failed" || briefState === "blocked" || briefState === "bounced" ? "alert-error" : briefState === "accepted_by_gmail" || briefState === "sent_folder_observed" || briefState === "delivery_confirmed" ? "alert-info" : "alert-warn"} mb-3`}>
+          <strong>Executive brief state: {briefState.replace(/_/g, " ")}.</strong>
+          {briefDetail ? <div className="mt-1">{briefDetail}</div> : null}
+        </div>
+      ) : null}
       <PageHead title="Email & reports" sub="Gmail OAuth configuration and notification delivery. No account password is ever requested or stored." />
 
       <div className="split">
@@ -121,10 +133,72 @@ export default async function AdminEmailPage({
           </div>
           <div className="card-body">
             <div className="card-quiet p-3 mb-3 text-[11.5px] leading-relaxed">
+              <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <strong>Latest executive brief delivery</strong>
+                <span className={`badge ${briefDelivery.state === "delivery_confirmed" || briefDelivery.state === "sent_folder_observed" ? "badge-good" : briefDelivery.state === "accepted_by_gmail" ? "badge-info" : briefDelivery.state === "failed" || briefDelivery.state === "blocked" || briefDelivery.state === "bounced" ? "badge-warn" : "badge-info"}`}>{briefDelivery.state.replace(/_/g, " ")}</span>
+              </div>
+              <div>{briefDelivery.message}</div>
+              <div className="mt-2"><strong>Report:</strong> {briefDelivery.reportId} · <strong>Outbox:</strong> {briefDelivery.outboxId ?? "not created"} · <strong>Notification:</strong> {briefDelivery.notificationId ?? "none"}</div>
+              <div><strong>Recipient:</strong> {briefDelivery.recipient ?? "not configured"} · <strong>Sender:</strong> {briefDelivery.sender ?? "not configured"}</div>
+              <div><strong>Subject:</strong> {briefDelivery.subject ?? "not generated"}</div>
+              <div><strong>Gmail message:</strong> {briefDelivery.messageId ?? "none"} · <strong>Thread:</strong> {briefDelivery.threadId ?? "none"} · <strong>RFC Message-ID:</strong> {briefDelivery.rfcMessageId ?? "none"}</div>
+              <div><strong>Last attempt:</strong> {briefDelivery.startedAt ? formatDateTime(briefDelivery.startedAt) : "none"} · <strong>Attempts:</strong> {briefDelivery.attempts} · <strong>Resends:</strong> {briefDelivery.resendCount}</div>
+              <div><strong>Next retry:</strong> {briefDelivery.nextRetryAt ? formatDateTime(briefDelivery.nextRetryAt) : "none"} · <strong>Last error:</strong> {briefDelivery.lastError ?? "none"}</div>
+              <div><strong>Sent-folder check:</strong> {briefDelivery.sentObservedAt ? `${formatDateTime(briefDelivery.sentObservedAt)} — ${briefDelivery.sentVerification ?? "observed"}` : briefDelivery.sentVerification ?? "not observed"}</div>
+              <div><strong>Delivery evidence:</strong> {briefDelivery.deliveryEvidence ?? "none"}</div>
+              <div><strong>Bounce evidence:</strong> {briefDelivery.bounceInfo ?? "none"}</div>
+              <div><strong>Gmail API response:</strong> {briefDelivery.appResponse ?? "none"}</div>
+              <div className="flex flex-wrap gap-2 mt-3">
+                <form action={sendExecutiveBriefNowAction}>
+                  <input type="hidden" name="mode" value="send" />
+                  <SubmitButton className="btn btn-primary" pendingLabel="Sending now…">Send now</SubmitButton>
+                </form>
+                {briefDelivery.canResend ? (
+                  <form action={sendExecutiveBriefNowAction}>
+                    <input type="hidden" name="mode" value="resend" />
+                    <SubmitButton className="btn" confirm="Resend only because the previous attempt definitively failed, was blocked, or bounced?" pendingLabel="Resending…">Resend last report</SubmitButton>
+                  </form>
+                ) : null}
+                {briefDelivery.messageId && briefDelivery.state !== "delivery_confirmed" && briefDelivery.state !== "bounced" ? (
+                  <form action={refreshExecutiveBriefDeliveryAction}>
+                    <SubmitButton className="btn" pendingLabel="Checking Sent…">Check Gmail Sent folder</SubmitButton>
+                  </form>
+                ) : null}
+              </div>
+              <div className="mt-2" style={{ color: "var(--muted)" }}>Send Now generates the current report and processes only its outbox row immediately. It does not wait for 17:00. Duplicate prevention stays active; Resend is offered only after a definitive failure, block or bounce.</div>
+            </div>
+            <div className="card-quiet p-3 mb-3 text-[11.5px] leading-relaxed">
+              <strong>Daily executive brief:</strong> {briefSchedule.enabled ? "enabled" : "disabled"} · {briefSchedule.time} {briefSchedule.timezone} · next {briefSchedule.next_run_at ? formatDateTime(briefSchedule.next_run_at) : "not scheduled"} · last status {briefSchedule.last_status ?? "not run"}.
+              {briefSchedule.last_error ? <div className="mt-1"><strong>Last brief error:</strong> {briefSchedule.last_error}</div> : null}
+              <div className="mt-1">The Coordinator is the only sender of the consolidated owner report. Routine successful applications stay in-app; blocked exceptions remain visible in the brief.</div>
+            </div>
+            <div className="card-quiet p-3 mb-3 text-[11.5px] leading-relaxed">
               <strong>Delivery outbox:</strong> {outbox.counts.pending} pending · {outbox.counts.retry_scheduled} retry scheduled · {outbox.counts.sending} sending · {outbox.counts.sent} accepted by Gmail · {outbox.counts.failed} failed.
               {outbox.lastError?.last_error ? <div className="mt-1"><strong>Last delivery error:</strong> {outbox.lastError.last_error}</div> : null}
               {outbox.lastAccepted ? <div className="mt-1"><strong>Last accepted:</strong> {outbox.lastAccepted.kind ?? "email"} · message {outbox.lastAccepted.provider_message_id ?? "none"} · {outbox.lastAccepted.finished_at ? formatDateTime(outbox.lastAccepted.finished_at) : "unknown"}</div> : null}
             </div>
+            {briefHistory.length > 0 ? (
+              <div className="mb-3">
+                <div className="label">Recent executive briefs</div>
+                <div className="feed">
+                  {briefHistory.map((brief) => (
+                    <div key={brief.id} className="feed-item">
+                      <span className="feed-dot">·</span>
+                      <div>
+                        <div className="feed-text">{brief.subject}</div>
+                        <div className="feed-time">
+                          {brief.created_at ? formatDateTime(brief.created_at) : "unknown"} · delivery {brief.delivery_state}
+                          {brief.attempts !== null ? ` · attempts ${brief.attempts}` : ""}
+                          {brief.provider_message_id ? ` · message ${brief.provider_message_id}` : ""}
+                          {brief.sent_observed_at ? ` · Sent observed ${formatDateTime(brief.sent_observed_at)}` : ""}
+                          {brief.last_error ? ` · ${brief.last_error}` : ""}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
             {notifications.length === 0 ? (
               <div className="empty">No notifications yet.</div>
             ) : (

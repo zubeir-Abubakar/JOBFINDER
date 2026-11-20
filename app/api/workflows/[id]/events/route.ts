@@ -1,6 +1,6 @@
 import { currentUser } from "@/lib/auth";
 import { listWorkflowEvents, subscribeWorkflowEvents, type WorkflowEvent } from "@/lib/events";
-import { workflowSnapshot } from "@/lib/workflow-view";
+import { workflowSnapshotForUser } from "@/lib/workflow-view";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -15,7 +15,7 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   const user = await currentUser();
   if (!user) return new Response("Unauthorised", { status: 401 });
   const { id } = await context.params;
-  if (!workflowSnapshot(id).workflow) return new Response("Not found", { status: 404 });
+  if (!workflowSnapshotForUser(user, id)?.workflow) return new Response("Not found", { status: 404 });
 
   const url = new URL(request.url);
   const after = Number(url.searchParams.get("after") ?? 0) || 0;

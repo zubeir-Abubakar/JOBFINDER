@@ -1,6 +1,7 @@
-const CACHE = "atw-shell-v1";
+const CACHE = "atw-shell-v6";
 const SHELL = [
   "/offline",
+  "/manifest.webmanifest",
   "/logo.svg",
   "/logo-mark.svg",
   "/icons/icon-192.png",
@@ -12,7 +13,10 @@ const SHELL = [
 self.addEventListener("install", (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(CACHE);
-    await cache.addAll(SHELL);
+    // One missing shell asset must not abort the entire service-worker install.
+    // Chrome treats a failed install as "not installable", so cache each item
+    // independently and keep the worker usable even if an optional asset 404s.
+    await Promise.allSettled(SHELL.map((asset) => cache.add(asset)));
     try {
       const response = await fetch("/offline", { cache: "reload" });
       if (response.ok) {
@@ -60,6 +64,22 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // The manifest must be network-first. A cache-first manifest can remain
+  // stale after a rename/icon/start_url change and make Chrome reject an
+  // otherwise valid installation.
+  if (url.pathname === "/manifest.webmanifest") {
+    event.respondWith(
+      fetch(request).then((response) => {
+        if (response.ok) {
+          const copy = response.clone();
+          void caches.open(CACHE).then((cache) => cache.put(request, copy));
+        }
+        return response;
+      }).catch(() => caches.match(request)),
+    );
+    return;
+  }
+
   if (request.mode === "navigate") {
     event.respondWith(fetch(request).catch(() => caches.match("/offline")));
     return;
@@ -74,17 +94,23 @@ self.addEventListener("fetch", (event) => {
     url.pathname === "/pdf.worker.min.mjs";
 
   if (staticAsset) {
-    event.respondWith(
-      caches.match(request).then((cached) => {
+    // Network-first for JavaScript chunks. Cache-first can keep an old
+    // Turbopack/Next chunk after a server restart, leaving the page hydrated by
+    // mismatched code. A hashed production asset is still cached for offline
+    // use, but the network remains authoritative while it is available.
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE);
+      try {
+        const response = await fetch(request);
+        if (response.ok && response.type === "basic") {
+          await cache.put(request, response.clone());
+        }
+        return response;
+      } catch (error) {
+        const cached = await cache.match(request);
         if (cached) return cached;
-        return fetch(request).then((response) => {
-          if (response.ok) {
-            const copy = response.clone();
-            void caches.open(CACHE).then((cache) => cache.put(request, copy));
-          }
-          return response;
-        });
-      }),
-    );
+        throw error;
+      }
+    })());
   }
 });

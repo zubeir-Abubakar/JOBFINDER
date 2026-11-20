@@ -15,7 +15,7 @@ import {
 import { assessEligibility, type EligibilityAssessment } from "./eligibility";
 import { discoverJobSources, sourceHealth, type DiscoveryResult, type SourceMetrics } from "./recruitment-discovery";
 import { evaluateReadiness, type ReadinessItem } from "./application-readiness";
-import { submitApplication, existingVerifiedSubmission, type SubmissionInput, type SubmissionOutcome } from "./submission";
+import { submitApplication, existingVerifiedSubmission, recoverStaleSubmissionClaims, type SubmissionInput, type SubmissionOutcome } from "./submission";
 import { QUALIFYING_MATCH_SCORE, effectiveMinMatchScore, qualifiesForAutoApply, autoApplyBlockers, type JobAnalysis } from "./scoring";
 import { getSetting } from "./settings";
 import { getProfileData } from "./profile";
@@ -28,9 +28,13 @@ import {
 import { notify } from "./notify";
 import { enqueueDocumentRecovery } from "./recruitment-recovery";
 import { audit } from "./audit";
-import { localDateKey, nextDailyRun, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, formatInZone } from "./recruitment-schedule";
+import { catchUpWindowHours, localDateKey, nextDailyRun, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, formatInZone } from "./recruitment-schedule";
+import { acquireRuntimeLock, refreshRuntimeLock, releaseRuntimeLock, runtimeLockActive } from "./runtime-state";
 import { recordApplicationEvent } from "./application-events";
 import { generateText, providerConfigured, scrubProviderError } from "./providers";
+import { buildExecutionManifest } from "./execution-manifest";
+import { verifyAndPersistVacancy, type VacancyVerification } from "./vacancy-verification";
+import { agentIdentity } from "./agent-identity";
 
 /**
  * Chief Coordinator for the autonomous daily recruitment run.
@@ -57,6 +61,7 @@ export const RUN_STATES = [
   "completed",
   "completed_with_warnings",
   "failed",
+  "interrupted",
 ] as const;
 
 export type RunState = (typeof RUN_STATES)[number];
@@ -73,8 +78,15 @@ export type RunRow = {
   started_at: string | null;
   finished_at: string | null;
   jobs_discovered: number;
+  jobs_duplicates: number;
+  jobs_filtered: number;
   jobs_eligible: number;
   jobs_qualified: number;
+  sources_checked: number;
+  sources_succeeded: number;
+  sources_failed: number;
+  sources_partial: number;
+  discovery_state: string | null;
   packages_prepared: number;
   applications_submitted: number;
   applications_unverified: number;
@@ -82,6 +94,8 @@ export type RunRow = {
   applications_simulated: number;
   failures: number;
   warnings: number;
+  warnings_json?: string | null;
+  failures_json?: string | null;
   report: string | null;
   source_metrics: string | null;
   mode: string | null;
@@ -99,7 +113,7 @@ export function qualifyingThreshold(): number {
 
 export function activeRun(): RunRow | null {
   return one<RunRow>(
-    "SELECT * FROM recruitment_runs WHERE status NOT IN ('completed','completed_with_warnings','failed') ORDER BY created_at DESC LIMIT 1",
+    "SELECT * FROM recruitment_runs WHERE status NOT IN ('completed','completed_with_warnings','failed','interrupted') ORDER BY created_at DESC LIMIT 1",
   );
 }
 
@@ -118,6 +132,58 @@ export function runStateHistory(run: RunRow): Array<{ state: string; at: string;
   } catch {
     return [];
   }
+}
+
+/**
+ * A restart or crashed worker must not leave a run permanently "running".
+ * A scheduled run that is still inside the catch-up window is safe to resume;
+ * a run that had already started is marked interrupted rather than blindly
+ * replayed. Phase 3's submission claim and duplicate evidence remain the final
+ * guards against a second send.
+ */
+export function recoverInterruptedRecruitmentRuns(now: Date = new Date()): {
+  resumed: string[];
+  interrupted: string[];
+} {
+  const rows = all<RunRow>(
+    "SELECT * FROM recruitment_runs WHERE status NOT IN ('completed','completed_with_warnings','failed','interrupted') ORDER BY created_at",
+  );
+  const resumed: string[] = [];
+  const interrupted: string[] = [];
+  for (const runRow of rows) {
+    const lockKey = `recruitment:run:${runRow.id}`;
+    if (runtimeLockActive(lockKey, now)) continue;
+    const scheduled = Date.parse(runRow.scheduled_for ?? runRow.created_at);
+    const withinCatchup =
+      Number.isFinite(scheduled) && now.getTime() - scheduled <= catchUpWindowHours() * 3600_000;
+    if (runRow.status === "scheduled" && withinCatchup) {
+      resumed.push(runRow.id);
+      continue;
+    }
+    const message = `Run was ${runRow.status} without an active worker lease after a restart. It was marked interrupted; completed work was preserved and no submission was retried blindly.`;
+    const history = [
+      ...runStateHistory(runRow),
+      { state: "interrupted", at: now.toISOString(), message },
+    ];
+    run(
+      "UPDATE recruitment_runs SET status = 'interrupted', state_history = ?, error = ?, finished_at = ? WHERE id = ? AND status = ?",
+      [JSON.stringify(history).slice(0, 20000), message, now.toISOString(), runRow.id, runRow.status],
+    );
+    closeOpenAssignments(runRow.id, "failed", message, runRow.workflow_id);
+    if (runRow.workflow_id) finishWorkflow(runRow.workflow_id, "failed", message);
+    if (runRow.trigger !== "manual") {
+      recordScheduleRun({ runId: runRow.id, status: "interrupted", error: message, now });
+    }
+    notify({
+      kind: "scheduler_failure",
+      dedupeKey: `run_interrupted:${runRow.id}`,
+      subject: "Recruitment run interrupted",
+      body: message,
+    });
+    audit({ action: "recruitment.run_interrupted", entity: "recruitment_run", entityId: runRow.id, detail: message });
+    interrupted.push(runRow.id);
+  }
+  return { resumed, interrupted };
 }
 
 function pushState(runId: string, state: RunState, message?: string): void {
@@ -196,6 +262,42 @@ function logAgent(input: {
 }
 
 /** Close assignments left non-terminal by an interrupted or advisory-only stage. */
+/**
+ * Persist an explicit skipped assignment for a specialist that was never
+ * required. Without this, an absent row and a crashed agent both look like
+ * silence; the manifest must be able to distinguish the two.
+ */
+function recordSkippedAgent(input: {
+  runId: string;
+  workflowId: string | null;
+  agentKey: string;
+  assignment: string;
+  reason: string;
+}): void {
+  const existing = one<{ id: number }>(
+    "SELECT id FROM recruitment_run_agents WHERE run_id = ? AND agent_key = ? LIMIT 1",
+    [input.runId, input.agentKey],
+  );
+  if (existing) return;
+  if (input.workflowId) {
+    const task = one<{ id: string }>(
+      "SELECT id FROM tasks WHERE workflow_id = ? AND agent_key = ? LIMIT 1",
+      [input.workflowId, input.agentKey],
+    );
+    if (task) return;
+  }
+  logAgent({
+    runId: input.runId,
+    agentKey: input.agentKey,
+    assignment: input.assignment,
+    status: "skipped",
+    output: input.reason,
+    decision: input.reason,
+    finishedAt: nowIso(),
+  });
+}
+
+/** Close assignments left non-terminal by an interrupted or advisory-only stage. */
 function closeOpenAssignments(runId: string, status: "completed" | "failed", note: string, workflowId: string | null = null): void {
   const at = nowIso();
   run(
@@ -236,7 +338,7 @@ function safeFail(taskId: string | null, agentKey: string, error: string): void 
 }
 
 const COORDINATOR_SYSTEM =
-  "You are the Chief Coordinator of an autonomous recruitment team. Reason only from the evidence supplied. " +
+  `You are ${agentIdentity("coordinator").name}, the ${agentIdentity("coordinator").title} of an autonomous recruitment team. Reason only from the evidence supplied. ` +
   "You may never change a match score, an eligibility result or the 85% threshold, invent candidate experience " +
   "or claim contact with an employer. Deterministic rules retain decision authority; your output is an advisory " +
   "assessment recorded on the run.";
@@ -336,11 +438,13 @@ type JobRowLite = {
   qualified: number;
   source: string | null;
   external_id: string | null;
+  company_domain: string | null;
+  expiry_at: string | null;
 };
 
 function jobLite(id: string): JobRowLite | null {
   return one<JobRowLite>(     `SELECT id, title, company, location, remote, url, application_url, description, employment_type, published_at,
-            match_score, analysis, eligibility, eligibility_notes, run_id, qualified, source, external_id
+            match_score, analysis, eligibility, eligibility_notes, run_id, qualified, source, external_id, company_domain, expiry_at
      FROM jobs WHERE id = ?`,
     [id],
   );
@@ -437,7 +541,7 @@ export async function startDailyRun(input: {
 
 /* ------------------------------ submission QA ----------------------------- */
 
-export type Readiness = { ready: boolean; reasons: string[]; items?: ReadinessItem[] };
+export type Readiness = { ready: boolean; state: string; reasons: string[]; items?: ReadinessItem[] };
 
 type ApplicationRowLite = {
   id: string;
@@ -477,22 +581,20 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
     "SELECT id, job_id, status, cv_document_id, cover_letter_id, submitted_at, confirmation FROM applications WHERE id = ?",
     [applicationId],
   );
-  if (!app) return { ready: false, reasons: ["The application record does not exist."] };
+  if (!app) return { ready: false, state: "blocked", reasons: ["The application record does not exist."] };
   if (app.submitted_at || ["submitted", "acknowledged", "interview_invited"].includes(app.status)) {
-    return { ready: false, reasons: ["The application is already recorded as submitted."] };
+    return { ready: false, state: "blocked", reasons: ["The application is already recorded as submitted."] };
   }
-  if (existingVerifiedSubmission(app.job_id)) {
-    return { ready: false, reasons: ["A verified submission already exists for this vacancy."] };
-  }
+  const duplicate = Boolean(existingVerifiedSubmission(app.job_id));
   const job = jobLite(app.job_id);
-  if (!job) return { ready: false, reasons: ["The linked vacancy does not exist."] };
+  if (!job) return { ready: false, state: "blocked", reasons: ["The linked vacancy does not exist."] };
 
   const profile = getProfileData();
   const sourceText = verifiedEvidenceText(profile);
   const documentFor = (id: string | null) => {
     if (!id) return null;
-    const row = one<{ text_content: string | null; quality_status: string | null; relative_path: string }>(
-      "SELECT text_content, quality_status, relative_path FROM documents WHERE id = ? AND deleted_at IS NULL",
+    const row = one<{ text_content: string | null; quality_status: string | null; quality_score: number | null; relative_path: string }>(
+      "SELECT text_content, quality_status, quality_score, relative_path FROM documents WHERE id = ? AND deleted_at IS NULL",
       [id],
     );
     if (!row) return null;
@@ -500,9 +602,12 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
       id,
       text: row.text_content,
       qualityStatus: row.quality_status,
+      qualityScore: row.quality_score,
       fileExists: existsSync(path.join(UPLOAD_DIR, path.basename(row.relative_path))),
     };
   };
+
+  const policy = getRecruitmentPolicy();
 
   const result = evaluateReadiness({
     job: {
@@ -523,6 +628,7 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
       fullName: profile.profile.full_name,
       email: profile.profile.email,
       phone: profile.profile.phone,
+      workAuthorisation: profile.profile.work_authorisation,
       skills: profile.skills.map((skill) => skill.name),
       certifications: profile.items.filter((item) => /cert/i.test(item.kind)).map((item) => item.title),
       languages: profile.languageEntries.map((entry) => `${entry.name} ${entry.level}`),
@@ -531,6 +637,15 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
     cv: documentFor(app.cv_document_id),
     cover: documentFor(app.cover_letter_id),
     threshold: qualifyingThreshold(),
+    duplicateApplication: duplicate,
+    submissionPolicy: {
+      active: policy.active,
+      autonomousSubmission: policy.autonomousSubmission,
+      approvalRequired: policy.requirePerApplicationApproval,
+      // The rolling daily cap is enforced immediately before each submission;
+      // readiness records document/policy eligibility, not the hour of sending.
+      dailyRemaining: null,
+    },
     now: new Date(),
   });
 
@@ -539,7 +654,7 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
     result.checkedAt,
     applicationId,
   ]);
-  return { ready: result.ready, reasons: result.reasons, items: result.items };
+  return { ready: result.ready, state: result.state, reasons: result.reasons, items: result.items };
 }
 
 /**
@@ -574,6 +689,8 @@ export type RunDeps = {
   prepare?: (jobId: string, workflowId: string) => Promise<PackageOutcome>;
   submit?: (input: SubmissionInput) => Promise<SubmissionOutcome>;
   analyse?: (jobId: string) => JobAnalysis | null;
+  /** Test fixtures may inject a local-page verifier; production uses the real fetch gate. */
+  verifyVacancy?: (jobId: string) => Promise<VacancyVerification>;
   now?: Date;
 };
 
@@ -594,7 +711,9 @@ export type RunOutcome = {
 };
 
 function updateCounts(runId: string, counts: Partial<Record<
-  "jobs_discovered" | "jobs_eligible" | "jobs_qualified" | "packages_prepared" | "applications_submitted" |
+  "jobs_discovered" | "jobs_duplicates" | "jobs_filtered" | "jobs_eligible" | "jobs_qualified" |
+  "sources_checked" | "sources_succeeded" | "sources_failed" | "sources_partial" |
+  "packages_prepared" | "applications_submitted" |
   "applications_unverified" | "applications_intervention" | "applications_simulated" | "failures" | "warnings", number>>): void {
   const keys = Object.keys(counts) as Array<keyof typeof counts>;
   if (keys.length === 0) return;
@@ -636,13 +755,37 @@ export async function executeRun(
   if (memoryRunning && memoryRunning !== runId) {
     throw new Error("Another recruitment run is already executing.");
   }
+  const runLockKey = `recruitment:run:${runId}`;
+  if (!acquireRuntimeLock(runLockKey, 300_000, undefined, { runId })) {
+    return {
+      runId,
+      status: runRow.status,
+      discovered: runRow.jobs_discovered,
+      eligible: runRow.jobs_eligible,
+      qualified: runRow.jobs_qualified,
+      prepared: runRow.packages_prepared,
+      submitted: runRow.applications_submitted,
+      unverified: runRow.applications_unverified,
+      intervention: runRow.applications_intervention,
+      simulated: runRow.applications_simulated,
+      warnings: ["Another application instance holds the active run lease; this process did not execute the run."],
+      failures: [],
+      report: runRow.report ?? buildRunReport(runId),
+    };
+  }
+  const runLease = setInterval(() => refreshRuntimeLock(runLockKey, 300_000), 60_000);
+  runLease.unref?.();
   memoryRunning = runId;
 
   const discoveryOnly = options.discoveryOnly === true || runRow.mode === "discovery";
   const deps = options.deps ?? {};
   const now = deps.now ?? options.deps?.now ?? new Date();
+  // Recover abandoned `submitting` leases before this run reads any readiness or
+  // duplicate state. The recovered outcome is unverified, never successful.
+  recoverStaleSubmissionClaims(now);
   const warnings: string[] = [];
   const failures: string[] = [];
+  let allSourcesFailed = false;
   const userId = ownerUserId(options.userId);
   const pages = Math.min(5, Math.max(1, options.pageBudget ?? 2));
   const policy = getRecruitmentPolicy();
@@ -653,7 +796,7 @@ export async function executeRun(
     Math.max(1, options.maxApplications ?? policy.maxSubmissionsPerDay),
   );
   const threshold = qualifyingThreshold();
-  const dryRun = getSetting<boolean>("recruitment_dry_run", false) || process.env.RECRUITMENT_DRY_RUN === "true";
+  const dryRun = getSetting<boolean>("recruitment_dry_run", true) || process.env.RECRUITMENT_DRY_RUN === "true";
   const submissionEnabled =
     getSetting<boolean>("recruitment_submission_enabled", true) && process.env.RECRUITMENT_SUBMISSION_ENABLED !== "false";
   const submissionAllowed =
@@ -674,9 +817,9 @@ export async function executeRun(
   let runStatus: RunState = "failed";
 
   try {
-    pushState(runId, "starting", "The Chief Coordinator created the daily recruitment run.");
+    pushState(runId, "starting", `${agentIdentity("coordinator").name} created the daily recruitment run.`);
     run("UPDATE recruitment_runs SET started_at = ? WHERE id = ?", [now.toISOString(), runId]);
-    workflowId = createWorkflow("autonomous_recruitment", `Daily autonomous recruitment · ${runRow.run_key}`);
+    workflowId = createWorkflow("autonomous_recruitment", `Daily autonomous recruitment · ${runRow.run_key}`, userId);
     run("UPDATE recruitment_runs SET workflow_id = ? WHERE id = ?", [workflowId, runId]);
 
     const plan = attemptTask("coordinator", workflowId, "Create the daily recruitment run", "Assign discovery, eligibility, scoring, documents, quality and submission");
@@ -695,6 +838,7 @@ export async function executeRun(
         : await discoverJobSources({ runId, pages });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Discovery failed.";
+      allSourcesFailed = true;
       failures.push(`Discovery: ${message}`);
       logAgent({ runId, agentKey: "research", assignment: "Discover vacancies", status: "failed", error: message, finishedAt: nowIso() });
       safeFail(researchTask.taskId, "research", message);
@@ -727,13 +871,45 @@ export async function executeRun(
       "research",
       `${discovery.inserted} new vacancies; ${discovery.duplicates} duplicate listing(s) blocked; ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
     );
-    updateCounts(runId, { jobs_discovered: discovery.inserted, warnings: warnings.length });
+    const checkedSources = discovery.sources.filter((source) => (source.requests ?? 0) > 0);
+    const succeededSources = checkedSources.filter((source) => (source.responses ?? 0) > 0);
+    const failedSources = checkedSources.filter((source) => (source.responses ?? 0) === 0);
+    const partialSources = succeededSources.filter((source) => Boolean(source.error));
+    allSourcesFailed = discovery.allSourcesFailed ?? (checkedSources.length > 0 && succeededSources.length === 0);
+    const discoveryState =
+      discovery.discoveryState ??
+      (checkedSources.length === 0
+        ? "not_configured"
+        : succeededSources.length === 0
+          ? "failed"
+          : partialSources.length > 0 || failedSources.length > 0
+            ? "partial"
+            : discovery.inserted === 0
+              ? "empty"
+              : "ok");
+    if (allSourcesFailed) {
+      const message = `All ${checkedSources.length} configured job source(s) failed; discovery is not reported as successful.`;
+      if (!failures.includes(message)) failures.push(message);
+      if (!warnings.some((warning) => /All .* configured source\(s\) failed/i.test(warning))) warnings.push(message);
+    }
+    run("UPDATE recruitment_runs SET discovery_state = ? WHERE id = ?", [discoveryState, runId]);
+    updateCounts(runId, {
+      jobs_discovered: discovery.inserted,
+      jobs_duplicates: discovery.duplicates,
+      jobs_filtered: discovery.filtered,
+      sources_checked: checkedSources.length,
+      sources_succeeded: succeededSources.length,
+      sources_failed: failedSources.length,
+      sources_partial: partialSources.length,
+      warnings: warnings.length,
+    });
     notify({
       userId,
       kind: "job_discovery_completed",
       dedupeKey: `discovery:${runId}`,
       subject: `Job discovery completed: ${discovery.inserted} new`,
       body: `${discovery.inserted} new vacancy(ies) stored, ${discovery.duplicates} duplicate listing(s) blocked, ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
+      email: false,
     });
 
     /* 2. Eligibility and scoring */
@@ -742,7 +918,10 @@ export async function executeRun(
     logAgent({ runId, agentKey: "analysis", assignment: "Assess eligibility and score every discovered vacancy", status: "running" });
     let eligibleCount = 0;
     const qualifiedJobs: Array<{ id: string; score: number }> = [];
-    for (const jobId of discovery.jobIds) {
+    // A source may repeat an id across queries; the same vacancy is assessed and
+    // prepared only once in this run.
+    const discoveredJobIds = [...new Set(discovery.jobIds)];
+    for (const jobId of discoveredJobIds) {
       const job = jobLite(jobId);
       if (!job) continue;
       const eligibility = assessEligibility(
@@ -812,6 +991,7 @@ export async function executeRun(
         dedupeKey: `strong_match:${runId}`,
         subject: `${strongMatches.length} strong match${strongMatches.length === 1 ? "" : "es"} discovered`,
         body: strongMatches.map((job) => `${job.title} at ${job.company} — ${job.match_score}%`).join("\n"),
+        email: false,
       });
     }
     logAgent({
@@ -819,13 +999,13 @@ export async function executeRun(
       agentKey: "analysis",
       assignment: "Assess eligibility and score every discovered vacancy",
       status: "completed",
-      output: `${discovery.jobIds.length} vacancies assessed; ${eligibleCount} eligible; ${qualifiedJobs.length} at or above ${threshold}%.`,
+      output: `${discoveredJobIds.length} vacancies assessed; ${eligibleCount} eligible; ${qualifiedJobs.length} at or above ${threshold}%.`,
       finishedAt: nowIso(),
     });
     safeComplete(
       analysisTask.taskId,
       "analysis",
-      `${discovery.jobIds.length} vacancies assessed with stored evidence. ${eligibleCount} eligible, ${qualifiedJobs.length} scored ${threshold}% or higher.`,
+      `${discoveredJobIds.length} vacancies assessed with stored evidence. ${eligibleCount} eligible, ${qualifiedJobs.length} scored ${threshold}% or higher.`,
     );
     updateCounts(runId, { jobs_eligible: eligibleCount, jobs_qualified: qualifiedJobs.length });
 
@@ -854,6 +1034,9 @@ export async function executeRun(
         errors: source.error ? 1 : 0,
         eligible: 0,
         qualified: 0,
+        attempts: source.attempts,
+        durationMs: source.durationMs,
+        status: source.status,
       });
     }
     const assessed = all<{ source: string; eligibility: string | null; qualified: number }>(
@@ -869,7 +1052,7 @@ export async function executeRun(
     run("UPDATE recruitment_runs SET source_metrics = ? WHERE id = ?", [JSON.stringify([...metricsByKey.values()]), runId]);
 
     /* 2b. AI match evaluation — advisory only, scores are never changed. */
-    pushState(runId, "analysing", "The analysis agent is reviewing the highest-scoring vacancies with the configured model.");
+    pushState(runId, "analysing", "Ali is reviewing the highest-scoring vacancies with the configured model.");
     const aiEvaluations: Array<{
       jobId: string;
       note: string | null;
@@ -891,7 +1074,7 @@ export async function executeRun(
         "AI match evaluation was skipped because no AI provider is configured. Deterministic eligibility and scoring remain authoritative.",
       );
     } else {
-      for (const jobId of discovery.jobIds.slice(0, 5)) {
+      for (const jobId of discoveredJobIds.slice(0, 5)) {
         const job = jobLite(jobId);
         if (!job) continue;
         const analysis = parseAnalysis(job.analysis);
@@ -901,7 +1084,7 @@ export async function executeRun(
           workflowId,
           taskId: analysisTask.taskId,
           system:
-            "You are the Job Analysis Agent of an autonomous recruitment team. Judge only the supplied evidence. " +
+            "You are Ali, the Job Analysis Agent. Judge only the supplied evidence. " +
             "Never change a score, never invent experience and never claim that an employer was contacted.",
           prompt: [
             `Vacancy: ${job.title} at ${job.company}${job.location ? ` (${job.location})` : ""}.`,
@@ -940,7 +1123,7 @@ export async function executeRun(
 
     /* 2c. Coordinator decision — advisory only. */
     if (providerConfigured()) {
-      const vacancyLines = discovery.jobIds
+      const vacancyLines = discoveredJobIds
         .slice(0, 5)
         .map((jobId) => {
           const job = jobLite(jobId);
@@ -1017,6 +1200,21 @@ export async function executeRun(
       for (const item of selected) {
         const job = jobLite(item.id);
         if (!job) continue;
+        const vacancyCheck = await verifyVacancyForRun(item.id, deps, deps.now ?? now);
+        if (!vacancyCheck || vacancyCheck.status !== "open") {
+          const reason = vacancyCheck?.reason ?? "The vacancy could not be found for final verification.";
+          warnings.push(`Final vacancy verification blocked ${job.title} at ${job.company}: ${reason}`);
+          logAgent({
+            runId,
+            agentKey: "ats",
+            assignment: `Final vacancy verification for ${job.title}`,
+            status: "failed",
+            error: reason,
+            decision: "No documents were generated and no application will be submitted until the live vacancy is verified.",
+            finishedAt: nowIso(),
+          });
+          continue;
+        }
         const preflight = generationPreflight(item.id);
         if (!preflight.ok) {
           warnings.push(`Package skipped for ${job.title} at ${job.company}: ${preflight.reasons.join(" ")}`);
@@ -1042,7 +1240,8 @@ export async function executeRun(
             lastError = error instanceof Error ? error.message : "Document generation failed.";
           }
           if (pkg?.ok) {
-            logAgent({ runId, agentKey: "cv", assignment: `Create and tailor documents for ${job.title}`, status: "completed", attempt, output: "Tailored CV and cover letter stored with quality records.", startedAt: started, finishedAt: nowIso() });
+            logAgent({ runId, agentKey: "cv", assignment: `Create tailored CV for ${job.title}`, status: "completed", attempt, output: `Tailored CV stored${pkg.cvDocumentId ? ` (${pkg.cvDocumentId})` : ""} with its quality record.`, startedAt: started, finishedAt: nowIso() });
+            logAgent({ runId, agentKey: "cover", assignment: `Create tailored cover letter for ${job.title}`, status: "completed", attempt, output: `Tailored cover letter stored${pkg.coverDocumentId ? ` (${pkg.coverDocumentId})` : ""} with its quality record.`, startedAt: started, finishedAt: nowIso() });
           } else if (attempt < 2) {
             logAgent({ runId, agentKey: "cv", assignment: `Create and tailor documents for ${job.title}`, status: "retried", attempt, error: lastError, startedAt: started, finishedAt: nowIso(), decision: "Coordinator retried once with the same verified facts." });
           } else {
@@ -1089,8 +1288,39 @@ export async function executeRun(
       const readiness = assessSubmissionReadiness(app.id);
       if (readiness.ready) {
         run("UPDATE applications SET status = 'ready_to_submit', last_update = ? WHERE id = ?", [nowIso(), app.id]);
-        logAgent({ runId, agentKey: "ats", assignment: `Quality check ${job.title}`, status: "completed", output: "All mandatory fields, documents, eligibility and duplicate checks passed.", finishedAt: nowIso() });
+        logAgent({ runId, agentKey: "ats", assignment: `Quality check ${job.title}`, status: "completed", output: "All mandatory fields, documents, quality evidence, eligibility and duplicate checks passed.", finishedAt: nowIso() });
         ready.push({ applicationId: app.id, jobId: item.id, job });
+      } else if (readiness.state === "quality_review_required") {
+        run("UPDATE applications SET status = 'quality_review_required', last_update = ? WHERE id = ?", [nowIso(), app.id]);
+        recordApplicationEvent({ applicationId: app.id, type: "quality.review", message: readiness.reasons.join(" ") });
+        logAgent({
+          runId,
+          agentKey: "ats",
+          assignment: `Quality check ${job.title}`,
+          status: "completed",
+          output: `Quality review required: ${readiness.reasons.join(" ")}`,
+          decision: "Coordinator withheld submission and queued the package for evidence-based quality review.",
+          finishedAt: nowIso(),
+        });
+        warnings.push(`Quality review required for ${job.title} at ${job.company}: ${readiness.reasons[0]}`);
+        notify({
+          kind: "ats_blocked",
+          dedupeKey: `quality_review:${runId}:${item.id}`,
+          subject: `Document quality review required: ${job.title}`,
+          body: `${job.company} was not submitted because a quality gate returned a warning: ${readiness.reasons.slice(0, 3).join(" ")}`,
+        });
+      } else if (readiness.state === "documents_ready") {
+        run("UPDATE applications SET status = 'awaiting_approval', last_update = ? WHERE id = ?", [nowIso(), app.id]);
+        recordApplicationEvent({ applicationId: app.id, type: "quality.ready", message: readiness.reasons.join(" ") });
+        logAgent({
+          runId,
+          agentKey: "ats",
+          assignment: `Quality check ${job.title}`,
+          status: "completed",
+          output: `Documents are ready; submission policy/approval remains: ${readiness.reasons.join(" ")}`,
+          decision: "Coordinator left the package awaiting approval rather than treating document existence as submission readiness.",
+          finishedAt: nowIso(),
+        });
       } else {
         run("UPDATE applications SET status = 'human_intervention_required', last_update = ? WHERE id = ?", [nowIso(), app.id]);
         recordApplicationEvent({ applicationId: app.id, type: "quality.blocked", message: readiness.reasons.join(" ") });
@@ -1136,6 +1366,16 @@ export async function executeRun(
           );
           break;
         }
+        const finalVacancyCheck = await verifyVacancyForRun(item.jobId, deps, deps.now ?? now);
+        if (!finalVacancyCheck || finalVacancyCheck.status !== "open") {
+          const reason = finalVacancyCheck?.reason ?? "The vacancy could not be found for final verification.";
+          intervention += 1;
+          warnings.push(`Submission blocked for ${item.job.title} at ${item.job.company}: final vacancy verification failed — ${reason}`);
+          run("UPDATE applications SET status = 'human_intervention_required', last_update = ? WHERE id = ?", [nowIso(), item.applicationId]);
+          recordApplicationEvent({ applicationId: item.applicationId, type: "vacancy.blocked", message: reason });
+          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: reason, decision: "No application was sent because the live vacancy could not be verified.", finishedAt: nowIso() });
+          continue;
+        }
         const input = await submissionInputFor(item.applicationId, item.job, runId, deps.now ?? now);
         if (!input) {
           intervention += 1;
@@ -1179,13 +1419,16 @@ export async function executeRun(
         } catch (error) {
           const message = error instanceof Error ? error.message : "Submission failed.";
           failures.push(`Submission for ${item.job.title}: ${message}`);
-          run("UPDATE applications SET status = 'human_intervention_required', submission_status = 'failed', last_update = ? WHERE id = ?", [nowIso(), item.applicationId]);
-          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: message, decision: "Coordinator stopped this submission; the run continues.", finishedAt: nowIso() });
+          // An unexpected throw can happen after the request was created, so the
+          // safe state is unknown rather than a definite failure. It is never
+          // retried without employer confirmation.
+          run("UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', last_update = ? WHERE id = ?", [nowIso(), item.applicationId]);
+          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: message, decision: "Submission outcome is unknown; the coordinator did not retry it blindly.", finishedAt: nowIso() });
           notify({
-            kind: "application_failed",
-            dedupeKey: `submission_failed:${runId}:${item.jobId}`,
-            subject: `Application submission failed: ${item.job.title}`,
-            body: `${item.job.company} was not recorded as submitted. ${message}`,
+            kind: "application_submission_unverified",
+            dedupeKey: `submission_unknown:${runId}:${item.jobId}`,
+            subject: `Submission outcome unknown: ${item.job.title}`,
+            body: `${item.job.company} may or may not have received the application. ${message} It is not counted as submitted and will not be retried without confirmation.`,
           });
           intervention += 1;
           continue;
@@ -1238,7 +1481,22 @@ export async function executeRun(
       warnings: warnings.length,
     });
 
-    runStatus = failures.length > 0 || warnings.length > 0 ? "completed_with_warnings" : "completed";
+    runStatus = allSourcesFailed ? "failed" : failures.length > 0 || warnings.length > 0 ? "completed_with_warnings" : "completed";
+    const runError = allSourcesFailed
+      ? `All configured job sources failed. ${failures.filter((failure) => !failure.startsWith("All ")).slice(0, 3).join(" | ")}`.trim()
+      : failures.length
+        ? failures.join(" | ").slice(0, 4000)
+        : null;
+    if (runStatus === "failed") {
+      notify({
+        userId,
+        kind: "recruitment_run_failed",
+        dedupeKey: `run_failed:${runId}`,
+        subject: "Recruitment run failed: all job sources were unavailable",
+        body: runError ?? "All configured job sources failed; no discovery success was claimed.",
+        email: false,
+      });
+    }
     if (submitted > 0) {
       notify({
         userId,
@@ -1246,6 +1504,7 @@ export async function executeRun(
         dedupeKey: `submitted:${runId}`,
         subject: `${submitted} application${submitted === 1 ? "" : "s"} submitted and verified`,
         body: `${submitted} submission(s) returned employer evidence. ${unverified} unverified and ${intervention} awaiting intervention. No unverified result is counted as successful.`,
+        email: false,
       });
     }
     if (intervention > 0) {
@@ -1258,28 +1517,106 @@ export async function executeRun(
       });
     }
     const report = `pending:${runId}`;
-    run("UPDATE recruitment_runs SET status = ?, finished_at = ?, report = ?, error = ? WHERE id = ?", [
-      runStatus,
-      nowIso(),
-      report,
-      failures.length ? failures.join(" | ").slice(0, 4000) : null,
+    run(
+      "UPDATE recruitment_runs SET status = ?, finished_at = ?, report = ?, error = ?, warnings_json = ?, failures_json = ? WHERE id = ?",
+      [
+        runStatus,
+        nowIso(),
+        report,
+        runError,
+        JSON.stringify(warnings).slice(0, 40000),
+        JSON.stringify(failures).slice(0, 40000),
+        runId,
+      ],
+    );
+    closeOpenAssignments(runId, runStatus === "failed" ? "failed" : "completed", "Stage reached its terminal result; no background work remains for this assignment.", workflowId);
+    pushState(
       runId,
-    ]);
-    closeOpenAssignments(runId, "completed", "Stage reached its terminal result; no background work remains for this assignment.", workflowId);
-    pushState(runId, runStatus, `${discovery.inserted} discovered · ${qualifiedJobs.length} qualified · ${prepared} prepared · ${submitted} submitted and verified.`);
-    const finalReport = buildRunReport(runId, { warnings });
+      runStatus,
+      `${discovery.sources.reduce((sum, source) => sum + source.fetched, 0)} postings screened · ${discovery.inserted} new · ${qualifiedJobs.length} qualified · ${prepared} prepared · ${submitted} submitted and verified.`,
+    );
+
+    // A specialist that was not required is recorded as SKIPPED with the exact
+    // dependency/reason. It is never left to look like a hidden success or an
+    // unrecorded crash.
+    const downstreamReason =
+      discoveryOnly
+        ? "No input: discovery-only run — document, quality and submission work was deliberately excluded."
+        : qualifiedJobs.length === 0
+          ? `No input: no vacancy reached the ${threshold}% threshold and all mandatory gates, so this specialist had no eligible work.`
+          : prepared === 0
+            ? "No input: no application package completed document preparation, so there was no input for this specialist."
+            : "No input: no application package reached this stage after the preceding quality gate.";
+    const withDependency = (dependency: string) => `${downstreamReason} Dependency: ${dependency}`;
+    recordSkippedAgent({
+      runId,
+      workflowId,
+      agentKey: "cv",
+      assignment: "Create and tailor CV documents",
+      reason: withDependency("Analysis must produce a new qualifying vacancy."),
+    });
+    recordSkippedAgent({
+      runId,
+      workflowId,
+      agentKey: "cover",
+      assignment: "Create tailored cover letters",
+      reason: withDependency("CV Optimisation must produce a tailored CV."),
+    });
+    recordSkippedAgent({
+      runId,
+      workflowId,
+      agentKey: "ats",
+      assignment: "Run the independent quality gate",
+      reason: prepared === 0
+        ? withDependency("CV Optimisation and Cover Letter must produce a complete package.")
+        : "No package required a further quality decision in this run.",
+    });
+    recordSkippedAgent({
+      runId,
+      workflowId,
+      agentKey: "application",
+      assignment: "Submit verified application packages",
+      reason:
+        ready.length === 0
+          ? prepared === 0
+            ? withDependency("ATS Quality Control must mark a package ready for submission.")
+            : "No input: no package passed every readiness check, so nothing was eligible for submission. Dependency: ATS Quality Control readiness."
+          : dryRun || !submissionAllowed
+            ? "Safety/policy hold: the package was prepared but no submission was sent because the live policy or delivery channel was not active."
+            : "No input: no eligible package remained after the submission limits and safety checks.",
+    });
+
+    // The Email & Tracking Agent's run-scoped job is to prepare the execution
+    // report and hand it to the existing durable outbox. Delivery acceptance is
+    // tracked separately; no Gmail success is claimed by this row.
+    logAgent({
+      runId,
+      agentKey: "email",
+      assignment: "Prepare the administrator execution report",
+      status: "completed",
+      output: `Structured agent evidence and report inputs are available to ${agentIdentity("coordinator").name} for the consolidated daily brief.`,
+      decision: "The specialist does not send an owner-facing email; the Coordinator owns the daily report and delivery record.",
+      finishedAt: nowIso(),
+    });
+
+    const finalReport = buildRunReport(runId, { warnings, failures });
     run("UPDATE recruitment_runs SET report = ? WHERE id = ?", [finalReport, runId]);
-    finishWorkflow(workflowId, "completed", finalReport.split("\n")[1] ?? "Daily recruitment run completed.");
+    finishWorkflow(workflowId, runStatus === "failed" ? "failed" : "completed", finalReport.split("\n")[1] ?? "Daily recruitment run completed.");
     // A discovery-only run does not consume the daily schedule slot.
     if (!discoveryOnly) recordScheduleRun({ runId, status: runStatus, now: deps.now ?? now });
+
+    // The Coordinator's daily brief is the single owner-facing consolidated
+    // report. Keep run completion visible in-app without emitting a competing
+    // execution email for every run.
     notify({
       userId,
       kind: runStatus === "completed_with_warnings" ? "recruitment_partial" : "recruitment_run",
-      dedupeKey: `run_finished:${runId}`,
+      dedupeKey: `execution_report:${runId}`,
       subject: runStatus === "completed_with_warnings"
-        ? `Recruitment run finished with ${failures.length} failure(s) and ${warnings.length} warning(s)`
-        : `Recruitment run finished: ${submitted} submitted`,
-      body: `${discovery.inserted} discovered, ${qualifiedJobs.length} qualified (>= ${threshold}%), ${prepared} prepared, ${submitted} submitted with evidence, ${unverified} unverified, ${intervention} needing attention. ${failures.length} failure(s), ${warnings.length} warning(s). ${failures.slice(0, 3).join(" | ")}`,
+        ? `Recruitment execution finished with ${warnings.length} warning(s)`
+        : `Recruitment execution finished: ${submitted} verified submission(s)`,
+      body: `${discovery.inserted} new vacancies, ${qualifiedJobs.length} qualified (>= ${threshold}%), ${prepared} prepared, ${submitted} submitted with evidence, ${unverified} unverified, ${intervention} needing attention. ${failures.length} failure(s), ${warnings.length} warning(s). The consolidated brief is generated by the Coordinator on its daily schedule.`,
+      email: false,
     });
     audit({ action: "recruitment.run_completed", entity: "recruitment_run", entityId: runId, detail: `${runStatus}: ${submitted} verified submissions`, userId });
 
@@ -1302,19 +1639,31 @@ export async function executeRun(
     const message = error instanceof Error ? error.message : "The recruitment run failed.";
     failures.push(message);
     const report = buildRunReport(runId, { failures, warnings });
-    run("UPDATE recruitment_runs SET status = 'failed', error = ?, finished_at = ?, failures = ?, warnings = ?, report = ? WHERE id = ?", [
-      message.slice(0, 4000),
-      nowIso(),
-      failures.length,
-      warnings.length,
-      report,
-      runId,
-    ]);
+    run(
+      "UPDATE recruitment_runs SET status = 'failed', error = ?, finished_at = ?, failures = ?, warnings = ?, warnings_json = ?, failures_json = ?, report = ? WHERE id = ?",
+      [
+        message.slice(0, 4000),
+        nowIso(),
+        failures.length,
+        warnings.length,
+        JSON.stringify(warnings).slice(0, 40000),
+        JSON.stringify(failures).slice(0, 40000),
+        report,
+        runId,
+      ],
+    );
     closeOpenAssignments(runId, "failed", "Run terminated before this assignment completed.", workflowId);
     pushState(runId, "failed", message);
     if (workflowId) finishWorkflow(workflowId, "failed", message);
     recordScheduleRun({ runId, status: "failed", error: message, now: deps.now ?? now });
-    notify({ userId, kind: "recruitment_run_failed", dedupeKey: `run_failed:${runId}`, subject: "Recruitment run failed", body: message });
+    notify({
+      userId,
+      kind: "recruitment_run_failed",
+      dedupeKey: `run_failed:${runId}`,
+      subject: "Recruitment run failed",
+      body: message,
+      email: false,
+    });
     return {
       runId,
       status: "failed",
@@ -1331,6 +1680,8 @@ export async function executeRun(
       report,
     };
   } finally {
+    clearInterval(runLease);
+    releaseRuntimeLock(runLockKey);
     if (memoryRunning === runId) memoryRunning = null;
   }
 }
@@ -1339,6 +1690,34 @@ type JobLiteForDocs = {
   title: string; company: string; url: string | null; application_url: string | null; description: string | null;
   source?: string | null; external_id?: string | null;
 };
+
+async function verifyVacancyForRun(
+  jobId: string,
+  dependencies: RunDeps,
+  now: Date,
+): Promise<VacancyVerification | null> {
+  const job = jobLite(jobId);
+  if (!job) return null;
+  if (dependencies.verifyVacancy) {
+    const result = await dependencies.verifyVacancy(jobId);
+    return result;
+  }
+  return verifyAndPersistVacancy(
+    {
+      id: job.id,
+      title: job.title,
+      company: job.company,
+      url: job.url,
+      application_url: job.application_url,
+      description: job.description,
+      published_at: job.published_at,
+      source: job.source,
+      company_domain: job.company_domain,
+      expiry_at: job.expiry_at,
+    },
+    { now },
+  );
+}
 
 async function submissionInputFor(
   applicationId: string,
@@ -1487,7 +1866,9 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   } catch {
     sourceMetrics = [];
   }
-  const checks = sourceHealth();
+  const checks = sourceHealth().filter(
+    (check) => !runRow.started_at || check.last_checked_at >= runRow.started_at,
+  );
   const failedSources = checks.filter((check) => check.ok !== 1);
   const staleSources = checks.filter((check) => check.ok === 1 && check.fresh === 0);
 
@@ -1526,11 +1907,17 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
     if (jobs.length === 0) {
       const fetched = sourceMetrics.reduce((sum, metric) => sum + metric.postings, 0);
       const fresh = sourceMetrics.reduce((sum, metric) => sum + metric.fresh, 0);
+      const relevant = sourceMetrics.reduce((sum, metric) => sum + metric.relevant, 0);
+      if (fetched === 0 && failedSources.length > 0) {
+        return (
+          `No configured source returned a readable response. This is a source-failure result, not a successful zero-result search. Failed endpoints: ${failedSources.map((check) => `${check.source_key} (${check.error ?? "unknown error"})`).join("; ")}. No vacancy was invented and the 85% threshold was not changed.`
+        );
+      }
       return (
-        `No validated vacancy was stored. ${fetched} posting(s) were fetched and ${fresh} were fresh; none passed the QA-relevance classification and the seven-day rule.` +
+        `${fetched.toLocaleString("en-GB")} posting(s) were screened, ${fresh.toLocaleString("en-GB")} were fresh and ${relevant} passed the QA relevance rule. ${runRow.jobs_duplicates ?? 0} listing(s) were already known and ${runRow.jobs_discovered} new vacancy(ies) were stored.` +
         (failedSources.length > 0
           ? ` ${failedSources.length} source endpoint(s) failed: ${failedSources.map((check) => `${check.source_key} (${check.error ?? "unknown error"})`).join("; ")}.`
-          : "") +
+          : " No configured source failed.") +
         " The 85% threshold and the freshness rule were not lowered, and no vacancy was invented."
       );
     }
@@ -1546,9 +1933,16 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
 
   const lines: string[] = [];
   lines.push(`# Daily recruitment report — ${runRow.run_key}`);
+  const screenedTotal = sourceMetrics.reduce((sum, metric) => sum + metric.postings, 0);
+  const relevantTotal = sourceMetrics.reduce((sum, metric) => sum + metric.relevant, 0);
   lines.push(
-    `${runRow.jobs_discovered} vacancies discovered, ${runRow.jobs_eligible} eligible, ${runRow.jobs_qualified} qualified at ${qualifyingThreshold()}% or higher, ${runRow.packages_prepared} package(s) prepared, ${runRow.applications_submitted} submitted and verified, ${runRow.applications_unverified} unverified, ${runRow.applications_simulated} simulated, ${runRow.applications_intervention} needing your attention. Run status: ${runRow.status.replace(/_/g, " ")}.`,
+    `${screenedTotal.toLocaleString("en-GB")} postings screened, ${relevantTotal} relevant, ${runRow.jobs_discovered} new vacancies stored, ${runRow.jobs_duplicates ?? 0} duplicate listing(s), ${runRow.jobs_filtered ?? 0} rejected during discovery, ${runRow.jobs_eligible} eligible, ${runRow.jobs_qualified} qualified at ${qualifyingThreshold()}% or higher, ${runRow.packages_prepared} package(s) prepared, ${runRow.applications_submitted} submitted and verified, ${runRow.applications_unverified} unverified, ${runRow.applications_simulated} simulated, ${runRow.applications_intervention} needing your attention. Run status: ${runRow.status.replace(/_/g, " ")}.`,
   );
+  if (runRow.sources_checked) {
+    lines.push(
+      `Sources: ${runRow.sources_checked} checked, ${runRow.sources_succeeded} returned data, ${runRow.sources_partial ?? 0} partial, ${runRow.sources_failed} failed. Discovery state: ${runRow.discovery_state ?? "unknown"}.`,
+    );
+  }
   lines.push("");
   lines.push("## 1. Executive summary");
   lines.push(
@@ -1560,7 +1954,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   }
   lines.push("");
   lines.push("## 2. Jobs discovered");
-  if (jobs.length === 0) lines.push("No validated vacancies were discovered in this run.");
+  if (jobs.length === 0) lines.push(zeroResultExplanation());
   for (const job of jobs) {
     lines.push(`- ${job.title} — ${job.company}${job.location ? ` (${job.location})` : ""} · match ${job.match_score ?? "—"}% · ${job.application_url ? "application URL captured" : "no application URL"}`);
   }
@@ -1569,7 +1963,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
     lines.push("Source contribution:");
     for (const metric of sourceMetrics) {
       lines.push(
-        `- ${metric.label}: ${metric.requests} request(s), ${metric.responses} response(s), ${metric.postings} posting(s), ${metric.fresh} fresh, ${metric.relevant} relevant, ${metric.duplicates} duplicate(s), ${metric.inserted} new · ${metric.eligible} eligible · ${metric.qualified} qualified`,
+        `- ${metric.label}: ${metric.status ?? "unknown"} · ${metric.requests} request(s), ${metric.responses} response(s), ${metric.attempts ?? 0} attempt(s), ${metric.durationMs ?? 0} ms, ${metric.postings} posting(s), ${metric.fresh} fresh, ${metric.relevant} relevant, ${metric.duplicates} duplicate(s), ${metric.inserted} new · ${metric.eligible} eligible · ${metric.qualified} qualified`,
       );
     }
   }
@@ -1651,7 +2045,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   const aiProviders = [...new Set(analysisAi.map((agent) => `${agent.provider}/${agent.model}`))];
   const decisionRow = [...agents].reverse().find((agent) => agent.agent_key === "coordinator" && agent.coordinator_decision);
   lines.push(
-    "- Deterministic discovery: the research agent's connectors fetched, filtered and deduplicated the postings above without model inference.",
+    `- Deterministic discovery: ${agentIdentity("research").name}'s connectors fetched, filtered and deduplicated the postings above without model inference.`,
   );
   lines.push(
     "- AI-assisted research: none in this run; connector research is deterministic by design, so no model output was used to find or filter vacancies.",
@@ -1684,20 +2078,39 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   }
   for (const app of readinessRows) {
     try {
-      const parsed = JSON.parse(app.readiness ?? "{}") as { ready?: boolean; items?: ReadinessItem[] };
+      const parsed = JSON.parse(app.readiness ?? "{}") as { ready?: boolean; state?: string; items?: ReadinessItem[] };
       const failed = (parsed.items ?? []).filter((entry) => !entry.passed);
       lines.push(
-        `- ${app.title} — ${app.company}: ${parsed.ready ? "ready" : `blocked (${failed.length} failed check(s))`}${failed.length ? ` — ${failed.map((entry) => `${entry.label}: ${entry.detail}`).join(" ")}` : ""}`,
+        `- ${app.title} — ${app.company}: ${parsed.state ?? (parsed.ready ? "ready_for_submission" : "blocked")}${failed.length ? ` (${failed.length} failed check(s)) — ${failed.map((entry) => `${entry.label}: ${entry.detail}`).join(" ")}` : ""}`,
       );
     } catch {
       lines.push(`- ${app.title} — ${app.company}: readiness record could not be parsed.`);
     }
   }
   lines.push("");
-  lines.push("## 13. Why this run produced its result");
-  lines.push(zeroResultExplanation());
+  lines.push("## 13. Eight-agent execution manifest");
+  const manifest = buildExecutionManifest(runId);
+  if (!manifest) {
+    lines.push("The execution manifest could not be read.");
+  } else {
+    lines.push(`${manifest.summary} Dispatched ${manifest.dispatchedAgents}/${manifest.expectedAgents}; results received ${manifest.resultsReceived}; rejected ${manifest.resultsRejected}; handoffs completed ${manifest.handoffsCompleted}/${manifest.handoffsExpected}.`);
+    for (const agent of manifest.agents) {
+      lines.push(
+        `- ${agent.name} · ${agent.state.replace(/_/g, " ")} · ${agent.recordsProcessed} record(s) · ${agent.durationMs === null ? "duration not recorded" : `${Math.round(agent.durationMs / 1000)}s`} · handoff ${agent.handoffTo ?? "none"}: ${agent.handoffComplete ? "completed" : "not completed"}${agent.error ? ` · ERROR: ${agent.error}` : ""}`,
+      );
+    }
+  }
   lines.push("");
-  lines.push("## 14. Standing authorisation and submission policy");
+  lines.push("## 14. Why this run produced its result");
+  if (runRow.discovery_state === "failed") {
+    lines.push(
+      "All configured sources failed. This run is recorded as failed and does not claim a successful discovery cycle. No vacancy or employer was invented.",
+    );
+  } else {
+    lines.push(zeroResultExplanation());
+  }
+  lines.push("");
+  lines.push("## 15. Standing authorisation and submission policy");
   const livePolicy = getRecruitmentPolicy();
   const liveUsage = dailySubmissionUsage(new Date());
   const heartbeat = schedule?.last_checked_at ? Date.parse(schedule.last_checked_at) : NaN;

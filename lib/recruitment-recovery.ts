@@ -1,5 +1,6 @@
-import { all, nowIso, one, run } from "./db";
+import { all, getDb, nowIso, one, run } from "./db";
 import { generateApplicationPackage, type PackageOutcome } from "./agents";
+import { heartbeatRuntimeWorker, startRuntimeWorker, stopRuntimeWorker } from "./runtime-state";
 import { nextProviderRetryAt } from "./provider-health";
 import { notify } from "./notify";
 
@@ -54,12 +55,22 @@ export function startRecoveryQueue(): void {
   const state = queueState();
   if (!state.started) {
     state.started = true;
+    startRuntimeWorker("document_recovery", "Durable document-prep recovery queue");
     run(
       "UPDATE recruitment_recovery SET status = 'retry_scheduled', available_at = ? WHERE status = 'processing' AND started_at < ?",
       [nowIso(), new Date(Date.now() - 5 * 60_000).toISOString()],
     );
   }
+  heartbeatRuntimeWorker("document_recovery");
   startTimer(1_000);
+}
+
+export function stopRecoveryQueue(): void {
+  const state = queueState();
+  if (state.timer) clearTimeout(state.timer);
+  state.timer = undefined;
+  state.started = false;
+  stopRuntimeWorker("document_recovery", "Stopped with the application process");
 }
 
 export function enqueueDocumentRecovery(input: {
@@ -130,6 +141,7 @@ function completeRecovery(row: RecoveryRow, pkg: PackageOutcome): void {
     dedupeKey: `documents_ready:${row.run_id}:${row.job_id}`,
     subject: job ? `Documents ready: ${job.title} at ${job.company}` : "Application documents prepared",
     body: "The preserved vacancy resumed at the document checkpoint. It now waits for the normal ATS/submission checks; nothing was submitted.",
+    email: false,
   });
 }
 
@@ -145,6 +157,7 @@ export async function processRecoveryQueue(options: {
   const state = queueState();
   if (state.running) return { attempted: 0, completed: 0, retryScheduled: 0, waitingIntervention: 0 };
   state.running = true;
+  heartbeatRuntimeWorker("document_recovery");
   const now = options.now ?? new Date();
   const prepare =
     options.prepare ??
@@ -160,11 +173,11 @@ export async function processRecoveryQueue(options: {
         [now.toISOString()],
       );
       if (!row) break;
+      const claimed = getDb()
+        .prepare("UPDATE recruitment_recovery SET status = 'processing', attempts = attempts + 1, started_at = COALESCE(started_at, ?) WHERE id = ? AND status IN ('pending','retry_scheduled')")
+        .run(nowIso(), row.id);
+      if (Number(claimed.changes) !== 1) continue;
       attempted += 1;
-      run("UPDATE recruitment_recovery SET status = 'processing', attempts = attempts + 1, started_at = COALESCE(started_at, ?) WHERE id = ?", [
-        nowIso(),
-        row.id,
-      ]);
       const attempts = row.attempts + 1;
       const runRow = one<{ workflow_id: string | null; status: string }>("SELECT workflow_id, status FROM recruitment_runs WHERE id = ?", [row.run_id]);
       if (!row.job_id || !runRow) {
@@ -172,7 +185,7 @@ export async function processRecoveryQueue(options: {
         continue;
       }
       const app = one<{ id: string }>("SELECT id FROM applications WHERE job_id = ? ORDER BY last_update DESC LIMIT 1", [row.job_id]);
-      if (app && documentsPassed(row.job_id) && ["quality_check", "ready_to_submit", "human_intervention_required"].includes(
+      if (app && documentsPassed(row.job_id) && ["quality_check", "quality_review_required", "ready_to_submit", "human_intervention_required"].includes(
         one<{ status: string }>("SELECT status FROM applications WHERE id = ?", [app.id])?.status ?? "",
       )) {
         completeRecovery(row, { ok: true, message: "Existing validated documents retained.", applicationId: app.id, warnings: [] });

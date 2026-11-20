@@ -43,13 +43,13 @@ export function Icon({ name, size = 15 }: { name: keyof typeof icons | string; s
 
 export function Brand({ href = "/" }: { href?: string }) {
   return (
-    <Link href={href} className="brand" aria-label="Towfiq AI Agents">
+    <Link href={href} className="brand" aria-label="AT AI Workforce">
       <span className="brand-logo">
         <BrandMark size={34} idPrefix="brand" />
       </span>
       <span>
-        <span className="brand-name">Towfiq</span>
-        <span className="brand-tag">AI Agents</span>
+        <span className="brand-name">AT</span>
+        <span className="brand-tag">AI Workforce</span>
       </span>
     </Link>
   );

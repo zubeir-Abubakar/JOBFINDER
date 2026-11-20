@@ -17,6 +17,9 @@ import { getSetting } from "./settings";
 import { notify } from "./notify";
 import { audit } from "./audit";
 import { emitWorkflowEvent } from "./events";
+import { workflowAccessibleTo, type WorkflowActor } from "./workflow-view";
+import { agentIdentity } from "./agent-identity";
+import { workflowOrderLabel } from "./workflow-stages";
 
 /**
  * Sequential workflow runner. One recruitment workflow executes at a time so an
@@ -78,20 +81,28 @@ function control(workflowId: string) {
   if (row?.pause_requested) throw new PauseSignal("Workflow paused by the user.");
 }
 
-function runningWorkflow() {
-  return one<{ id: string; label: string; status: string }>(
-    "SELECT id, label, status FROM workflows WHERE status IN ('running','queued') ORDER BY created_at DESC LIMIT 1",
+function runningWorkflow(actor?: WorkflowActor) {
+  const row = one<{ id: string; label: string; status: string; started_by: string | null }>(
+    "SELECT id, label, status, started_by FROM workflows WHERE status IN ('running','queued') ORDER BY created_at DESC LIMIT 1",
   );
+  if (!row || (actor && !workflowAccessibleTo(actor, row))) return null;
+  return row;
 }
 
-export function activeWorkflow() {
-  return runningWorkflow();
+export function activeWorkflow(actor?: WorkflowActor) {
+  return runningWorkflow(actor);
 }
 
-export function latestPausedWorkflow() {
-  return one<{ id: string; kind: string; label: string; params: string | null }>(
-    "SELECT id, kind, label, params FROM workflows WHERE status = 'paused' ORDER BY created_at DESC LIMIT 1",
+export function latestPausedWorkflow(actor?: WorkflowActor) {
+  const rows = all<{ id: string; kind: string; label: string; params: string | null; started_by: string | null }>(
+    "SELECT id, kind, label, params, started_by FROM workflows WHERE status = 'paused' ORDER BY created_at DESC LIMIT 50",
   );
+  return rows.find((row) => !actor || workflowAccessibleTo(actor, row)) ?? null;
+}
+
+export function workflowActor(userId: string): WorkflowActor {
+  const row = one<{ role: string }>("SELECT role FROM users WHERE id = ?", [userId]);
+  return { id: userId, role: row?.role === "admin" ? "admin" : "owner" };
 }
 
 export async function startRecruitmentWorkflow(
@@ -108,37 +119,40 @@ export async function startRecruitmentWorkflow(
   }
   const pages = Math.min(5, Math.max(1, options.pages ?? 2));
   const autoPackage = options.autoPackage !== false;
-  const workflowId = createWorkflow("recruitment", "Recruitment operations run");
-  run("UPDATE workflows SET params = ?, started_by = ? WHERE id = ?", [
+  const workflowId = createWorkflow("recruitment", "Recruitment operations run", userId);
+  run("UPDATE workflows SET params = ? WHERE id = ?", [
     JSON.stringify({ pages, autoPackage }),
-    userId,
     workflowId,
   ]);
   schedule({ workflowId, job: () => runRecruitment(userId, workflowId, pages, autoPackage) });
-  audit({ action: "workflow.started", entity: "workflow", entityId: workflowId, detail: `Sequential recruitment run, ${pages} page(s)`, userId });
-  return { ok: true, workflowId, message: "Workflow queued. Agents run sequentially in the background." };
+  audit({ action: "workflow.started", entity: "workflow", entityId: workflowId, detail: `Manual single-vacancy workflow, ${pages} page(s)`, userId });
+  return {
+    ok: true,
+    workflowId,
+    message: "Manual single-vacancy workflow queued. This legacy operation prepares one vacancy; use the recruitment page for the autonomous multi-vacancy run.",
+  };
 }
 
-export async function pauseRunningWorkflow(): Promise<string> {
-  const running = runningWorkflow();
+export async function pauseRunningWorkflow(actor: WorkflowActor): Promise<string> {
+  const running = runningWorkflow(actor);
   if (!running) return "No workflow is running.";
   run("UPDATE workflows SET pause_requested = 1 WHERE id = ?", [running.id]);
   pauseAllAgents(true);
-  notify({ kind: "workflow_paused", subject: "Workflow paused", body: "The coordinator will stop at the next safe checkpoint." });
+  notify({ kind: "workflow_paused", subject: "Workflow paused", body: `${agentIdentity("coordinator").name} will stop at the next safe checkpoint.` });
   return "Pause requested. The current step finishes, then the workflow pauses.";
 }
 
-export async function stopRunningWorkflow(): Promise<string> {
-  const running = runningWorkflow();
+export async function stopRunningWorkflow(actor: WorkflowActor): Promise<string> {
+  const running = runningWorkflow(actor);
   if (!running) return "No workflow is running.";
   run("UPDATE workflows SET stop_requested = 1 WHERE id = ?", [running.id]);
   pauseAllAgents(true);
-  notify({ kind: "workflow_stopped", subject: "Workflow stopped", body: "The coordinator will stop at the next safe checkpoint and no new documents will be produced." });
+  notify({ kind: "workflow_stopped", subject: "Workflow stopped", body: `${agentIdentity("coordinator").name} will stop at the next safe checkpoint and no new documents will be produced.` });
   return "Stop requested. Remaining stages will not run.";
 }
 
-export async function resumeLatestWorkflow(userId: string): Promise<StartResult> {
-  const paused = latestPausedWorkflow();
+export async function resumeLatestWorkflow(actor: WorkflowActor): Promise<StartResult> {
+  const paused = latestPausedWorkflow(actor);
   if (!paused) return { ok: false, message: "There is no paused workflow to resume." };
   const params = (() => {
     try {
@@ -150,15 +164,18 @@ export async function resumeLatestWorkflow(userId: string): Promise<StartResult>
   pauseAllAgents(false);
   run("UPDATE workflows SET summary = COALESCE(summary, 'Resumed') WHERE id = ?", [paused.id]);
   if (paused.kind !== "recruitment") return { ok: false, message: "Only recruitment workflows can be resumed. Retry the document workflow from the vacancy page." };
-  return startRecruitmentWorkflow(userId, { pages: params.pages, autoPackage: params.autoPackage });
+  return startRecruitmentWorkflow(actor.id, { pages: params.pages, autoPackage: params.autoPackage });
 }
 
-export async function retryWorkflow(userId: string, workflowId: string): Promise<StartResult> {
-  const workflow = one<{ kind: string; params: string | null }>("SELECT kind, params FROM workflows WHERE id = ?", [workflowId]);
-  if (!workflow) return { ok: false, message: "Workflow not found." };
+export async function retryWorkflow(actor: WorkflowActor, workflowId: string): Promise<StartResult> {
+  const workflow = one<{ kind: string; params: string | null; started_by: string | null }>(
+    "SELECT kind, params, started_by FROM workflows WHERE id = ?",
+    [workflowId],
+  );
+  if (!workflow || !workflowAccessibleTo(actor, workflow)) return { ok: false, message: "Workflow not found." };
   if (workflow.kind !== "recruitment") return { ok: false, message: "Only recruitment workflows support retry. Regenerate package documents from the vacancy." };
   const params = workflow.params ? (JSON.parse(workflow.params) as { pages?: number; autoPackage?: boolean }) : {};
-  return startRecruitmentWorkflow(userId, { pages: params.pages, autoPackage: params.autoPackage });
+  return startRecruitmentWorkflow(actor.id, { pages: params.pages, autoPackage: params.autoPackage });
 }
 
 function topVacancy() {
@@ -177,7 +194,7 @@ async function runRecruitment(userId: string, workflowId: string, pages: number,
     // Operational plans are deterministic. A generative model may phrase a plan
     // as an invented role or task, so it is never used as the source of workflow
     // assignments; AI remains advisory inside the document stages.
-    const plan = `Execution order: Chief Coordinator → Job Research → Job Analysis → CV Optimisation → ATS Quality Control → Cover Letter → Application → Email & Tracking. Search ${pages} source page(s), score only validated vacancies against the verified profile, prepare at most one application package${autoPackage ? "" : " (package generation disabled)"}, and stop for explicit application and email approval.`;
+    const plan = `Execution order: ${workflowOrderLabel()}. Search ${pages} source page(s), score only validated vacancies against the verified profile, prepare at most one application package${autoPackage ? "" : " (package generation disabled)"}, and stop for explicit application and email approval.`;
     completeTask(planTask, "coordinator", plan);
     control(workflowId);
 

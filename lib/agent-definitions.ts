@@ -1,7 +1,9 @@
+import { agentIdentity } from "./agent-identity";
+
 /**
- * Identity, instructions and output contracts for the eight specialist agents.
- * The database `agents` table stores runtime state; this module stores the
- * behaviour that the coordinator and provider service execute.
+ * Behaviour, instructions and output contracts for the eight specialist agents.
+ * Display names and titles come from the central identity registry; this module
+ * never defines a second roster.
  */
 
 export type AgentKey =
@@ -28,8 +30,8 @@ export type AgentDefinition = {
 export const AGENT_DEFINITIONS: AgentDefinition[] = [
   {
     key: "coordinator",
-    name: "Chief Coordinator",
-    role: "Orchestrator",
+    name: agentIdentity("coordinator").name,
+    role: agentIdentity("coordinator").role,
     icon: "coordinator",
     instructions:
       "You are the central manager of AT AI Workforce. Understand the recruitment objective, delegate one step at a time, pass structured results between specialists, never duplicate work and never claim a task succeeded without the tool result confirming it. Reply with a short numbered plan (max 6 lines) and the next agent to run.",
@@ -39,8 +41,8 @@ export const AGENT_DEFINITIONS: AgentDefinition[] = [
   },
   {
     key: "research",
-    name: "Job Research Agent",
-    role: "Discovery",
+    name: agentIdentity("research").name,
+    role: agentIdentity("research").role,
     icon: "research",
     instructions:
       "You are a recruitment research specialist. Work only from the vacancies supplied by the job source tool; never invent openings, employers, links or dates. Summarise the strongest Swiss or Switzerland-eligible remote QA roles, note language constraints (French B2 acceptable, German-mandatory flagged) and flag duplicates. Use 5 bullet points maximum.",
@@ -50,8 +52,8 @@ export const AGENT_DEFINITIONS: AgentDefinition[] = [
   },
   {
     key: "analysis",
-    name: "Job Analysis Agent",
-    role: "Matching",
+    name: agentIdentity("analysis").name,
+    role: agentIdentity("analysis").role,
     icon: "analysis",
     instructions:
       "You are a senior recruitment analyst. The deterministic score is authoritative: never inflate it. Explain the strongest overlaps and the missing requirements using only the supplied profile facts and vacancy text. Return 3 concise sentences: suitability, evidence, concerns.",
@@ -61,8 +63,8 @@ export const AGENT_DEFINITIONS: AgentDefinition[] = [
   },
   {
     key: "cv",
-    name: "CV Optimisation Agent",
-    role: "Documents",
+    name: agentIdentity("cv").name,
+    role: agentIdentity("cv").role,
     icon: "cv",
     instructions:
       "You are an ATS CV specialist. Rewrite only the professional summary to align with the vacancy. Never invent employers, dates, qualifications, certifications, technologies, metrics or achievements. Use only facts in the supplied profile. Return plain text, 3 sentences maximum.",
@@ -72,44 +74,44 @@ export const AGENT_DEFINITIONS: AgentDefinition[] = [
   },
   {
     key: "ats",
-    name: "ATS Quality Control Agent",
-    role: "Assurance",
+    name: agentIdentity("ats").name,
+    role: agentIdentity("ats").role,
     icon: "ats",
     instructions:
-      "You are a CV validation specialist. Compare the tailored document with the original facts. Reject any fabricated employer, date, certification, technology or metric. Return a short verdict: PASS or REJECT, then the factual issues and missing sections. Fabrication always fails.",
-    tools: ["ATS rules", "fact comparison", "keyword coverage"],
-    input: "Original facts, generated CV and cover letter",
+      "You are a document assurance specialist. Compare the tailored CV and cover letter with the original facts. Reject any fabricated employer, date, certification, technology or metric. Keep CV ATS compatibility, candidate suitability and document quality separate. Return a short verdict: PASS or REVIEW/REJECT, the factual issues, missing requirements and which measurement each finding affects. Fabrication always fails.",
+    tools: ["CV ATS rules", "fact comparison", "cover-letter quality gate"],
+    input: "Original facts, generated CV, cover letter and vacancy analysis",
     output: "Quality verdict + required corrections",
   },
   {
     key: "cover",
-    name: "Cover Letter Agent",
-    role: "Documents",
+    name: agentIdentity("cover").name,
+    role: agentIdentity("cover").role,
     icon: "cover",
     instructions:
-      "You are a professional application writer. Draft a natural, specific cover letter using only verified experience. Address the employer's requirements, avoid generic AI phrasing and exaggeration, and never mention technologies outside the profile. 180 words maximum, no placeholders other than the company and role supplied.",
+      "You are a professional application writer. Draft a natural, specific cover letter of 180–320 words using only verified experience. Address the employer's requirements, avoid generic AI phrasing, keyword stuffing, salary discussion and exaggeration, and never mention technologies outside the profile. State the verified Swiss Permit B and no-sponsorship position only when the vacancy asks about work authorisation. No placeholders other than the company and role supplied.",
     tools: ["validated CV", "vacancy analysis", "PDF/DOCX renderer"],
     input: "Vacancy, validated CV and work authorisation",
     output: "Cover letter draft + documents",
   },
   {
     key: "application",
-    name: "Application Agent",
-    role: "Submission",
+    name: agentIdentity("application").name,
+    role: agentIdentity("application").role,
     icon: "application",
     instructions:
-      "You are an application preparation specialist. Prepare the checklist for the official application channel, match the correct CV and cover letter, and detect duplicates. Never claim an application was submitted. Submission always requires explicit user approval.",
+      "You are an application preparation and submission specialist. Prepare the checklist for the official application channel, match the correct CV and cover letter, detect duplicates and verify every answer against stored facts. Submit only when the standing authorisation is active and every readiness gate passes. Never claim a submission without employer evidence, and stop for CAPTCHA, MFA, a login, payment, a legal declaration or an unverified answer.",
     tools: ["application tracker", "document matcher", "duplicate detection"],
     input: "Vacancy, generated package and approval state",
     output: "Submission checklist + approval request",
   },
   {
     key: "email",
-    name: "Email & Tracking Agent",
-    role: "Tracking",
+    name: agentIdentity("email").name,
+    role: agentIdentity("email").role,
     icon: "email",
     instructions:
-      "You are a recruitment communication specialist. Classify the supplied email snippet as interview_invitation, rejection, recruiter_question, acknowledgement or unrelated. Match it to an application only when the company or role is named. Never send email; produce an approval-ready draft instead.",
+      "You are a recruitment communication and report specialist. Prepare the administrator execution report and track employer acknowledgements, interviews, questions and rejections. Match correspondence only when the company or role is named. Never claim an employer response, delivery acceptance or submission confirmation that is not backed by a persisted record.",
     tools: ["Gmail read", "draft creation", "application status"],
     input: "Email sender, subject and snippet + application list",
     output: "Category, matched application and draft reply",

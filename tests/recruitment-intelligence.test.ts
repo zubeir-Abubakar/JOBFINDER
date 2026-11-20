@@ -263,6 +263,7 @@ function readinessInput(overrides: Record<string, unknown> = {}) {
       fullName: "Ada Lovelace",
       email: "ada@example.com",
       phone: "+41 79 000 00 00",
+      workAuthorisation: "Swiss Permit B — authorised to work without employer sponsorship",
       skills: ["Playwright", "Selenium", "TypeScript", "API testing"],
       certifications: ["ISTQB Certified Tester"],
       languages: ["English C1"],
@@ -272,12 +273,14 @@ function readinessInput(overrides: Record<string, unknown> = {}) {
       id: "doc_cv",
       text: `${sourceText}\nTailored for Swiss Payments AG. Playwright and Selenium automation for payment APIs.`,
       qualityStatus: "passed",
+      qualityScore: 96,
       fileExists: true,
     },
     cover: {
       id: "doc_cover",
       text: "Dear Swiss Payments AG team, I am applying for the Senior QA Automation Engineer role. I built Playwright suites covering 120 payment scenarios and reduced release defects by 30%.",
       qualityStatus: "passed",
+      qualityScore: 95,
       fileExists: true,
     },
     threshold: 85,
@@ -289,7 +292,8 @@ function readinessInput(overrides: Record<string, unknown> = {}) {
 test("a complete, evidenced package passes every readiness check", () => {
   const result = evaluateReadiness(readinessInput());
   assert.equal(result.ready, true, result.reasons.join(" "));
-  assert.equal(result.items.length, 10);
+  assert.equal(result.state, "ready_for_submission");
+  assert.equal(result.items.length, 15);
 });
 
 test("readiness refuses stale vacancies, missing CVs, unsupported claims and wrong cover targets", () => {
@@ -301,7 +305,7 @@ test("readiness refuses stale vacancies, missing CVs, unsupported claims and wro
 
   const missingCv = evaluateReadiness(readinessInput({ cv: null }));
   assert.equal(missingCv.ready, false);
-  assert.ok(missingCv.reasons.some((reason) => /Master CV/i.test(reason)));
+  assert.ok(missingCv.reasons.some((reason) => /Tailored CV/i.test(reason)));
 
   const base = readinessInput();
   const unsupported = evaluateReadiness(readinessInput({

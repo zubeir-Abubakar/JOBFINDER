@@ -7,9 +7,11 @@ import { formatDate, formatDateTime, param } from "@/lib/format";
 import { AUTONOMOUS_PIPELINE, statusClass, statusLabel } from "@/lib/application-status";
 import { formatInZone, scheduleSnapshot } from "@/lib/recruitment-schedule";
 import { qualifyingThreshold, recentRuns } from "@/lib/recruitment-run";
+import { buildExecutionManifest } from "@/lib/execution-manifest";
 import { dailySubmissionUsage, getRecruitmentPolicy } from "@/lib/recruitment-policy";
 import { recruitmentSchedulerStatus } from "@/lib/recruitment-ticker";
-import type { SourceMetrics } from "@/lib/recruitment-discovery";
+import { sourceHealth, type SourceMetrics } from "@/lib/recruitment-discovery";
+import { agentIdentity } from "@/lib/agent-identity";
 import {
   activateStandingAuthorisationAction,
   pauseStandingAuthorisationAction,
@@ -36,6 +38,7 @@ export default async function RecruitmentPage({
   const sp = await searchParams;
   const runs = recentRuns(12);
   const latest = runs[0] ?? null;
+  const latestManifest = latest ? buildExecutionManifest(latest.id) : null;
   const schedule = scheduleSnapshot();
   const policy = getRecruitmentPolicy();
   const usage = dailySubmissionUsage();
@@ -59,6 +62,46 @@ export default async function RecruitmentPage({
   } catch {
     sourceMetrics = [];
   }
+  const rejected = latest
+    ? all<{ title: string; company: string; eligibility: string | null; eligibility_notes: string | null; match_score: number | null }>(
+        `SELECT title, company, eligibility, eligibility_notes, match_score FROM jobs
+         WHERE run_id = ? AND qualified = 0 ORDER BY match_score DESC NULLS LAST LIMIT 6`,
+        [latest.id],
+      )
+    : [];
+  const runQueues = latest
+    ? one<{ processing: number; quality: number; approval: number; submitted: number }>(
+        `SELECT
+           SUM(CASE WHEN a.status IN ('documents_preparing','preparing_documents','awaiting_documents') THEN 1 ELSE 0 END) AS processing,
+           SUM(CASE WHEN a.status = 'quality_check' THEN 1 ELSE 0 END) AS quality,
+           SUM(CASE WHEN a.status = 'awaiting_approval' THEN 1 ELSE 0 END) AS approval,
+           SUM(CASE WHEN a.status = 'submitted' THEN 1 ELSE 0 END) AS submitted
+         FROM applications a JOIN jobs j ON j.id = a.job_id WHERE j.run_id = ?`,
+        [latest.id],
+      )
+    : null;
+  const rejectedTotal = latest
+    ? Number(one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE run_id = ? AND qualified = 0", [latest.id])?.c ?? 0)
+    : 0;
+  const lastSourceChecks = sourceHealth();
+  const lastSuccessfulDiscovery = lastSourceChecks
+    .map((check) => check.last_success_at)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) ?? null;
+  const latestRunStartedAt = latest?.started_at ? Date.parse(latest.started_at) : NaN;
+  const lastFailedSource = lastSourceChecks
+    .filter((check) => check.ok !== 1)
+    .filter((check) => !Number.isFinite(latestRunStartedAt) || Date.parse(check.last_checked_at) >= latestRunStartedAt)
+    .sort((a, b) => b.last_checked_at.localeCompare(a.last_checked_at))[0] ?? null;
+  const rejectionReason = (job: (typeof rejected)[number]): string => {
+    try {
+      const parsed = JSON.parse(job.eligibility_notes ?? "{}") as { blockers?: string[]; reasons?: string[] };
+      return parsed.blockers?.[0] ?? parsed.reasons?.[0] ?? (job.eligibility === "eligible" ? "Below match threshold" : "Did not meet eligibility rules");
+    } catch {
+      return job.eligibility === "eligible" ? "Below match threshold" : "Did not meet eligibility rules";
+    }
+  };
 
   const today = one<{ discovered: number; qualified: number; prepared: number; submitted: number; intervention: number; interviews: number }>(
     `SELECT
@@ -90,7 +133,7 @@ export default async function RecruitmentPage({
       <Flash ok={param(sp.ok)} error={param(sp.error)} />
       <PageHead
         title="Autonomous Recruitment"
-        sub={`The Chief Coordinator runs the team every day at ${schedule.time} ${schedule.timezone}. Qualifying applications (${qualifyingThreshold()}% or higher) are prepared and submitted without per-application approval.`}
+        sub={`${agentIdentity("coordinator").name} runs the team every day at ${schedule.time} ${schedule.timezone}. Qualifying applications (${qualifyingThreshold()}% or higher) are ${policy.active ? "prepared and automatically submitted" : "prepared but not submitted until the standing authorisation is active"}.`}
         actions={
           <>
             <form action={runRecruitmentDiscoveryNowAction}>
@@ -107,7 +150,9 @@ export default async function RecruitmentPage({
       />
 
       <section className="stats mb-4">
-        <Stat label="Discovered today" value={today.discovered} href="/jobs" />
+        <Stat label="Latest postings screened" value={latestManifest?.counts.postingsScreened ?? 0} />
+        <Stat label="Latest relevant" value={latestManifest?.counts.relevant ?? 0} />
+        <Stat label="New today" value={today.discovered} href="/jobs" />
         <Stat label={`At or above ${qualifyingThreshold()}%`} value={today.qualified} tone="good" href="/jobs?min=85" />
         <Stat label="Prepared" value={today.prepared} href="/applications" />
         <Stat label="Submitted (verified)" value={today.submitted} tone="good" href="/applications?status=submitted" />
@@ -210,11 +255,29 @@ export default async function RecruitmentPage({
             {latest ? (
               <div className="stack text-[12.5px]" style={{ gap: 8 }}>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Status</span><span className={`badge ${latest.status === "completed" ? "badge-good" : latest.status === "failed" ? "badge-bad" : "badge-warn"}`}>{latest.status.replace(/_/g, " ")}</span></div>
-                <div className="between"><span style={{ color: "var(--muted)" }}>Discovered / eligible / qualified</span><span>{latest.jobs_discovered} / {latest.jobs_eligible} / {latest.jobs_qualified}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Discovery state</span><span>{latest.discovery_state?.replace(/_/g, " ") ?? "not recorded"}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Sources checked / ok / partial / failed</span><span>{latest.sources_checked ?? 0} / {latest.sources_succeeded ?? 0} / {latest.sources_partial ?? 0} / {latest.sources_failed ?? 0}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>New / relevant / duplicates / filtered</span><span>{latest.jobs_discovered} / {latestManifest?.counts.relevant ?? 0} / {latest.jobs_duplicates ?? 0} / {latest.jobs_filtered ?? 0}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Agents succeeded / expected</span><span>{latestManifest?.succeededAgents ?? 0} / {latestManifest?.expectedAgents ?? 8} · {latestManifest?.notExecutedAgents ?? 0} not executed · {latestManifest?.skippedAgents ?? 0} skipped</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Eligible / qualified / rejected</span><span>{latest.jobs_eligible} / {latest.jobs_qualified} / {rejectedTotal}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Prepared</span><span>{latest.packages_prepared}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Processing / quality / approval</span><span>{runQueues?.processing ?? 0} / {runQueues?.quality ?? 0} / {runQueues?.approval ?? 0}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Submitted and verified</span><span>{latest.applications_submitted}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Unverified / intervention</span><span>{latest.applications_unverified} / {latest.applications_intervention}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Started / finished</span><span>{formatDateTime(latest.started_at)} → {formatDateTime(latest.finished_at)}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Last successful discovery</span><span>{formatInZone(lastSuccessfulDiscovery)}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>Last failed source</span><span>{lastFailedSource ? `${lastFailedSource.source_key} · ${lastFailedSource.error ?? "unknown error"}` : latest ? "None in latest run" : "None recorded"}</span></div>
+                {rejected.length > 0 ? (
+                  <div className="card-quiet p-2">
+                    <div className="text-[11px] font-medium mb-1">Latest run rejections</div>
+                    {rejected.map((job) => (
+                      <div key={`${job.title}-${job.company}`} className="text-[11px]" style={{ color: "var(--muted)" }}>
+                        {job.title} — {job.company}: {rejectionReason(job)}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {latest.error ? <div className="alert alert-error" style={{ padding: "7px 9px", fontSize: 11 }}>{latest.error}</div> : null}
               </div>
             ) : (
               <Empty title="No autonomous run yet">Run the team now to create the first record, or wait for the next scheduled execution.</Empty>
@@ -238,6 +301,9 @@ export default async function RecruitmentPage({
               <thead>
                 <tr>
                   <th>Source</th>
+                  <th>Status</th>
+                  <th>Attempts</th>
+                  <th>Time</th>
                   <th>Requests</th>
                   <th>Responses</th>
                   <th>Postings</th>
@@ -253,6 +319,9 @@ export default async function RecruitmentPage({
                 {sourceMetrics.map((metric) => (
                   <tr key={metric.key}>
                     <td className="cell-title">{metric.label}{metric.errors ? <div className="cell-sub">{metric.errors} error(s)</div> : null}</td>
+                    <td><span className={`badge ${metric.status === "ok" ? "badge-good" : metric.status === "failed" ? "badge-bad" : "badge-warn"}`}>{metric.status ?? "unknown"}</span></td>
+                    <td className="num">{metric.attempts ?? 0}</td>
+                    <td className="num">{metric.durationMs ? `${metric.durationMs} ms` : "—"}</td>
                     <td className="num">{metric.requests}</td>
                     <td className="num">{metric.responses}</td>
                     <td className="num">{metric.postings}</td>

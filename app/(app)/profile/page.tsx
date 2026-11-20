@@ -277,7 +277,7 @@ export default async function ProfilePage({
                         <details>
                           <summary className="btn btn-sm" style={{ listStyle: "none", cursor: "pointer" }}>Edit</summary>
                           <div className="mt-3">
-                            <form action={updateExperienceAction} className="grid g2" style={{ gap: 9, minWidth: 300 }}>
+                            <form action={updateExperienceAction} className="grid g2" style={{ gap: 9, minWidth: "min(300px, 100%)" }}>
                               <input type="hidden" name="id" value={exp.id} />
                               <div>
                                 <label className="label" htmlFor={`title-${exp.id}`}>Job title</label>

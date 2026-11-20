@@ -2,13 +2,17 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "Towfiq AI Agents",
-    short_name: "Towfiq AI",
+    id: "/",
+    name: "AT AI Workforce",
+    short_name: "AT Workforce",
     description: "Private multi-agent recruitment operations workspace.",
+    lang: "en",
+    dir: "ltr",
     start_url: "/dashboard",
     scope: "/",
     display: "standalone",
-    orientation: "portrait-primary",
+    // The app supports portrait and landscape; Android may rotate the standalone window.
+    orientation: "any",
     background_color: "#070a10",
     theme_color: "#070a10",
     categories: ["business", "productivity"],

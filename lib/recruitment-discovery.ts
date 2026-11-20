@@ -4,6 +4,12 @@ import { htmlToText } from "./scoring";
 import { researchJobs } from "./jobs";
 import { getSetting } from "./settings";
 import { classifyVacancy } from "./vacancy-classification";
+import {
+  requestJson,
+  requestText,
+  type SourceAttemptDiagnostic,
+  type SourceErrorCategory,
+} from "./source-http";
 
 /**
  * Vacancy discovery for the autonomous daily run.
@@ -48,6 +54,11 @@ export type DiscoverySource = {
   fresh: number;
   relevant: number;
   duplicates: number;
+  configured?: boolean;
+  status?: "ok" | "empty" | "partial" | "failed" | "skipped";
+  attempts?: number;
+  durationMs?: number;
+  errorCategory?: SourceErrorCategory | null;
 };
 
 /** Per-source contribution, persisted on the run and shown in the report/UI. */
@@ -64,6 +75,9 @@ export type SourceMetrics = {
   errors: number;
   eligible: number;
   qualified: number;
+  attempts?: number;
+  durationMs?: number;
+  status?: string;
 };
 
 export type DiscoveryResult = {
@@ -74,6 +88,12 @@ export type DiscoveryResult = {
   jobIds: string[];
   sources: DiscoverySource[];
   warnings: string[];
+  sourcesChecked?: number;
+  sourcesSucceeded?: number;
+  sourcesFailed?: number;
+  sourcesPartial?: number;
+  discoveryState?: "ok" | "empty" | "partial" | "failed" | "not_configured";
+  allSourcesFailed?: boolean;
 };
 
 const QA_TITLE =
@@ -148,14 +168,20 @@ function publishedWithinSevenDays(value: string | null): boolean {
   return Date.now() - time <= 7 * 86400_000;
 }
 
-/** Returns the new row id, or null when the vacancy is a duplicate. */
-export function insertDiscovered(job: DiscoveredJob, runId: string | null): string | null {
+export type DuplicateMatch = {
+  id: string;
+  rule: "source + external_id" | "normalised employer + title SHA-1" | "normalised application URL" | "case-insensitive employer + title";
+};
+
+/** Find the existing record for a listing without changing it. */
+export function findDuplicateJob(job: DiscoveredJob): DuplicateMatch | null {
   if (job.externalId) {
     const sameSource = one<{ id: string }>("SELECT id FROM jobs WHERE source = ? AND external_id = ?", [job.source, job.externalId]);
-    if (sameSource) return null;
+    if (sameSource) return { id: sameSource.id, rule: "source + external_id" };
   }
   const dedupeKey = dedupeKeyFor(job.company, job.title);
-  if (one<{ id: string }>("SELECT id FROM jobs WHERE dedupe_key = ?", [dedupeKey])) return null;
+  const keyMatch = one<{ id: string }>("SELECT id FROM jobs WHERE dedupe_key = ?", [dedupeKey]);
+  if (keyMatch) return { id: keyMatch.id, rule: "normalised employer + title SHA-1" };
 
   const applicationUrl = normaliseApplicationUrl(job.applicationUrl);
   if (applicationUrl) {
@@ -163,16 +189,32 @@ export function insertDiscovered(job: DiscoveredJob, runId: string | null): stri
       "SELECT id FROM jobs WHERE lower(replace(replace(coalesce(application_url, url), 'https://', ''), 'http://', '')) LIKE ?",
       [`%${applicationUrl.replace(/^https?:\/\//, "")}%`],
     );
-    if (rows) return null;
+    if (rows) return { id: rows.id, rule: "normalised application URL" };
   }
 
   const nearDuplicate = one<{ id: string }>(
     "SELECT id FROM jobs WHERE lower(trim(title)) = lower(trim(?)) AND lower(trim(company)) = lower(trim(?))",
     [job.title, job.company],
   );
-  if (nearDuplicate) return null;
+  if (nearDuplicate) return { id: nearDuplicate.id, rule: "case-insensitive employer + title" };
+  return null;
+}
+
+/** A duplicate is evidence that the original vacancy is still live. */
+function touchJobSeen(id: string, source: string): void {
+  run("UPDATE jobs SET last_seen_at = ?, last_seen_source = ? WHERE id = ?", [nowIso(), source, id]);
+}
+
+/** Returns the new row id, or null when the vacancy is a duplicate. */
+export function insertDiscovered(job: DiscoveredJob, runId: string | null): string | null {
+  const duplicate = findDuplicateJob(job);
+  if (duplicate) {
+    touchJobSeen(duplicate.id, job.source);
+    return null;
+  }
 
   const id = `job_${crypto.randomBytes(8).toString("hex")}`;
+  const dedupeKey = dedupeKeyFor(job.company, job.title);
   const classification = classifyVacancy({
     title: job.title,
     company: job.company,
@@ -183,8 +225,9 @@ export function insertDiscovered(job: DiscoveredJob, runId: string | null): stri
     run(
       `INSERT INTO jobs (id, source, source_platform, external_id, title, company, company_domain, location, remote,
                          employment_type, salary, url, application_url, description, classification, requirements,
-                         published_at, posted_at, discovered_at, status, dedupe_key, run_id, raw)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)`,
+                         published_at, posted_at, discovered_at, status, dedupe_key, run_id, raw,
+                         last_seen_at, last_seen_source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)`,
       [
         id,
         job.source,
@@ -208,6 +251,8 @@ export function insertDiscovered(job: DiscoveredJob, runId: string | null): stri
         dedupeKey,
         runId,
         job.raw ? JSON.stringify(job.raw).slice(0, 20000) : null,
+        nowIso(),
+        job.source,
       ],
     );
   } catch (error) {
@@ -246,10 +291,47 @@ export type RawDiscovery = {
   requests: number;
   responses: number;
   error: string | null;
+  errorCategory: SourceErrorCategory | null;
+  attempts: number;
+  durationMs: number;
+  diagnostics: SourceAttemptDiagnostic[];
+  numPages?: number;
 };
 
+function logSourceDiagnostics(runId: string, source: string, diagnostics: SourceAttemptDiagnostic[]): void {
+  for (const event of diagnostics) {
+    if (event.retryDecision === "success") continue;
+    const line = JSON.stringify({
+      event: "job_source.attempt",
+      runId,
+      source,
+      attempt: event.attempt,
+      durationMs: event.durationMs,
+      statusCode: event.statusCode,
+      errorCategory: event.errorCategory,
+      retryDecision: event.retryDecision,
+      retryAfterMs: event.retryAfterMs,
+    });
+    if (event.retryDecision === "stop") console.warn(line);
+    else console.info(line);
+  }
+}
+
 function emptyRaw(): RawDiscovery {
-  return { jobs: [], fetched: 0, filtered: 0, fresh: 0, requests: 0, responses: 0, error: null };
+  return {
+    jobs: [],
+    fetched: 0,
+    filtered: 0,
+    fresh: 0,
+    requests: 0,
+    responses: 0,
+    error: null,
+    errorCategory: null,
+    attempts: 0,
+    durationMs: 0,
+    diagnostics: [],
+    numPages: 1,
+  };
 }
 
 /** "sumup" -> "Sumup", "any-botics" -> "Any Botics" for display only. */
@@ -286,16 +368,45 @@ export async function discoverFromAshby(boards: string[]): Promise<RawDiscovery>
     const slug = board.trim().replace(/^https?:\/\/jobs\.ashbyhq\.com\//i, "").replace(/\/+$/, "");
     if (!slug) continue;
     out.requests += 1;
+    const endpoint = `${base}/${encodeURIComponent(slug)}?includeCompensation=true`;
+    const freshBefore = out.fresh;
+    const filteredBefore = out.filtered;
+    let postingCount = 0;
     try {
-      const response = await fetch(`${base}/${encodeURIComponent(slug)}?includeCompensation=true`, {
-        headers: { Accept: "application/json", "User-Agent": "AT-AI-Workforce/2.0 (personal job search)" },
-        signal: AbortSignal.timeout(15_000),
-        cache: "no-store",
+      const request = await requestJson<{ jobs?: AshbyPosting[]; data?: { jobs?: AshbyPosting[] } }>(endpoint, {
+        timeoutMs: 25_000,
+        // Ashby's largest public boards exceed the shared 4 MB default. The
+        // shared reader's hard ceiling remains 8 MB, so this raises only the
+        // per-board budget and still bounds memory use.
+        maxResponseBytes: 8 * 1024 * 1024,
+        label: `Ashby board ${slug}`,
       });
-      if (!response.ok) throw new Error(`Ashby board ${slug} responded ${response.status}`);
+      out.attempts += request.attempts;
+      out.durationMs += request.durationMs;
+      out.diagnostics.push(...request.diagnostics);
+      if (!request.ok || !request.data) {
+        out.error = request.error ?? `Ashby board ${slug} could not be read.`;
+        out.errorCategory = request.errorCategory ?? "unknown";
+        recordSourceCheck({
+          key: "ashby",
+          employer: slug,
+          endpoint,
+          method: "Public Ashby posting API",
+          ok: false,
+          postings: 0,
+          fresh: 0,
+          relevant: 0,
+          error: out.error,
+          errorCategory: out.errorCategory,
+          statusCode: request.statusCode,
+          attempts: request.attempts,
+          durationMs: request.durationMs,
+        });
+        continue;
+      }
       out.responses += 1;
-      const payload = (await response.json()) as { jobs?: AshbyPosting[]; data?: { jobs?: AshbyPosting[] } };
-      const postings = payload.jobs ?? payload.data?.jobs ?? [];
+      const postings = request.data.jobs ?? request.data.data?.jobs ?? [];
+      postingCount = postings.length;
       out.fetched += postings.length;
       for (const posting of postings) {
         if (posting.isListed === false) {
@@ -340,8 +451,39 @@ export async function discoverFromAshby(boards: string[]): Promise<RawDiscovery>
           raw: { board: slug, id: posting.id, department: posting.department, team: posting.team },
         });
       }
+      recordSourceCheck({
+        key: "ashby",
+        employer: slug,
+        endpoint,
+        method: "Public Ashby posting API",
+        ok: true,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: Math.max(0, postingCount - (out.filtered - filteredBefore)),
+        error: null,
+        errorCategory: null,
+        statusCode: request.statusCode,
+        attempts: request.attempts,
+        durationMs: request.durationMs,
+      });
     } catch (error) {
       out.error = error instanceof Error ? error.message : `Ashby board ${slug} could not be reached.`;
+      out.errorCategory = "unknown";
+      recordSourceCheck({
+        key: "ashby",
+        employer: slug,
+        endpoint,
+        method: "Public Ashby posting API",
+        ok: false,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: 0,
+        error: out.error,
+        errorCategory: "unknown",
+        statusCode: null,
+        attempts: 0,
+        durationMs: Date.now(),
+      });
     }
   }
   return out;
@@ -376,15 +518,39 @@ export async function discoverFromCareerPages(pages: string[]): Promise<RawDisco
     const pageUrl = page.trim();
     if (!/^https?:\/\//i.test(pageUrl)) continue;
     out.requests += 1;
+    const freshBefore = out.fresh;
+    const filteredBefore = out.filtered;
+    let postingCount = 0;
     try {
-      const response = await fetch(pageUrl, {
-        headers: { Accept: "text/html", "User-Agent": "AT-AI-Workforce/2.0 (personal job search)" },
-        signal: AbortSignal.timeout(20_000),
-        cache: "no-store",
+      const request = await requestText(pageUrl, {
+        timeoutMs: 20_000,
+        label: new URL(pageUrl).hostname,
       });
-      if (!response.ok) throw new Error(`${pageUrl} responded ${response.status}`);
+      out.attempts += request.attempts;
+      out.durationMs += request.durationMs;
+      out.diagnostics.push(...request.diagnostics);
+      if (!request.ok || request.data === null) {
+        out.error = request.error ?? `${pageUrl} could not be read.`;
+        out.errorCategory = request.errorCategory ?? "unknown";
+        recordSourceCheck({
+          key: `career:${new URL(pageUrl).hostname}`,
+          employer: new URL(pageUrl).hostname,
+          endpoint: pageUrl,
+          method: "schema.org JobPosting on employer page",
+          ok: false,
+          postings: 0,
+          fresh: 0,
+          relevant: 0,
+          error: out.error,
+          errorCategory: out.errorCategory,
+          statusCode: request.statusCode,
+          attempts: request.attempts,
+          durationMs: request.durationMs,
+        });
+        continue;
+      }
       out.responses += 1;
-      const html = await response.text();
+      const html = request.data;
       const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
       const postings: JsonLdNode[] = [];
       for (const block of blocks) {
@@ -394,6 +560,7 @@ export async function discoverFromCareerPages(pages: string[]): Promise<RawDisco
           // A malformed block is skipped; valid blocks on the same page still count.
         }
       }
+      postingCount = postings.length;
       out.fetched += postings.length;
       const host = new URL(pageUrl).hostname.replace(/^www\./, "");
       for (const posting of postings) {
@@ -437,8 +604,24 @@ export async function discoverFromCareerPages(pages: string[]): Promise<RawDisco
           raw: { page: pageUrl, identifier: asText(posting.identifier) },
         });
       }
+      recordSourceCheck({
+        key: `career:${host}`,
+        employer: host,
+        endpoint: pageUrl,
+        method: "schema.org JobPosting on employer page",
+        ok: true,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: Math.max(0, postingCount - (out.filtered - filteredBefore)),
+        error: null,
+        errorCategory: null,
+        statusCode: request.statusCode,
+        attempts: request.attempts,
+        durationMs: request.durationMs,
+      });
     } catch (error) {
       out.error = error instanceof Error ? error.message : `${pageUrl} could not be reached.`;
+      out.errorCategory = "unknown";
     }
   }
   return out;
@@ -471,16 +654,41 @@ export async function discoverFromGreenhouse(boards: string[]): Promise<RawDisco
       .replace(/\/+$/, "");
     if (!token) continue;
     out.requests += 1;
+    const endpoint = `https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(token)}/jobs?content=true`;
+    const freshBefore = out.fresh;
+    const filteredBefore = out.filtered;
+    let postingCount = 0;
     try {
-      const response = await fetch(`https://boards-api.greenhouse.io/v1/boards/${encodeURIComponent(token)}/jobs?content=true`, {
-        headers: { Accept: "application/json", "User-Agent": "AT-AI-Workforce/2.0 (personal job search)" },
-        signal: AbortSignal.timeout(20_000),
-        cache: "no-store",
+      const request = await requestJson<{ jobs?: GreenhouseJob[] }>(endpoint, {
+        timeoutMs: 20_000,
+        label: `Greenhouse board ${token}`,
       });
-      if (!response.ok) throw new Error(`Greenhouse board ${token} responded ${response.status}`);
+      out.attempts += request.attempts;
+      out.durationMs += request.durationMs;
+      out.diagnostics.push(...request.diagnostics);
+      if (!request.ok || !request.data) {
+        out.error = request.error ?? `Greenhouse board ${token} could not be read.`;
+        out.errorCategory = request.errorCategory ?? "unknown";
+        recordSourceCheck({
+          key: "greenhouse",
+          employer: token,
+          endpoint,
+          method: "Public Greenhouse job-board API",
+          ok: false,
+          postings: 0,
+          fresh: 0,
+          relevant: 0,
+          error: out.error,
+          errorCategory: out.errorCategory,
+          statusCode: request.statusCode,
+          attempts: request.attempts,
+          durationMs: request.durationMs,
+        });
+        continue;
+      }
       out.responses += 1;
-      const payload = (await response.json()) as { jobs?: GreenhouseJob[] };
-      const postings = payload.jobs ?? [];
+      const postings = request.data.jobs ?? [];
+      postingCount = postings.length;
       out.fetched += postings.length;
       const company = prettifySlug(token);
       for (const posting of postings) {
@@ -523,8 +731,39 @@ export async function discoverFromGreenhouse(boards: string[]): Promise<RawDisco
           raw: { board: token, id: posting.id },
         });
       }
+      recordSourceCheck({
+        key: "greenhouse",
+        employer: token,
+        endpoint,
+        method: "Public Greenhouse job-board API",
+        ok: true,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: Math.max(0, postingCount - (out.filtered - filteredBefore)),
+        error: null,
+        errorCategory: null,
+        statusCode: request.statusCode,
+        attempts: request.attempts,
+        durationMs: request.durationMs,
+      });
     } catch (error) {
       out.error = error instanceof Error ? error.message : `Greenhouse board ${token} could not be reached.`;
+      out.errorCategory = "unknown";
+      recordSourceCheck({
+        key: "greenhouse",
+        employer: token,
+        endpoint,
+        method: "Public Greenhouse job-board API",
+        ok: false,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: 0,
+        error: out.error,
+        errorCategory: "unknown",
+        statusCode: null,
+        attempts: 0,
+        durationMs: 0,
+      });
     }
   }
   return out;
@@ -555,15 +794,41 @@ export async function discoverFromLever(sites: string[]): Promise<RawDiscovery> 
     const slug = site.trim().replace(/^https?:\/\/jobs\.lever\.co\//i, "").replace(/\/+$/, "");
     if (!slug) continue;
     out.requests += 1;
+    const endpoint = `https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`;
+    const freshBefore = out.fresh;
+    const filteredBefore = out.filtered;
+    let postingCount = 0;
     try {
-      const response = await fetch(`https://api.lever.co/v0/postings/${encodeURIComponent(slug)}?mode=json`, {
-        headers: { Accept: "application/json", "User-Agent": "AT-AI-Workforce/2.0 (personal job search)" },
-        signal: AbortSignal.timeout(20_000),
-        cache: "no-store",
+      const request = await requestJson<LeverPosting[]>(endpoint, {
+        timeoutMs: 20_000,
+        label: `Lever site ${slug}`,
       });
-      if (!response.ok) throw new Error(`Lever site ${slug} responded ${response.status}`);
+      out.attempts += request.attempts;
+      out.durationMs += request.durationMs;
+      out.diagnostics.push(...request.diagnostics);
+      if (!request.ok || !request.data) {
+        out.error = request.error ?? `Lever site ${slug} could not be read.`;
+        out.errorCategory = request.errorCategory ?? "unknown";
+        recordSourceCheck({
+          key: "lever",
+          employer: slug,
+          endpoint,
+          method: "Public Lever postings API",
+          ok: false,
+          postings: 0,
+          fresh: 0,
+          relevant: 0,
+          error: out.error,
+          errorCategory: out.errorCategory,
+          statusCode: request.statusCode,
+          attempts: request.attempts,
+          durationMs: request.durationMs,
+        });
+        continue;
+      }
       out.responses += 1;
-      const postings = (await response.json()) as LeverPosting[];
+      const postings = request.data;
+      postingCount = postings.length;
       out.fetched += postings.length;
       const company = prettifySlug(slug);
       for (const posting of postings) {
@@ -607,8 +872,39 @@ export async function discoverFromLever(sites: string[]): Promise<RawDiscovery> 
           raw: { site: slug, id: posting.id, team: posting.categories?.team },
         });
       }
+      recordSourceCheck({
+        key: "lever",
+        employer: slug,
+        endpoint,
+        method: "Public Lever postings API",
+        ok: true,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: Math.max(0, postingCount - (out.filtered - filteredBefore)),
+        error: null,
+        errorCategory: null,
+        statusCode: request.statusCode,
+        attempts: request.attempts,
+        durationMs: request.durationMs,
+      });
     } catch (error) {
       out.error = error instanceof Error ? error.message : `Lever site ${slug} could not be reached.`;
+      out.errorCategory = "unknown";
+      recordSourceCheck({
+        key: "lever",
+        employer: slug,
+        endpoint,
+        method: "Public Lever postings API",
+        ok: false,
+        postings: postingCount,
+        fresh: out.fresh - freshBefore,
+        relevant: 0,
+        error: out.error,
+        errorCategory: "unknown",
+        statusCode: null,
+        attempts: 0,
+        durationMs: 0,
+      });
     }
   }
   return out;
@@ -624,6 +920,10 @@ export type SourceHealth = {
   fresh: number;
   relevant: number;
   error: string | null;
+  error_category: string | null;
+  status_code: number | null;
+  last_attempts: number;
+  last_duration_ms: number;
   last_checked_at: string;
   last_success_at: string | null;
 };
@@ -639,16 +939,23 @@ export function recordSourceCheck(input: {
   fresh: number;
   relevant: number;
   error: string | null;
+  errorCategory?: SourceErrorCategory | null;
+  statusCode?: number | null;
+  attempts?: number;
+  durationMs?: number;
 }): void {
   const at = nowIso();
   run(
-    `INSERT INTO discovery_source_status (source_key, employer, endpoint, method, ok, postings, fresh, relevant, error, last_checked_at, last_success_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO discovery_source_status
+       (source_key, employer, endpoint, method, ok, postings, fresh, relevant, error, error_category, status_code, last_attempts, last_duration_ms, last_checked_at, last_success_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(source_key, endpoint) DO UPDATE SET
        employer = excluded.employer, method = excluded.method, ok = excluded.ok,
        postings = excluded.postings, fresh = excluded.fresh, relevant = excluded.relevant,
-       error = excluded.error, last_checked_at = excluded.last_checked_at,
-       last_success_at = CASE WHEN excluded.ok = 1 AND excluded.postings > 0 THEN excluded.last_checked_at ELSE discovery_source_status.last_success_at END`,
+       error = excluded.error, error_category = excluded.error_category, status_code = excluded.status_code,
+       last_attempts = excluded.last_attempts, last_duration_ms = excluded.last_duration_ms,
+       last_checked_at = excluded.last_checked_at,
+       last_success_at = CASE WHEN excluded.ok = 1 THEN excluded.last_checked_at ELSE discovery_source_status.last_success_at END`,
     [
       input.key,
       input.employer,
@@ -659,6 +966,10 @@ export function recordSourceCheck(input: {
       input.fresh,
       input.relevant,
       input.error ? input.error.slice(0, 1000) : null,
+      input.errorCategory ?? null,
+      input.statusCode ?? null,
+      Math.max(0, input.attempts ?? 0),
+      Math.max(0, input.durationMs ?? 0),
       at,
       input.ok ? at : null,
     ],
@@ -686,8 +997,13 @@ type JobsChDocument = {
   _links?: { detail_en?: { href?: string }; detail_de?: { href?: string } };
 };
 
-export async function discoverFromJobsCh(queries: string[]): Promise<RawDiscovery> {
+export async function discoverFromJobsCh(
+  queries: string[],
+  options: { page?: number; detailsPerQuery?: number } = {},
+): Promise<RawDiscovery> {
   const out = emptyRaw();
+  const page = Math.min(2, Math.max(1, Math.floor(options.page ?? 1)));
+  const detailsPerQuery = Math.min(8, Math.max(0, Math.floor(options.detailsPerQuery ?? 8)));
   if (queries.length === 0) return out;
   const source = one<{ enabled: number }>("SELECT enabled FROM job_sources WHERE key = 'jobs_ch'");
   if (source && source.enabled !== 1) {
@@ -700,24 +1016,47 @@ export async function discoverFromJobsCh(queries: string[]): Promise<RawDiscover
     const query = rawQuery.trim();
     if (!query) continue;
     // jobs.ch rejects rows > 20 with HTTP 422 (verified 2026-11-18).
-    const endpoint = `https://www.jobs.ch/api/v1/public/search?query=${encodeURIComponent(query)}&rows=20`;
+    // The public response exposes current_page/num_pages; Phase 1 fetches only
+    // one additional page and splits the existing detail budget across both.
+    const endpoint = `https://www.jobs.ch/api/v1/public/search?query=${encodeURIComponent(query)}&rows=20&page=${page}`;
     out.requests += 1;
     const filteredBefore = out.filtered;
     const freshBefore = out.fresh;
     let postings = 0;
     try {
-      const response = await fetch(endpoint, {
-        headers: { Accept: "application/json", "User-Agent": "AT-AI-Workforce/2.4 (personal job search)" },
-        signal: AbortSignal.timeout(20_000),
-        cache: "no-store",
+      const request = await requestJson<{ documents?: JobsChDocument[]; num_pages?: number }>(endpoint, {
+        timeoutMs: 20_000,
+        label: "jobs.ch",
       });
-      if (!response.ok) throw new Error(`jobs.ch query "${query}" responded ${response.status}`);
+      out.attempts += request.attempts;
+      out.durationMs += request.durationMs;
+      out.diagnostics.push(...request.diagnostics);
+      if (!request.ok || !request.data) {
+        out.error = request.error ?? `jobs.ch query "${query}" could not be read.`;
+        out.errorCategory = request.errorCategory ?? "unknown";
+        recordSourceCheck({
+          key: "jobs_ch",
+          employer: "jobs.ch (aggregated Swiss employers)",
+          endpoint,
+          method: "Public search JSON + schema.org JobPosting detail",
+          ok: false,
+          postings: 0,
+          fresh: 0,
+          relevant: 0,
+          error: out.error,
+          errorCategory: out.errorCategory,
+          statusCode: request.statusCode,
+          attempts: request.attempts,
+          durationMs: request.durationMs,
+        });
+        continue;
+      }
       out.responses += 1;
-      const payload = (await response.json()) as { documents?: JobsChDocument[] };
-      const documents = payload.documents ?? [];
+      out.numPages = Math.max(out.numPages ?? 1, Math.min(2, Number(request.data.num_pages ?? 1) || 1));
+      const documents = request.data.documents ?? [];
       postings = documents.length;
       out.fetched += documents.length;
-      let detailBudget = 8;
+      let detailBudget = detailsPerQuery;
       for (const document of documents) {
         // The same vacancy can match several queries; it is fetched and counted
         // once per run rather than being sent through detail retrieval twice.
@@ -757,14 +1096,13 @@ export async function discoverFromJobsCh(queries: string[]): Promise<RawDiscover
         if (detailUrl) {
           try {
             out.requests += 1;
-            const detail = await fetch(detailUrl, {
-              headers: { Accept: "text/html", "User-Agent": "AT-AI-Workforce/2.4 (personal job search)" },
-              signal: AbortSignal.timeout(20_000),
-              cache: "no-store",
-            });
-            if (detail.ok) {
+            const detail = await requestText(detailUrl, { timeoutMs: 20_000, label: "jobs.ch detail" });
+            out.attempts += detail.attempts;
+            out.durationMs += detail.durationMs;
+            out.diagnostics.push(...detail.diagnostics);
+            if (detail.ok && detail.data !== null) {
               out.responses += 1;
-              const html = await detail.text();
+              const html = detail.data;
               const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
               const parsed: JsonLdNode[] = [];
               for (const block of blocks) {
@@ -810,7 +1148,7 @@ export async function discoverFromJobsCh(queries: string[]): Promise<RawDiscover
           applicationUrl: url,
           description,
           publishedAt,
-          raw: { job_id: document.job_id, query, publication_date: publishedAt, languages: document.language_skills },
+          raw: { job_id: document.job_id, query, page, publication_date: publishedAt, languages: document.language_skills },
         });
       }
       recordSourceCheck({
@@ -823,9 +1161,14 @@ export async function discoverFromJobsCh(queries: string[]): Promise<RawDiscover
         fresh: out.fresh - freshBefore,
         relevant: Math.max(0, postings - (out.filtered - filteredBefore)),
         error: null,
+        errorCategory: null,
+        statusCode: request.statusCode,
+        attempts: request.attempts,
+        durationMs: request.durationMs,
       });
     } catch (error) {
       out.error = error instanceof Error ? error.message : `jobs.ch query "${query}" could not be reached.`;
+      out.errorCategory = "unknown";
       recordSourceCheck({
         key: "jobs_ch",
         employer: "jobs.ch (aggregated Swiss employers)",
@@ -836,6 +1179,10 @@ export async function discoverFromJobsCh(queries: string[]): Promise<RawDiscover
         fresh: 0,
         relevant: 0,
         error: out.error,
+        errorCategory: "unknown",
+        statusCode: null,
+        attempts: 0,
+        durationMs: 0,
       });
     }
   }
@@ -904,6 +1251,7 @@ export async function discoverJobSources(options: {
   const pages = Math.min(5, Math.max(1, options.pages ?? 2));
 
   const research = await researchJobs(pages, 40);
+  logSourceDiagnostics(options.runId, "arbeitnow", research.diagnostics);
   result.inserted += research.inserted;
   result.duplicates += research.duplicates;
   result.filtered += research.filteredOut;
@@ -922,6 +1270,11 @@ export async function discoverJobSources(options: {
     fresh: research.fresh,
     relevant: Math.max(0, research.fetched - research.filteredOut),
     duplicates: research.duplicates,
+    configured: true,
+    status: research.error ? (research.responses > 0 ? "partial" : "failed") : research.fetched === 0 ? "empty" : "ok",
+    attempts: research.attempts,
+    durationMs: research.durationMs,
+    errorCategory: research.errorCategory ?? null,
   });
   if (research.error) result.warnings.push(`Arbeitnow: ${research.error}`);
   recordSourceCheck({
@@ -934,10 +1287,14 @@ export async function discoverJobSources(options: {
     fresh: research.fresh,
     relevant: Math.max(0, research.fetched - research.filteredOut),
     error: research.error ?? null,
+    errorCategory: research.errorCategory ?? null,
+    attempts: research.attempts,
+    durationMs: research.durationMs,
   });
 
   const boards = options.ashbyBoards ?? configuredAshbyBoards();
   const ashby = await discoverFromAshby(boards);
+  logSourceDiagnostics(options.runId, "ashby", ashby.diagnostics);
   let ashbyInserted = 0;
   let ashbyDuplicates = 0;
   for (const job of ashby.jobs) {
@@ -957,17 +1314,23 @@ export async function discoverJobSources(options: {
     label: `Ashby boards (${boards.length} configured)`,
     fetched: ashby.fetched,
     inserted: ashbyInserted,
-    error: ashby.error ?? (boards.length === 0 ? "No Ashby boards are configured." : null),
+    error: ashby.error,
     requests: ashby.requests,
     responses: ashby.responses,
     fresh: ashby.fresh,
     relevant: Math.max(0, ashby.fetched - ashby.filtered),
     duplicates: ashbyDuplicates,
+    configured: boards.length > 0,
+    status: boards.length === 0 ? "skipped" : ashby.responses === 0 ? "failed" : ashby.error ? "partial" : ashby.fetched === 0 ? "empty" : "ok",
+    attempts: ashby.attempts,
+    durationMs: ashby.durationMs,
+    errorCategory: ashby.errorCategory,
   });
   if (ashby.error) result.warnings.push(`Ashby: ${ashby.error}`);
 
   const greenhouseBoards = options.greenhouseBoards ?? configuredGreenhouseBoards();
   const greenhouse = await discoverFromGreenhouse(greenhouseBoards);
+  logSourceDiagnostics(options.runId, "greenhouse", greenhouse.diagnostics);
   let greenhouseInserted = 0;
   let greenhouseDuplicates = 0;
   for (const job of greenhouse.jobs) {
@@ -987,17 +1350,23 @@ export async function discoverJobSources(options: {
     label: `Greenhouse boards (${greenhouseBoards.length} configured)`,
     fetched: greenhouse.fetched,
     inserted: greenhouseInserted,
-    error: greenhouse.error ?? (greenhouseBoards.length === 0 ? "No Greenhouse boards are configured." : null),
+    error: greenhouse.error,
     requests: greenhouse.requests,
     responses: greenhouse.responses,
     fresh: greenhouse.fresh,
     relevant: Math.max(0, greenhouse.fetched - greenhouse.filtered),
     duplicates: greenhouseDuplicates,
+    configured: greenhouseBoards.length > 0,
+    status: greenhouseBoards.length === 0 ? "skipped" : greenhouse.responses === 0 ? "failed" : greenhouse.error ? "partial" : greenhouse.fetched === 0 ? "empty" : "ok",
+    attempts: greenhouse.attempts,
+    durationMs: greenhouse.durationMs,
+    errorCategory: greenhouse.errorCategory,
   });
   if (greenhouse.error) result.warnings.push(`Greenhouse: ${greenhouse.error}`);
 
   const leverSites = options.leverSites ?? configuredLeverSites();
   const lever = await discoverFromLever(leverSites);
+  logSourceDiagnostics(options.runId, "lever", lever.diagnostics);
   let leverInserted = 0;
   let leverDuplicates = 0;
   for (const job of lever.jobs) {
@@ -1017,12 +1386,17 @@ export async function discoverJobSources(options: {
     label: `Lever sites (${leverSites.length} configured)`,
     fetched: lever.fetched,
     inserted: leverInserted,
-    error: lever.error ?? (leverSites.length === 0 ? "No Lever sites are configured." : null),
+    error: lever.error,
     requests: lever.requests,
     responses: lever.responses,
     fresh: lever.fresh,
     relevant: Math.max(0, lever.fetched - lever.filtered),
     duplicates: leverDuplicates,
+    configured: leverSites.length > 0,
+    status: leverSites.length === 0 ? "skipped" : lever.responses === 0 ? "failed" : lever.error ? "partial" : lever.fetched === 0 ? "empty" : "ok",
+    attempts: lever.attempts,
+    durationMs: lever.durationMs,
+    errorCategory: lever.errorCategory,
   });
   if (lever.error) result.warnings.push(`Lever: ${lever.error}`);
   recordSourceCheck({
@@ -1030,15 +1404,37 @@ export async function discoverJobSources(options: {
     employer: leverSites.join(", ") || null,
     endpoint: "https://api.lever.co/v0/postings",
     method: "Public Lever postings API",
-    ok: !lever.error && leverSites.length > 0,
+    ok: !lever.error && lever.responses > 0,
     postings: lever.fetched,
     fresh: lever.fresh,
     relevant: Math.max(0, lever.fetched - lever.filtered),
-    error: lever.error ?? (leverSites.length === 0 ? "No Lever sites are configured." : null),
+    error: lever.error,
+    errorCategory: lever.errorCategory,
+    attempts: lever.attempts,
+    durationMs: lever.durationMs,
   });
 
   const jobsChQueries = options.jobsChQueries ?? configuredJobsChQueries();
-  const jobsCh = await discoverFromJobsCh(jobsChQueries);
+  const jobsChPageLimit = Math.min(2, Math.max(1, options.pages ?? 1));
+  // Splitting the detail budget keeps a two-page run within the same maximum
+  // number of full-detail fetches as the previous single-page connector.
+  const jobsChDetailsPerQuery = jobsChPageLimit > 1 ? 4 : 8;
+  const jobsCh = await discoverFromJobsCh(jobsChQueries, { page: 1, detailsPerQuery: jobsChDetailsPerQuery });
+  if (jobsChPageLimit > 1 && (jobsCh.numPages ?? 1) > 1 && !jobsCh.error) {
+    const secondPage = await discoverFromJobsCh(jobsChQueries, { page: 2, detailsPerQuery: jobsChDetailsPerQuery });
+    jobsCh.jobs.push(...secondPage.jobs);
+    jobsCh.fetched += secondPage.fetched;
+    jobsCh.filtered += secondPage.filtered;
+    jobsCh.fresh += secondPage.fresh;
+    jobsCh.requests += secondPage.requests;
+    jobsCh.responses += secondPage.responses;
+    jobsCh.attempts += secondPage.attempts;
+    jobsCh.durationMs += secondPage.durationMs;
+    jobsCh.diagnostics.push(...secondPage.diagnostics);
+    jobsCh.error = jobsCh.error ?? secondPage.error;
+    jobsCh.errorCategory = jobsCh.errorCategory ?? secondPage.errorCategory;
+  }
+  logSourceDiagnostics(options.runId, "jobs_ch", jobsCh.diagnostics);
   let jobsChInserted = 0;
   let jobsChDuplicates = 0;
   for (const job of jobsCh.jobs) {
@@ -1055,20 +1451,26 @@ export async function discoverJobSources(options: {
   result.filtered += jobsCh.filtered;
   result.sources.push({
     key: "jobs_ch",
-    label: `jobs.ch (${jobsChQueries.length} verified queries)`,
+    label: `jobs.ch (${jobsChQueries.length} verified queries, up to ${jobsChPageLimit} page${jobsChPageLimit === 1 ? "" : "s"})`,
     fetched: jobsCh.fetched,
     inserted: jobsChInserted,
-    error: jobsCh.error ?? (jobsChQueries.length === 0 ? "No jobs.ch queries are configured." : null),
+    error: jobsCh.error,
     requests: jobsCh.requests,
     responses: jobsCh.responses,
     fresh: jobsCh.fresh,
     relevant: Math.max(0, jobsCh.fetched - jobsCh.filtered),
     duplicates: jobsChDuplicates,
+    configured: jobsChQueries.length > 0,
+    status: jobsChQueries.length === 0 ? "skipped" : jobsCh.responses === 0 ? "failed" : jobsCh.error ? "partial" : jobsCh.fetched === 0 ? "empty" : "ok",
+    attempts: jobsCh.attempts,
+    durationMs: jobsCh.durationMs,
+    errorCategory: jobsCh.errorCategory,
   });
   if (jobsCh.error) result.warnings.push(`jobs.ch: ${jobsCh.error}`);
 
   const pagesConfig = options.careerPages ?? configuredCareerPages();
   const careers = await discoverFromCareerPages(pagesConfig);
+  logSourceDiagnostics(options.runId, "career_pages", careers.diagnostics);
   let careerInserted = 0;
   let careerDuplicates = 0;
   for (const job of careers.jobs) {
@@ -1088,12 +1490,17 @@ export async function discoverJobSources(options: {
     label: `Employer career pages (${pagesConfig.length} configured)`,
     fetched: careers.fetched,
     inserted: careerInserted,
-    error: careers.error ?? (pagesConfig.length === 0 ? "No employer career pages are configured." : null),
+    error: careers.error,
     requests: careers.requests,
     responses: careers.responses,
     fresh: careers.fresh,
     relevant: Math.max(0, careers.fetched - careers.filtered),
     duplicates: careerDuplicates,
+    configured: pagesConfig.length > 0,
+    status: pagesConfig.length === 0 ? "skipped" : careers.responses === 0 ? "failed" : careers.error ? "partial" : careers.fetched === 0 ? "empty" : "ok",
+    attempts: careers.attempts,
+    durationMs: careers.durationMs,
+    errorCategory: careers.errorCategory,
   });
   if (careers.error) result.warnings.push(`Employer pages: ${careers.error}`);
   recordSourceCheck({
@@ -1107,13 +1514,42 @@ export async function discoverJobSources(options: {
     }).join(", ") || null,
     endpoint: "https://employer-careers (configured pages)",
     method: "schema.org JobPosting on employer pages",
-    ok: !careers.error && pagesConfig.length > 0,
+    ok: !careers.error && careers.responses > 0,
     postings: careers.fetched,
     fresh: careers.fresh,
     relevant: Math.max(0, careers.fetched - careers.filtered),
-    error: careers.error ?? (pagesConfig.length === 0 ? "No employer career pages are configured." : null),
+    error: careers.error,
+    errorCategory: careers.errorCategory,
+    attempts: careers.attempts,
+    durationMs: careers.durationMs,
   });
 
+  const checked = result.sources.filter((source) => (source.requests ?? 0) > 0);
+  const succeeded = checked.filter((source) => (source.responses ?? 0) > 0);
+  const failed = checked.filter((source) => (source.responses ?? 0) === 0);
+  const partial = succeeded.filter((source) => Boolean(source.error));
+  result.sourcesChecked = checked.length;
+  result.sourcesSucceeded = succeeded.length;
+  result.sourcesFailed = failed.length;
+  result.sourcesPartial = partial.length;
+  result.allSourcesFailed = checked.length > 0 && succeeded.length === 0;
+  result.discoveryState =
+    checked.length === 0
+      ? "not_configured"
+      : succeeded.length === 0
+        ? "failed"
+        : partial.length > 0 || failed.length > 0
+          ? "partial"
+          : result.inserted === 0
+            ? "empty"
+            : "ok";
+  if (result.allSourcesFailed) {
+    result.warnings.push(
+      `All ${checked.length} configured source(s) failed. No discovery success is claimed and no vacancy was invented.`,
+    );
+  } else if (checked.length === 0) {
+    result.warnings.push("No job source is configured. Discovery did not run.");
+  }
   result.discovered = result.inserted;
   return result;
 }

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { AgentAvatar } from "./AgentAvatar";
+import { agentIdentity } from "@/lib/agent-identity";
 
 type Msg = { id: string | number; role: string; content: string; created_at?: string };
 type VoiceSettings = { voice: string; speed: number; volume: number; muted: boolean; spokenProgress: boolean };
@@ -378,7 +379,7 @@ export function VoiceAssistant({
             <div className="flex items-center gap-2.5 min-w-0">
               <AgentAvatar agentKey="coordinator" status={listening ? "working" : speaking ? "thinking" : "idle"} size={38} />
               <div className="min-w-0">
-                <div className="text-[13.5px] font-semibold truncate">Chief Coordinator</div>
+                <div className="text-[13.5px] font-semibold truncate">{agentIdentity("coordinator").name}</div>
                 <div className="text-[11px]" style={{ color: "var(--muted)" }}>
                   {listening ? "Listening — speak, then press stop" : processing ? "Coordinating your request…" : speaking ? "Speaking — press interrupt to stop" : "Voice and text · approval rules unchanged"}
                 </div>
@@ -506,7 +507,7 @@ export function VoiceAssistant({
                 onChange={(event) => setInput(event.target.value)}
                 placeholder={mode === "voice" ? "Speak, or type an instruction…" : "Type an instruction…"}
                 disabled={processing}
-                aria-label="Message the Chief Coordinator"
+                aria-label={`Message ${agentIdentity("coordinator").name}`}
               />
               <button type="submit" className="btn btn-primary btn-sm" disabled={processing || !input.trim()}>
                 Send

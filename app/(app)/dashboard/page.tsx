@@ -8,7 +8,8 @@ import { unreadNotifications } from "@/lib/notify";
 import { cleanupExpiredDocuments } from "@/lib/retention";
 import { PageHead, HeroStat, Stat, Empty, Flash, Progress } from "@/components/ui";
 import { relativeTime, formatDateTime, formatDate, param } from "@/lib/format";
-import { pauseAllAction, resumeAllAction, startWorkflowAction } from "@/lib/actions/agents";
+import { pauseAllAction, resumeAllAction } from "@/lib/actions/agents";
+import { startAutonomousRecruitmentAction } from "@/lib/actions/recruitment";
 import { SubmitButton } from "@/components/SubmitButton";
 import { Icon } from "@/components/icons";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
@@ -18,6 +19,8 @@ import { freeLlmPolicyIssue, providerHealth } from "@/lib/providers";
 import { WorkflowFlow } from "@/components/WorkflowFlow";
 import { AiQueuePanel } from "@/components/AiQueuePanel";
 import { activeWorkflow } from "@/lib/workflow";
+import { latestWorkflowForUser } from "@/lib/workflow-view";
+import { agentIdentity } from "@/lib/agent-identity";
 
 export const dynamic = "force-dynamic";
 
@@ -79,11 +82,9 @@ export default async function DashboardPage({
   const topMatches = all<{ id: string; title: string; company: string; match_score: number; match_flag: string }>(
     "SELECT id, title, company, match_score, match_flag FROM jobs WHERE match_flag IN ('strong','possible') ORDER BY match_score DESC LIMIT 4",
   );
-  const workflow = one<{ label: string; status: string; summary: string | null; finished_at: string | null }>(
-    "SELECT label, status, summary, finished_at FROM workflows ORDER BY created_at DESC LIMIT 1",
-  );
+  const workflow = latestWorkflowForUser(user);
   const paused = agents.filter((a) => a.status === "paused").length;
-  const active = activeWorkflow();
+  const active = activeWorkflow(user);
   const health = await providerHealth();
   const gateway = health.find((item) => item.name === "freellmapi");
   const ollama = health.find((item) => item.name === "ollama");
@@ -111,10 +112,10 @@ export default async function DashboardPage({
         sub="Live recruitment operation: every figure below is read from your database, not a sample."
         actions={
           <>
-            <form action={startWorkflowAction}>
-              <input type="hidden" name="pages" value="2" />
-              <SubmitButton pendingLabel="Queuing agents…" className="btn btn-primary">
-                <Icon name="jobs" /> Start job search
+            <form action={startAutonomousRecruitmentAction}>
+              <input type="hidden" name="return_to" value="/dashboard" />
+              <SubmitButton pendingLabel="Starting autonomous run…" className="btn btn-primary">
+                <Icon name="jobs" /> Start recruitment run
               </SubmitButton>
             </form>
             <Link href="/assistant" className="btn">
@@ -295,6 +296,7 @@ export default async function DashboardPage({
           <div className="card-body grid g2">
             {agents.map((agent) => {
               const availability = agentAvailability(agent.key);
+              const identity = agentIdentity(agent.key);
               const displayStatus = effectiveAgentStatus(agent.status, agent.enabled === 1, availability);
               const exec = taskExecutionMeta(lastExecution.get(agent.key) ?? {});
               return (
@@ -303,13 +305,13 @@ export default async function DashboardPage({
                     <div className="flex items-center gap-2.5">
                       <AgentAvatar agentKey={agent.key} status={displayStatus} />
                       <div>
-                        <div className="name">{agent.name}</div>
-                        <div className="text-[10px] uppercase tracking-[0.07em]" style={{ color: "var(--muted)" }}>{agent.role}</div>
+                        <div className="name">{identity.name}</div>
+                        <div className="text-[10px] uppercase tracking-[0.07em]" style={{ color: "var(--muted)" }}>{identity.title}</div>
                       </div>
                     </div>
                     <AgentStatusBadge status={displayStatus} enabled={agent.enabled === 1} />
                   </div>
-                  <div className="desc">{agent.current_task ?? (displayStatus === "idle" ? "Idle — no task assigned" : agent.role)}</div>
+                  <div className="desc">{agent.current_task ?? (displayStatus === "idle" ? "Idle — no task assigned" : identity.responsibilities)}</div>
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className={`badge ${exec.tone}`} title={exec.detail} style={{ fontSize: 9.5 }}>
                       {exec.label}
@@ -407,7 +409,7 @@ export default async function DashboardPage({
           <div className="card-body">
             {topMatches.length === 0 ? (
               <Empty title="No analysed matches yet">
-                Start a job search. The research agent stores real vacancies, then the analysis agent scores them.
+                Start a job search. {agentIdentity("research").name} stores real vacancies, then {agentIdentity("analysis").name} scores them.
               </Empty>
             ) : (
               <table className="data">
@@ -449,10 +451,10 @@ export default async function DashboardPage({
             </div>
           </div>
           <div className="card-body stack" style={{ gap: 8 }}>
-            <form action={startWorkflowAction}>
-              <input type="hidden" name="pages" value="2" />
-              <SubmitButton className="btn w-full justify-start" pendingLabel="Queuing agents…">
-                <Icon name="jobs" /> Start job search
+            <form action={startAutonomousRecruitmentAction}>
+              <input type="hidden" name="return_to" value="/dashboard" />
+              <SubmitButton className="btn w-full justify-start" pendingLabel="Starting autonomous run…">
+                <Icon name="jobs" /> Start recruitment run
               </SubmitButton>
             </form>
             <Link href="/documents#upload" className="btn justify-start"><Icon name="docs" /> Upload original CV</Link>

@@ -2,7 +2,7 @@ import { requireAdmin } from "@/lib/auth";
 import { all } from "@/lib/db";
 import { PageHead, Flash } from "@/components/ui";
 import { formatDateTime, param } from "@/lib/format";
-import { createUserAction, setUserStatusAction, resetUserPasswordAction } from "@/lib/actions/admin";
+import { createUserAction, setUserStatusAction, resetUserPasswordAction, resetUserMfaAction } from "@/lib/actions/admin";
 import { SubmitButton } from "@/components/SubmitButton";
 import { PasswordInput } from "@/components/PasswordInput";
 
@@ -15,8 +15,8 @@ export default async function AdminUsersPage({
 }) {
   const admin = await requireAdmin();
   const sp = await searchParams;
-  const users = all<{ id: string; email: string; name: string; role: string; status: string; created_at: string; last_login_at: string | null }>(
-    "SELECT id, email, name, role, status, created_at, last_login_at FROM users ORDER BY created_at",
+  const users = all<{ id: string; email: string; name: string; role: string; status: string; created_at: string; last_login_at: string | null; mfa_enabled: number }>(
+    "SELECT id, email, name, role, status, created_at, last_login_at, mfa_enabled FROM users ORDER BY created_at",
   );
   const sessions = all<{ user_id: string; count: number }>("SELECT user_id, COUNT(*) AS count FROM sessions WHERE expires_at > datetime('now') GROUP BY user_id");
   const sessionMap = new Map(sessions.map((s) => [s.user_id, s.count]));
@@ -35,7 +35,7 @@ export default async function AdminUsersPage({
                 <tr key={user.id}>
                   <td>
                     <div className="cell-title">{user.name}{user.id === admin.id ? " (you)" : ""}</div>
-                    <div className="cell-sub">{user.email}</div>
+                    <div className="cell-sub">{user.email} · MFA {user.mfa_enabled ? "on" : "off"}</div>
                   </td>
                   <td><span className={`badge ${user.role === "admin" ? "badge-info" : "badge-neutral"}`}>{user.role}</span></td>
                   <td><span className={`badge ${user.status === "active" ? "badge-good" : "badge-bad"}`}>{user.status}</span></td>
@@ -53,9 +53,15 @@ export default async function AdminUsersPage({
                           </SubmitButton>
                         </form>
                       ) : null}
+                      {user.mfa_enabled ? (
+                        <form action={resetUserMfaAction}>
+                          <input type="hidden" name="id" value={user.id} />
+                          <SubmitButton className="btn btn-sm" confirm={`Reset MFA for ${user.email}? Their sessions will end and they must re-enrol.`}>Reset MFA</SubmitButton>
+                        </form>
+                      ) : null}
                       <details>
                         <summary className="btn btn-sm" style={{ listStyle: "none", cursor: "pointer" }}>Reset password</summary>
-                        <form action={resetUserPasswordAction} className="mt-2 flex gap-2" style={{ minWidth: 250 }}>
+                        <form action={resetUserPasswordAction} className="mt-2 flex gap-2" style={{ minWidth: "min(250px, 100%)" }}>
                           <input type="hidden" name="id" value={user.id} />
                           <PasswordInput id={`reset-password-${user.id}`} name="password" minLength={10} required placeholder="New password" autoComplete="new-password" />
                           <SubmitButton className="btn btn-sm" pendingLabel="Saving…">Set</SubmitButton>

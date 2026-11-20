@@ -1,7 +1,12 @@
 import { all, nowIso, one, run } from "./db";
 import { randomId } from "./security";
 import { agentDefinition, type AgentKey } from "./agent-definitions";
-import { agentIdentity } from "./agent-identity";
+import {
+  agentIdentity,
+  agentKeyForName as identityKeyForName,
+  agentKeysMentioned,
+  agentKeysNamed,
+} from "./agent-identity";
 
 /**
  * Persisted direct-conversation sessions.
@@ -26,39 +31,61 @@ export type HandoverResolution =
   | { kind: "same"; target: AgentKey; reason: string }
   | { kind: "unknown"; reason: string };
 
-const AGENT_LOOKUP: Array<[AgentKey, RegExp]> = [
-  ["coordinator", /\b(coordinator|chief coordinator|chief|orchestrator)\b/i],
-  ["research", /\b(research|research agent|job research|discovery|job search)\b/i],
-  ["analysis", /\b(analysis|analyst|job analysis|matching|scoring)\b/i],
-  ["cv", /\b(cv|resume|curriculum vitae|cv agent|cv optimisation|cv optimization)\b/i],
-  ["ats", /\b(ats|quality control|quality assurance|qc|inspector)\b/i],
-  ["cover", /\b(cover letter|cover|letter agent)\b/i],
-  ["application", /\b(application|application agent|applications agent|submission|submit)\b/i],
-  ["email", /\b(email|tracking|inbox|mail|email agent)\b/i],
-];
-
 export function normaliseAgentKey(value: string): AgentKey | null {
-  const key = value.trim().toLowerCase();
-  if (!key) return null;
-  for (const [agentKey, pattern] of AGENT_LOOKUP) {
-    if (key === agentKey || pattern.test(key)) return agentKey;
-  }
-  return null;
+  return identityKeyForName(value);
 }
 
 export function agentKeyForName(value: string): AgentKey | null {
-  const target = value.trim().toLowerCase();
-  for (const [key] of AGENT_LOOKUP) {
-    const definition = agentDefinition(key);
-    const identity = agentIdentity(key);
-    if (
-      target === key ||
-      target === definition?.name.toLowerCase() ||
-      target === identity.shortName.toLowerCase()
-    ) {
-      return key;
-    }
+  return identityKeyForName(value);
+}
+
+/**
+ * Detect a direct address such as "Noor, which applications..." or a bare
+ * "Saffa". This is deliberately before any model call, so a name selects the
+ * real agent rather than producing a pretend reply from the Coordinator.
+ */
+export function namedAddress(message: string): { target: AgentKey; remainder: string } | null {
+  const trimmed = message.trim();
+  if (!trimmed) return null;
+  // "Hi Chief, how are you?" is a direct address to Chief, not a message for
+  // whichever specialist happened to be active.
+  const withoutGreeting = trimmed.replace(/^(?:hi|hey|hello|good morning|good afternoon|good evening)[,!.\s]+/i, "").trim();
+  const exact = identityKeyForName(withoutGreeting.replace(/[.!?]+$/, ""));
+  if (exact) return { target: exact, remainder: "" };
+
+  const addressed = withoutGreeting.match(/^([A-Za-z][A-Za-z' .&-]{1,48}?)\s*[,:]\s*(.+)$/s);
+  if (addressed) {
+    const target = identityKeyForName(addressed[1]);
+    if (target) return { target, remainder: addressed[2].trim() };
   }
+
+  const bare = withoutGreeting.match(/^([A-Za-z][A-Za-z' .&-]{1,48}?)\s+(.+)$/s);
+  if (!bare) return null;
+  const target = identityKeyForName(bare[1]);
+  return target ? { target, remainder: bare[2].trim() } : null;
+}
+
+/**
+ * Explicit delegation such as "Ask Saffa to find more jobs." This is separate
+ * from a connection request: the specialist receives the actual request, while
+ * its existing read-only permissions still decide what it may execute.
+ */
+export function delegationRequest(message: string): { target: AgentKey; request: string } | null {
+  const trimmed = message.trim();
+  if (!trimmed) return null;
+
+  const ask = trimmed.match(/^(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:ask|tell|have|get)\s+(.+?)\s+to\s+(.+)$/is);
+  if (ask) {
+    const target = agentKeyForName(ask[1].trim());
+    if (target) return { target, request: ask[2].trim() };
+  }
+
+  const bring = trimmed.match(/^(?:please\s+)?(?:bring|add|include)\s+(.+?)\s+(?:into|to)\s+(?:this|the)\s+(?:conversation|chat)(?:\s+(?:to|and)\s+(.+?))?[.!?]*$/is);
+  if (bring) {
+    const target = agentKeyForName(bring[1].trim());
+    if (target) return { target, request: bring[2]?.trim() ?? "" };
+  }
+
   return null;
 }
 
@@ -68,8 +95,10 @@ export function resolveHandoverRequest(message: string): HandoverResolution | nu
   if (!text) return null;
 
   const back = /\b(take me back|go back|switch back|return me|previous agent|last agent|back to the previous)\b/i.test(text);
-  const transfer = /\b(transfer|connect|switch|handover|hand off|put me through|take me to|return to|let me talk to|let me speak to|i want to speak to|i want to talk to|speak to|talk to)\b/i.test(text);
+  const transfer = /\b(transfer|connect|switch|handover|hand off|put me through|take me to|return to|let me talk to|let me speak to|let me ask|i want to speak to|i want to talk to|i want to ask|i'd like to ask|speak to|talk to)\b/i.test(text);
   if (!back && !transfer) return null;
+  // "Talk to me about our job search" is ordinary conversation, not a switch.
+  if (!back && /\b(talk|speak)\s+(?:to|with)\s+(?:me|you)\b/i.test(text)) return null;
 
   const explicitPrevious = /\b(previous agent|last agent|back to the previous|switch back)\b/i.test(text);
   if (explicitPrevious) return { kind: "previous", reason: "Return to the previous conversational agent." };
@@ -83,14 +112,26 @@ export function resolveHandoverRequest(message: string): HandoverResolution | nu
   const direct = agentKeyForName(stripped) ?? normaliseAgentKey(stripped);
   if (direct) return { kind: "target", target: direct, reason: "Explicit agent request resolved from the registry." };
 
-  // The remaining words may contain an unambiguous agent alias in a longer
-  // sentence; scanning is still deterministic and bounded by the registry.
-  const candidates = AGENT_LOOKUP.filter(([, pattern]) => pattern.test(text));
-  if (candidates.length === 1) {
-    return { kind: "target", target: candidates[0][0], reason: "Agent alias resolved from the registry." };
+  // Prefer a personal name. "Connect me to Noor about my application" contains
+  // two registered terms but only one person, so it must not become ambiguous.
+  const named = agentKeysNamed(text);
+  if (named.length === 1) {
+    return { kind: "target", target: named[0], reason: "Explicit agent request resolved from the registry." };
+  }
+  const candidates = agentKeysMentioned(text);
+  if (named.length === 0 && candidates.length === 1) {
+    return { kind: "target", target: candidates[0], reason: "Explicit agent request resolved from the registry." };
   }
   if (back) return { kind: "previous", reason: "Return to the previous conversational agent." };
-  return { kind: "unknown", reason: "No registered agent matched that request." };
+  // Only a clear connection command with no valid target is a real routing
+  // failure. An ordinary sentence containing "talk to" stays conversational.
+  if (named.length > 1 || candidates.length > 1) {
+    return { kind: "unknown", reason: "That request names more than one agent, so the target is ambiguous." };
+  }
+  if (/\b(connect|transfer|switch|handover|put me through)\b/i.test(text)) {
+    return { kind: "unknown", reason: "No registered agent matched that request." };
+  }
+  return null;
 }
 
 export function activeAgentSession(userId: string): AgentSession {

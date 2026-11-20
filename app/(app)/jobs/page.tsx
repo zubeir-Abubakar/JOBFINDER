@@ -9,6 +9,7 @@ import { researchAction, toggleJobSourceAction } from "@/lib/actions/jobs";
 import { SubmitButton } from "@/components/SubmitButton";
 import { ManualJobForm } from "@/components/ManualJobForm";
 import { Icon } from "@/components/icons";
+import { agentIdentity } from "@/lib/agent-identity";
 
 export const dynamic = "force-dynamic";
 
@@ -54,7 +55,7 @@ export default async function JobsPage({
       <Flash ok={param(sp.ok)} error={param(sp.error)} saved={param(sp.saved)} />
       <PageHead
         title="Job discovery"
-        sub="Vacancies found by the research agent or added manually. Duplicate postings are blocked at insert time."
+        sub={`Vacancies found by ${agentIdentity("research").name} or added manually. Duplicate postings are blocked at insert time.`}
         actions={
           <>
             <form action={researchAction} className="row" style={{ gap: 6 }}>
@@ -167,7 +168,7 @@ export default async function JobsPage({
         <div className="card-head">
           <div>
             <h2>Vacancies <span className="num" style={{ color: "var(--muted)", fontWeight: 500 }}>({jobs.length})</span></h2>
-            <p className="card-sub">Scores are internal estimates from the analysis agent, not employer feedback.</p>
+            <p className="card-sub">Scores are internal estimates from Ali, not employer feedback.</p>
           </div>
         </div>
         <div className="card-body job-results">

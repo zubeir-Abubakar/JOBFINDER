@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { currentUser } from "@/lib/auth";
 import { one, UPLOAD_DIR } from "@/lib/db";
+import { safeDocumentMime } from "@/lib/document-type";
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   const user = await currentUser();
@@ -15,12 +16,17 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   if (user.role !== "admin" && doc.user_id !== user.id) return new Response("Forbidden", { status: 403 });
 
   const safe = path.basename(doc.relative_path);
+  const mime = safeDocumentMime(doc.file_name, doc.mime);
+  // Only a PDF may render inline. DOCX/TXT and unknown files are downloads, so
+  // an uploaded HTML document can never be interpreted as a same-origin page.
+  const inline = new URL(request.url).searchParams.get("inline") === "1" && mime === "application/pdf";
   try {
     const bytes = await readFile(path.join(UPLOAD_DIR, safe));
     return new Response(new Uint8Array(bytes), {
       headers: {
-        "Content-Type": doc.mime || "application/octet-stream",
-        "Content-Disposition": `${new URL(request.url).searchParams.get("inline") === "1" ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`,
+        "Content-Type": mime,
+        "Content-Disposition": `${inline ? "inline" : "attachment"}; filename*=UTF-8''${encodeURIComponent(doc.file_name)}`,
+        "X-Content-Type-Options": "nosniff",
         "Cache-Control": "private, no-store",
       },
     });

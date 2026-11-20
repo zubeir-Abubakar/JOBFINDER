@@ -2,33 +2,16 @@ import { requireUser } from "@/lib/auth";
 import { Flash, PageHead } from "@/components/ui";
 import { chatHistory, assistantSuggestions } from "@/lib/chat";
 import { sendChatMessageAction, clearChatAction, switchAgentAction } from "@/lib/actions/chat";
-import { formatDateTime, param } from "@/lib/format";
+import { param } from "@/lib/format";
 import { SubmitButton } from "@/components/SubmitButton";
+import { AssistantChat } from "@/components/AssistantChat";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
-import { agentIdentity } from "@/lib/agent-identity";
-import { agentDefinition } from "@/lib/agent-definitions";
+import { AGENT_IDENTITY_KEYS, agentIdentity } from "@/lib/agent-identity";
 import { activeAgentSession } from "@/lib/agent-sessions";
 import { voiceProfileForAgent } from "@/lib/agent-voices";
 import { getOperationalSnapshot } from "@/lib/operations";
 
 export const dynamic = "force-dynamic";
-
-type MessageMeta = {
-  agentKey?: string;
-  agentKeys?: string[];
-  sessionId?: string | null;
-  handover?: { from?: string; to?: string; status?: string; note?: string | null } | null;
-  pendingAction?: string | null;
-};
-
-function messageMeta(value: string | null): MessageMeta {
-  if (!value) return {};
-  try {
-    return JSON.parse(value) as MessageMeta;
-  } catch {
-    return {};
-  }
-}
 
 export default async function AssistantPage({
   searchParams,
@@ -40,7 +23,6 @@ export default async function AssistantPage({
   const messages = chatHistory(user.id);
   const active = activeAgentSession(user.id);
   const activeIdentity = agentIdentity(active.agentKey);
-  const activeDefinition = agentDefinition(active.agentKey);
   const snapshot = await getOperationalSnapshot();
   const runtime = snapshot.agents.find((agent) => agent.key === active.agentKey);
   const activeVoice = voiceProfileForAgent(active.agentKey);
@@ -51,7 +33,7 @@ export default async function AssistantPage({
       <Flash ok={param(sp.ok)} error={param(sp.error)} />
       <PageHead
         title="AI assistance"
-        sub="Converse with the Chief Coordinator or a specialist, inspect live operational state, or run a grounded recruitment action. Nothing is submitted or sent without approval."
+        sub={`Converse with ${agentIdentity("coordinator").name} or a named specialist, inspect live operational state, or run a grounded recruitment action. Nothing is submitted or sent without approval.`}
         actions={
           <form action={clearChatAction}>
             <SubmitButton className="btn" confirm="Clear the conversation history for this account?">Clear conversation</SubmitButton>
@@ -67,7 +49,7 @@ export default async function AssistantPage({
               <div>
                 <h2>{activeIdentity.name}</h2>
                 <p className="card-sub">
-                  {activeDefinition?.role ?? "Specialist"} · {direct ? "direct specialist conversation" : "orchestrator"} · answers grounded in live operational data
+                  {activeIdentity.title} · {direct ? "direct specialist conversation" : "orchestrator"} · answers grounded in live operational data
                 </p>
               </div>
             </div>
@@ -87,7 +69,7 @@ export default async function AssistantPage({
               <form action={switchAgentAction} className="flex items-center gap-2">
                 <label htmlFor="agent-switch" className="sr-only">Switch direct agent</label>
                 <select id="agent-switch" name="agent" className="select" defaultValue={active.agentKey} style={{ width: "auto", minWidth: 150 }}>
-                  {["coordinator", "research", "analysis", "cv", "ats", "cover", "application", "email"].map((key) => (
+                  {AGENT_IDENTITY_KEYS.map((key) => (
                     <option key={key} value={key}>{agentIdentity(key).shortName}</option>
                   ))}
                 </select>
@@ -95,60 +77,18 @@ export default async function AssistantPage({
               </form>
             </div>
           </div>
-          <div className="chat-scroll assistant-thread">
-            {messages.length === 0 ? (
-              <div className="mx-auto max-w-md text-center">
-                <div className="mx-auto mb-3 flex justify-center">
-                  <AgentAvatar agentKey={active.agentKey} status="idle" size={54} />
-                </div>
-                <h3 className="text-[15px]">Talk directly to {activeIdentity.shortName}</h3>
-                <p className="mt-1.5 text-[12.5px] leading-relaxed" style={{ color: "var(--muted)" }}>
-                  {direct
-                    ? `You are in ${activeIdentity.name}'s own session. Ask about its work, or say “return to the coordinator”.`
-                    : "Ask about agents, providers, models, tokens, health, permissions or recruitment. Transfer requests switch the active session immediately, without waiting for the model to decide."}
-                </p>
-              </div>
-            ) : (
-              messages.map((message) => {
-                const meta = messageMeta(message.meta);
-                const agents = message.role === "assistant" ? (meta.agentKeys?.length ? meta.agentKeys : [meta.agentKey ?? "coordinator"]) : [];
-                const messageAgent = meta.agentKey ?? agents[0] ?? "coordinator";
-                return (
-                  <div key={message.id} style={{ display: "flex", flexDirection: "column" }}>
-                    <div className={`msg ${message.role === "user" ? "msg-user" : "msg-bot"}`}>{message.content}</div>
-                    <div className={`msg-meta ${message.role === "user" ? "self-end" : "self-start"}`}>
-                      {message.role === "user" ? (
-                        "You"
-                      ) : (
-                        <span className="inline-flex items-center gap-1.5">
-                          {[...new Set(agents)].map((key) => (
-                            <AgentAvatar key={key} agentKey={key} status="idle" size={18} />
-                          ))}
-                          {agentIdentity(messageAgent).shortName}
-                          {agents.length > 1 ? ` +${agents.length - 1}` : ""}
-                        </span>
-                      )}{" "}
-                      · {formatDateTime(message.created_at)}
-                    </div>
-                  </div>
-                );
-              })
-            )}
-          </div>
-          <form action={sendChatMessageAction} className="assistant-composer" style={{ borderTop: "1px solid var(--line)", padding: 12 }}>
-            <div className="flex items-end gap-2">
-              <textarea
-                name="message"
-                className="textarea"
-                rows={2}
-                required
-                placeholder={direct ? `Ask ${activeIdentity.shortName} about its work, or say “return to the coordinator”` : "Ask about agents, providers, tokens, health, permissions or recruitment"}
-                style={{ minHeight: 52 }}
-              />
-              <SubmitButton className="btn btn-primary" pendingLabel="Coordinating…">Send</SubmitButton>
-            </div>
-            <p className="hint">Discovery runs may take up to a minute. Destructive document cleanup requires a second confirmation.</p>
-          </form>
+          <AssistantChat
+            initialMessages={messages.map((message) => ({
+              id: message.id,
+              role: message.role,
+              content: message.content,
+              created_at: message.created_at,
+              meta: message.meta,
+            }))}
+            activeAgentKey={active.agentKey}
+            activeName={activeIdentity.shortName}
+            direct={direct}
+          />
         </section>
 
         <div className="stack assistant-side">

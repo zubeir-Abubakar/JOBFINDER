@@ -4,9 +4,13 @@ import { setSetting } from "./settings";
 import { randomId } from "./security";
 import { notify } from "./notify";
 import { audit } from "./audit";
+import { recordApplicationEvent } from "./application-events";
+import { existingVerifiedSubmission } from "./submission";
 import { GMAIL_IDENTITY_SCOPES, REQUIRED_GMAIL_SCOPES, GmailProfileError, gmailApiError, missingGrantedScopes, parseGmailProfile } from "./gmail-profile";
 import { generateText, type AiCallSource } from "./providers";
 import { enqueueAiJob, isQueueableAiError } from "./ai-queue";
+import { buildEmailMime } from "./email-mime";
+import { renderNotificationEmail } from "./email-template";
 
 /**
  * Gmail OAuth and mailbox integration.
@@ -39,6 +43,30 @@ export type GmailTestStatus =
   | "invalid_recipient"
   | "api_error";
 
+export type GmailSentObservation = {
+  observed: boolean;
+  messageId: string | null;
+  threadId: string | null;
+  labels: string[];
+  method: "message-id" | "rfc-message-id" | null;
+  detail: string;
+  checkedAt: string;
+};
+
+export type GmailSendReadiness = {
+  ok: boolean;
+  code: "ready" | "missing_configuration" | "authentication_failed" | "permission_denied";
+  detail: string;
+  email: string | null;
+};
+
+export type GmailBounceCheck = {
+  detected: boolean;
+  evidence: string | null;
+  detail: string;
+  checkedAt: string;
+};
+
 export type GmailTestResult = {
   status: GmailTestStatus;
   provider: "gmail";
@@ -46,6 +74,12 @@ export type GmailTestResult = {
   messageId: string | null;
   threadId: string | null;
   delivery: "unverified" | null;
+  rfcMessageId: string | null;
+  sentObserved: boolean;
+  sentFolderDetail: string | null;
+  sentFolderCheckedAt: string | null;
+  bounceDetected: boolean;
+  bounceEvidence: string | null;
   detail: string;
   at: string;
 };
@@ -120,9 +154,15 @@ function decrypt(value: string): string {
   return Buffer.concat([decipher.update(Buffer.from(data, "base64url")), decipher.final()]).toString("utf8");
 }
 
+function oauthStateKey(): string {
+  const secret = process.env.APP_SECRET_KEY?.trim();
+  if (!secret) throw new Error("APP_SECRET_KEY is required for the Gmail OAuth state.");
+  return secret;
+}
+
 export function stateToken(): string {
   const nonce = crypto.randomBytes(16).toString("base64url");
-  const signature = crypto.createHmac("sha256", process.env.APP_SECRET_KEY ?? "atw").update(nonce).digest("base64url");
+  const signature = crypto.createHmac("sha256", oauthStateKey()).update(nonce).digest("base64url");
   return `${nonce}.${signature}`;
 }
 
@@ -130,7 +170,13 @@ export function verifyState(state: string | null): boolean {
   if (!state) return false;
   const [nonce, signature] = state.split(".");
   if (!nonce || !signature) return false;
-  const expected = crypto.createHmac("sha256", process.env.APP_SECRET_KEY ?? "atw").update(nonce).digest("base64url");
+  let key: string;
+  try {
+    key = oauthStateKey();
+  } catch {
+    return false;
+  }
+  const expected = crypto.createHmac("sha256", key).update(nonce).digest("base64url");
   return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
@@ -300,13 +346,29 @@ function classify(subject: string, body: string): string {
   return "unrelated";
 }
 
-function matchApplication(subject: string, body: string): { id: string; company: string; title: string } | null {
+function matchApplication(subject: string, body: string): { id: string; job_id: string; company: string; title: string } | null {
   const haystack = `${subject}\n${body}`.toLowerCase();
-  const rows = all<{ id: string; company: string; title: string }>(
-    `SELECT a.id, j.company, j.title FROM applications a JOIN jobs j ON j.id = a.job_id
-     WHERE a.status NOT IN ('rejected') ORDER BY a.last_update DESC LIMIT 50`,
+  const rows = all<{ id: string; job_id: string; company: string; title: string }>(
+    `SELECT a.id, a.job_id, j.company, j.title FROM applications a JOIN jobs j ON j.id = a.job_id
+     WHERE a.status NOT IN ('rejected', 'rejected_by_employer', 'withdrawn') ORDER BY a.last_update DESC LIMIT 50`,
   );
-  return rows.find((row) => row.company && row.company.length > 2 && haystack.includes(row.company.toLowerCase())) ?? null;
+  const ignored = new Set(["senior", "junior", "lead", "staff", "principal", "the", "and", "for", "with", "job", "role"]);
+  const tokens = (value: string) =>
+    value
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length > 2 && !ignored.has(token));
+  let best: { row: { id: string; job_id: string; company: string; title: string }; score: number } | null = null;
+  for (const row of rows) {
+    const companyHit = Boolean(row.company && row.company.length > 2 && haystack.includes(row.company.toLowerCase()));
+    const titleWords = tokens(row.title);
+    const titleHits = titleWords.filter((token) => haystack.includes(token)).length;
+    const titleRatio = titleWords.length > 0 ? titleHits / titleWords.length : 0;
+    if (!companyHit && titleRatio < 0.6) continue;
+    const score = (companyHit ? 10 : 0) + (titleRatio >= 0.6 ? 5 : 0) + (titleRatio === 1 ? 3 : 0) + titleHits;
+    if (!best || score > best.score) best = { row, score };
+  }
+  return best?.row ?? null;
 }
 
 const AI_CATEGORIES = new Set([
@@ -445,12 +507,78 @@ export async function syncInbox(limit = 20, context: InboxContext = {}) {
       matched += 1;
       if (category === "interview_invitation") {
         run("UPDATE applications SET status = 'interview_invited', last_update = ? WHERE id = ?", [nowIso(), application.id]);
-        notify({ kind: "interview", subject: `Interview invitation: ${application.title}`, body: `${application.company} replied by email. Review the message in the inbox.` });
+        recordApplicationEvent({
+          applicationId: application.id,
+          type: "email.interview_invitation",
+          message: subject,
+          meta: { gmailId: message.id, sender },
+        });
+        notify({
+          kind: "interview",
+          dedupeKey: `email_interview:${message.id}`,
+          subject: `Interview invitation: ${application.title}`,
+          body: `${application.company} replied by email. Review the message in the inbox.`,
+        });
       } else if (category === "rejection") {
         run("UPDATE applications SET status = 'rejected', last_update = ? WHERE id = ?", [nowIso(), application.id]);
-        notify({ kind: "rejection", subject: `Rejection: ${application.title}`, body: `${application.company} sent a rejection. The application status was updated.` });
+        recordApplicationEvent({
+          applicationId: application.id,
+          type: "email.rejection",
+          message: subject,
+          meta: { gmailId: message.id, sender },
+        });
+        notify({
+          kind: "rejection",
+          dedupeKey: `email_rejection:${message.id}`,
+          subject: `Rejection: ${application.title}`,
+          body: `${application.company} sent a rejection. The application status was updated.`,
+        });
+      } else if (category === "acknowledgement") {
+        // An employer acknowledgement is verifiable receipt, including when the
+        // original automated send returned no reference. It is the one external
+        // signal that can safely resolve a submission_unknown outcome.
+        const prior = existingVerifiedSubmission(application.job_id);
+        const evidence = {
+          source: "employer_email_acknowledgement",
+          gmailId: message.id,
+          subject,
+          sender,
+          receivedAt,
+        };
+        if (!prior) {
+          run(
+            `INSERT INTO submission_attempts (id, application_id, job_id, run_id, channel, endpoint, status, http_status, reference, evidence, error, attempted_at)
+             VALUES (?, ?, ?, NULL, 'email_confirmation', NULL, 'verified', NULL, ?, ?, NULL, ?)`,
+            [`sub_${randomId()}`, application.id, application.job_id, message.id, JSON.stringify(evidence).slice(0, 12000), receivedAt],
+          );
+        }
+        run(
+          `UPDATE applications SET status = 'acknowledged', submission_status = 'verified', submission_evidence = COALESCE(submission_evidence, ?),
+             confirmation = COALESCE(confirmation, ?), confirmation_ref = COALESCE(confirmation_ref, ?), submitted_at = COALESCE(submitted_at, ?),
+             last_update = ? WHERE id = ? AND status NOT IN ('rejected', 'rejected_by_employer', 'withdrawn')`,
+          [JSON.stringify(evidence).slice(0, 12000), message.id, message.id, receivedAt, nowIso(), application.id],
+        );
+        run("UPDATE jobs SET status = 'applied' WHERE id = ?", [application.job_id]);
+        recordApplicationEvent({
+          applicationId: application.id,
+          type: "email.acknowledgement",
+          message: subject,
+          meta: { gmailId: message.id, sender, reference: message.id },
+        });
+        notify({
+          kind: "employer_confirmation",
+          dedupeKey: `email_confirmation:${application.id}:${message.id}`,
+          subject: `Employer confirmation: ${application.title}`,
+          body: `${application.company} confirmed receipt of your application. Subject: ${subject}`,
+          email: false,
+        });
       } else if (category === "recruiter_question") {
-        notify({ kind: "recruiter_question", subject: `Recruiter question: ${application.company}`, body: subject });
+        notify({
+          kind: "recruiter_question",
+          dedupeKey: `email_recruiter_question:${message.id}`,
+          subject: `Recruiter question: ${application.company}`,
+          body: subject,
+        });
       }
     }
     if (category === "interview_invitation" && !one("SELECT id FROM email_messages WHERE gmail_id = ? AND draft_id IS NOT NULL", [message.id])) {
@@ -538,9 +666,198 @@ function sendFailure(recipient: string, status: GmailTestStatus, detail: string)
     messageId: null,
     threadId: null,
     delivery: null,
+    rfcMessageId: null,
+    sentObserved: false,
+    sentFolderDetail: null,
+    sentFolderCheckedAt: null,
+    bounceDetected: false,
+    bounceEvidence: null,
     detail,
     at: nowIso(),
   };
+}
+
+/**
+ * Confirm delivery prerequisites without sending. This exercises the stored
+ * token (including refresh) against Gmail's profile endpoint and refuses a
+ * connection that cannot send or has no durable refresh path.
+ */
+export async function gmailSendReadiness(): Promise<GmailSendReadiness> {
+  const missing = gmailMissing();
+  if (missing.length > 0) {
+    return { ok: false, code: "missing_configuration", detail: missing.join(" "), email: null };
+  }
+  const row = one<GmailAccount>("SELECT * FROM gmail_accounts WHERE id = 1");
+  if (!row) return { ok: false, code: "missing_configuration", detail: "Gmail is not connected.", email: null };
+  if (!row.refresh_token) {
+    return {
+      ok: false,
+      code: "authentication_failed",
+      detail: "Gmail has no stored refresh token. Reconnect the mailbox so sending does not depend on an expiring access token.",
+      email: row.email,
+    };
+  }
+  const missingScopes = missingGrantedScopes(row.scopes);
+  if (missingScopes.length > 0) {
+    return {
+      ok: false,
+      code: "permission_denied",
+      detail: `Gmail is missing required permissions: ${missingScopes.map((scope) => scope.split("/").pop()).join(", ")}. Reconnect Gmail and approve read, draft and send access.`,
+      email: row.email,
+    };
+  }
+  try {
+    const profile = await gmailFetch<{ emailAddress?: string }>("/profile");
+    if (!profile.emailAddress) {
+      return { ok: false, code: "authentication_failed", detail: "Gmail returned no mailbox identity.", email: row.email };
+    }
+    return {
+      ok: true,
+      code: "ready",
+      detail: `Gmail token refreshed and ${profile.emailAddress} is ready to send.`,
+      email: profile.emailAddress,
+    };
+  } catch (cause) {
+    if (cause instanceof GmailProfileError && cause.kind === "scope") {
+      return { ok: false, code: "permission_denied", detail: cause.message, email: row.email };
+    }
+    return {
+      ok: false,
+      code: "authentication_failed",
+      detail: cause instanceof Error ? cause.message.slice(0, 500) : "Gmail authentication failed.",
+      email: row.email,
+    };
+  }
+}
+
+/** Check the connected mailbox's Sent label without sending another message. */
+export async function verifyGmailSentMessage(
+  messageId: string,
+  rfcMessageId?: string | null,
+): Promise<GmailSentObservation> {
+  const checkedAt = nowIso();
+  try {
+    const message = await gmailFetch<{ id?: string; threadId?: string; labelIds?: string[] }>(
+      `/messages/${encodeURIComponent(messageId)}?format=minimal`,
+    );
+    const labels = message.labelIds ?? [];
+    if (message.id === messageId && labels.includes("SENT")) {
+      return {
+        observed: true,
+        messageId,
+        threadId: message.threadId ?? null,
+        labels,
+        method: "message-id",
+        detail: "The Gmail message ID is present in the connected mailbox's Sent label.",
+        checkedAt,
+      };
+    }
+  } catch {
+    // A direct lookup can fail while an RFC Message-ID search still succeeds.
+  }
+  if (rfcMessageId) {
+    const found = await findGmailSentByRfcMessageId(rfcMessageId);
+    if (found) {
+      return {
+        observed: true,
+        messageId: found.id,
+        threadId: found.threadId ?? null,
+        labels: found.labels,
+        method: "rfc-message-id",
+        detail: "The RFC Message-ID was found in the connected mailbox's Sent label.",
+        checkedAt,
+      };
+    }
+  }
+  return {
+    observed: false,
+    messageId,
+    threadId: null,
+    labels: [],
+    method: null,
+    detail: "The message was not found in the connected mailbox's Sent label.",
+    checkedAt,
+  };
+}
+
+export async function findGmailSentByRfcMessageId(
+  rfcMessageId: string,
+): Promise<{ id: string; threadId: string | null; labels: string[] } | null> {
+  try {
+    const query = encodeURIComponent(`rfc822msgid:${rfcMessageId} label:sent`);
+    const listed = await gmailFetch<{ messages?: Array<{ id: string }> }>(`/messages?maxResults=5&q=${query}`);
+    for (const candidate of listed.messages ?? []) {
+      const message = await gmailFetch<{ id?: string; threadId?: string; labelIds?: string[] }>(
+        `/messages/${encodeURIComponent(candidate.id)}?format=minimal`,
+      );
+      const labels = message.labelIds ?? [];
+      if (message.id && labels.includes("SENT")) {
+        return { id: message.id, threadId: message.threadId ?? null, labels };
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** A conservative classifier: only an explicit DSN naming the recipient counts. */
+export function classifyBounceNotice(input: {
+  from: string;
+  subject: string;
+  snippet: string;
+  recipient: string;
+  rfcMessageId: string | null;
+}): { detected: boolean; evidence: string | null } {
+  const sender = input.from.toLowerCase();
+  const text = `${input.subject} ${input.snippet}`;
+  const fromDeliverySystem = /mailer-daemon|postmaster|mail delivery subsystem/i.test(sender);
+  // Recipient text alone is too weak: an older DSN for another message to the
+  // same owner must not mark this report as bounced. Require our RFC Message-ID.
+  const namesTarget = Boolean(input.rfcMessageId && text.includes(input.rfcMessageId));
+  const explicitFailure = /undeliverable|delivery status notification|delivery has failed|message not delivered|rejected|bounce/i.test(text);
+  if (fromDeliverySystem && namesTarget && explicitFailure) {
+    return {
+      detected: true,
+      evidence: `${input.from.slice(0, 160)} — ${input.subject.slice(0, 200)} — ${input.snippet.slice(0, 300)}`,
+    };
+  }
+  return { detected: false, evidence: null };
+}
+
+/** Best-effort DSN inspection; absence of evidence is not proof of delivery. */
+export async function inspectGmailBounce(
+  recipient: string,
+  rfcMessageId: string | null,
+): Promise<GmailBounceCheck> {
+  const checkedAt = nowIso();
+  try {
+    const query = encodeURIComponent("from:(mailer-daemon OR postmaster) newer_than:2d");
+    const listed = await gmailFetch<{ messages?: Array<{ id: string }> }>(`/messages?maxResults=5&q=${query}`);
+    for (const candidate of listed.messages ?? []) {
+      const message = await gmailFetch<GmailMessage>(
+        `/messages/${encodeURIComponent(candidate.id)}?format=metadata&metadataHeaders=From&metadataHeaders=Subject`,
+      );
+      const result = classifyBounceNotice({
+        from: header(message.payload, "From"),
+        subject: header(message.payload, "Subject"),
+        snippet: message.snippet ?? "",
+        recipient,
+        rfcMessageId,
+      });
+      if (result.detected) {
+        return { detected: true, evidence: result.evidence, detail: "A delivery-status notice naming this recipient was found.", checkedAt };
+      }
+    }
+    return { detected: false, evidence: null, detail: "No matching delivery-status notice was found.", checkedAt };
+  } catch (cause) {
+    return {
+      detected: false,
+      evidence: null,
+      detail: `Bounce evidence could not be checked: ${cause instanceof Error ? cause.message.slice(0, 300) : "unknown error"}`,
+      checkedAt,
+    };
+  }
 }
 
 /**
@@ -548,7 +865,12 @@ function sendFailure(recipient: string, status: GmailTestStatus, detail: string)
  * notification outbox. Gmail's message id proves API acceptance, not inbox
  * delivery; the latter is never claimed by this application.
  */
-export async function sendGmailEmail(to: string, subject: string, body: string): Promise<GmailTestResult> {
+export async function sendGmailEmail(
+  to: string,
+  subject: string,
+  body: string,
+  options: { html?: string | null; rfcMessageId?: string | null; from?: string | null; verifySentFolder?: boolean; inspectBounce?: boolean } = {},
+): Promise<GmailTestResult> {
   const recipient = to.trim();
   if (!validRecipient(recipient)) return sendFailure(recipient, "invalid_recipient", "Enter a valid notification email address.");
 
@@ -566,11 +888,26 @@ export async function sendGmailEmail(to: string, subject: string, body: string):
   }
 
   try {
+    const from = options.from?.trim() || one<GmailAccount>("SELECT email FROM gmail_accounts WHERE id = 1")?.email || "";
+    const mime = buildEmailMime({
+      from,
+      to: recipient,
+      subject,
+      text: body,
+      html: options.html ?? null,
+      messageId: options.rfcMessageId ?? null,
+    });
     const sent = await gmailFetch<{ id?: string; threadId?: string }>("/messages/send", {
       method: "POST",
-      body: JSON.stringify({ raw: draftEmail(recipient, subject, body) }),
+      body: JSON.stringify({ raw: mime.raw }),
     });
     if (!sent?.id) return sendFailure(recipient, "unverified", "Gmail returned a successful response without a message ID. Delivery cannot be confirmed.");
+    const observation = options.verifySentFolder === false
+      ? null
+      : await verifyGmailSentMessage(sent.id, mime.rfcMessageId).catch(() => null);
+    const bounce = options.inspectBounce === false
+      ? null
+      : await inspectGmailBounce(recipient, mime.rfcMessageId).catch(() => null);
     return {
       provider: "gmail",
       recipientMasked: maskEmail(recipient),
@@ -578,7 +915,19 @@ export async function sendGmailEmail(to: string, subject: string, body: string):
       messageId: sent.id,
       threadId: sent.threadId ?? null,
       delivery: "unverified",
-      detail: "Gmail accepted the message. Delivery to the mailbox is not independently verified by the application.",
+      rfcMessageId: mime.rfcMessageId,
+      sentObserved: Boolean(observation?.observed && !bounce?.detected),
+      sentFolderDetail: bounce?.detected
+        ? "A delivery-status notice was found; Sent-folder presence does not establish inbox delivery."
+        : observation?.detail ?? "Sent-folder verification did not complete.",
+      sentFolderCheckedAt: observation?.checkedAt ?? bounce?.checkedAt ?? null,
+      bounceDetected: Boolean(bounce?.detected),
+      bounceEvidence: bounce?.evidence ?? null,
+      detail: bounce?.detected
+        ? "Gmail accepted the message, but a delivery-status notice indicates it was rejected or bounced."
+        : observation?.observed
+          ? "Gmail accepted the message and it is present in the connected mailbox's Sent label. Recipient inbox delivery is not independently confirmed."
+          : "Gmail accepted the message. Sent-folder observation did not complete; recipient inbox delivery is not independently confirmed.",
       at: nowIso(),
     };
   } catch (cause) {
@@ -617,14 +966,17 @@ export async function verifyGmailAccess(): Promise<{ ok: boolean; email: string 
  * account. Exactly one API send call is made.
  */
 export async function sendGmailTestEmail(to: string): Promise<GmailTestResult> {
+  const subject = "AT AI Workforce | Gmail delivery test";
   const body = [
-    "This is a test message from Towfiq AI Agents.",
+    "This is a test message from AT AI Workforce.",
     "",
     `Requested at ${new Date().toISOString()}.`,
     "If you received this, Gmail accepted the send request from the connected mailbox.",
     "The application can confirm API acceptance but cannot independently verify inbox delivery.",
   ].join("\n");
-  return sendGmailEmail(to, "Towfiq AI Agents — Gmail test", body);
+  return sendGmailEmail(to, subject, body, {
+    html: renderNotificationEmail({ subject, body, kind: "email_test" }).html,
+  });
 }
 
 /** Persist and audit the result so the Settings card shows the last real outcome. */

@@ -5,11 +5,25 @@ import { useActionState, useState } from "react";
 import { loginAction, type LoginState } from "@/app/login/actions";
 import { SubmitButton } from "./SubmitButton";
 import { PasswordInput } from "./PasswordInput";
+import { MfaForm } from "./MfaForm";
 
 export function LoginForm() {
   const [state, action] = useActionState<LoginState | undefined, FormData>(loginAction, undefined);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+
+  if (state?.mfaRequired) {
+    return (
+      <div className="stack" style={{ gap: 14 }}>
+        <div className="auth-form-heading" style={{ marginBottom: 0 }}>
+          <span className="auth-kicker">Second factor</span>
+          <h2>Verify it is you</h2>
+          <p>Enter the code from your authenticator app, or use a recovery code.</p>
+        </div>
+        <MfaForm />
+      </div>
+    );
+  }
 
   return (
     <form action={action} className="stack" style={{ gap: 14 }}>

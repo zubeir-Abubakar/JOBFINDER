@@ -4,7 +4,7 @@ A working multi-agent recruitment operations platform for a single owner, built 
 
 ## What actually works
 
-- **Authentication** — an established administrator (`abubakar@admin.com`; the legacy `admin@admin.com` address is migrated once without changing the password or related records), optional owner account created from the admin console or with `OWNER_*` / `ADMIN_*` environment variables, scrypt password hashing, database-backed sessions (hashed tokens), HttpOnly cookies, login rate limiting and audit logging. No default password is seeded or re-asserted.
+- **Authentication** — an established administrator (`abubakar@admin.com`; the legacy `admin@admin.com` address is migrated once without changing the password or related records), optional owner account created from the admin console or with `OWNER_*` / `ADMIN_*` environment variables, scrypt password hashing, database-backed sessions (hashed tokens), HttpOnly cookies, durable login throttling, optional TOTP MFA with one-time recovery codes, and audit logging. No default password is seeded or re-asserted.
 - **RBAC** — the owner workspace (`/dashboard`, `/jobs`, `/documents`, …) and the administrator console (`/admin/…`) are enforced server-side in layouts and in every server action. An owner cannot reach admin pages by typing a URL.
 - **Professional profile** — seeded with the facts in the brief (no invented dates, certifications or skills), fully editable; skill levels distinguish exposure from working/advanced expertise.
 - **CV upload and extraction** — PDF (unpdf), DOCX (mammoth) and TXT are parsed locally, stored under `data/uploads`, and the detected name/email/phone/LinkedIn/skills are presented for review. Nothing is applied until you confirm; the original CV is never overwritten.
@@ -18,7 +18,7 @@ A working multi-agent recruitment operations platform for a single owner, built 
 - **AI assistant** — the Chief Coordinator handles conversation and workspace actions in two explicit paths. Conversational replies use the free provider service with a local fallback; workspace commands (search, list/filter vacancies, analyse, generate documents, review packages, show applications and recruiter messages, update preferences, pause/resume agents, reports, confirmed cleanup) execute deterministically against the database. Context from the current conversation is included, and destructive cleanup requires confirmation.
 - **Analytics** — daily/weekly/monthly discovery and application charts, funnel, status distribution, conversion rates, source and CV-version performance, all from live SQL, with date filtering and daily/weekly/monthly reports.
 - **Admin console** — system health, database statistics, storage usage, user management (create/disable/reset password), agent controls and JSON configuration, AI/API settings, email/Gmail OAuth settings, security policy, `VACUUM INTO` backups, retention management and audit logs.
-- **Security** — path-safe file storage (random names, downloads through an authenticated route), upload size/type validation, no public CV URLs, audit logging of logins, uploads, deletions, submissions and configuration changes.
+- **Security** — path-safe file storage (random names, downloads through an authenticated route), content-signature upload validation, no public CV URLs, encrypted MFA secrets, durable SQLite API counters, trusted-proxy IP handling, production-only HSTS, outbound URL filtering, loopback/token-gated health output, and audit logging of logins, uploads, deletions, submissions and configuration changes.
 
 ## Setup
 
@@ -43,6 +43,14 @@ Administrators can open both the admin console and the owner workspace. To keep 
 
 For development: `npm run dev`. Type checking: `npm run typecheck`.
 
+### Recruitment activity email
+
+Scheduled recruitment runs produce a branded **AT AI Workforce | Recruitment Activity Report | [Date]** email. The HTML is built from persisted SQLite rows for the Europe/Zurich day, with a plain-text fallback and the existing `Logo.jpeg` attached inline by Content-ID so Gmail does not depend on a public image URL. It reports the executive summary, verified submissions with evidence, actual employer/ATS confirmations, pending work, failed tasks, all eight agent activity rows and next actions. A prepared package or an unverified attempt is never counted as a submitted application.
+
+Immediate events (verified submission, submission failure, employer confirmation, agent error) use the same branded shell. Delivery remains a separate durable outbox, so a Gmail failure cannot trigger a second submission. The daily report is sent once per date; manual runs send an immediate run summary, not a duplicate daily report.
+
+The live local policy is deliberately paused until the acceptance checks are approved: standing authorisation is inactive, approval mode is on and `recruitment_dry_run` is true. Reactivation is an explicit owner action, and the dry-run gate is also enforced inside the final submission function.
+
 Data lives in `./data` (SQLite database, uploads, backups) and is git-ignored. Back it up from **Admin → Security → Run database backup**.
 
 ## Why these choices
@@ -54,7 +62,7 @@ Data lives in `./data` (SQLite database, uploads, backups) and is git-ignored. B
 | LangGraph | Purpose-built coordinator + task table in `lib/agents.ts` | The brief allows an equivalent orchestration framework; sequential execution and structured task records fit the hardware constraint. |
 | SQLite → PostgreSQL | SQLite via Node's built-in `node:sqlite` | No native dependency, zero setup. All SQL is portable; the schema is in `lib/db.ts`. |
 | Gmail OAuth | OAuth routes + encrypted tokens + read/sync/draft/send-approval | Credentials come from the server environment; the redirect URI must be registered in Google Cloud. Tokens never reach the browser. |
-| Playwright application submission | Configured HTTP form endpoint with evidence capture | Employer portals require logins/CAPTCHA/MFA and are never automated. An explicitly configured form endpoint (`RECRUITMENT_SUBMISSION_ENDPOINT`) can submit; it must return a confirmation reference, otherwise the application is recorded as `submission_unverified`. No ATS-specific adapter ships and no endpoint is configured by default. |
+| Playwright application submission | Configured HTTP form endpoint plus ATS adapters with evidence capture | Employer portals may require logins/CAPTCHA/MFA; those are never automated. A configured form endpoint (`RECRUITMENT_SUBMISSION_ENDPOINT`) or an employer-issued ATS credential can submit; success without a confirmation reference is recorded as `submission_unverified`. No live endpoint or credential is configured by default. |
 | LLM provider | FreeLLMAPI primary → local Ollama fallback through one service | Deterministic scoring, matching and document facts stay authoritative. LLM output is used for planning, narrative and review notes, never invented facts. Paid models are blocked. Gemini/OpenRouter are not text fallbacks; Gemini is voice-only. |
 
 ## Local Ollama fallback
@@ -83,9 +91,10 @@ it, every package is queued for a human and nothing is sent); a running host or
 host cron at 10:00 Europe/Zurich; further board identifiers or career-page URLs
 to widen coverage; Gmail credentials for inbox tracking.
 
-**Not implemented** — ATS-specific submission adapters (Ashby, Greenhouse and
-Lever apply APIs), portal login/CAPTCHA/MFA automation, and automatic email
-applications. No application has been submitted to a real employer.
+**Not implemented** — portal login/CAPTCHA/MFA automation and automatic email
+applications. Greenhouse, Lever and Ashby adapters exist but require an
+explicitly supplied employer credential and are disabled without one. No
+application has been submitted to a real employer.
 
 ## Deliberate limitations (not hidden in the UI)
 
@@ -93,6 +102,8 @@ applications. No application has been submitted to a real employer.
 - Job discovery uses public, key-free feeds: Arbeitnow, Ashby job boards, Greenhouse job boards, Lever sites and employer pages that publish schema.org `JobPosting` JSON-LD. Ashby boards, Greenhouse boards, Lever sites and career-page URLs must be configured; jobs.ch is not scraped (terms of use). No vacancy is invented.
 - The assistant can converse naturally, but it cannot invent workspace facts and does not claim an action succeeded without a backend result. Its workspace actions remain deterministic and approval gates are unchanged.
 - The daily run is started by an in-process scheduler while the application is running, and the same tick is exposed at `GET/POST /api/cron/recruitment` for a host cron. A switched-off machine cannot run it; a run outside the catch-up window is recorded as missed instead of being executed late. A restart marks interrupted workflow steps failed and pauses the run so it can be resumed.
+- API throttling is durable across processes sharing the SQLite file, but it is not a distributed limiter for horizontal scaling.
+- TOTP MFA is available per account but is not forced by policy. Enrol both the owner and administrator and store recovery codes offline before exposing the workspace.
 
 ## Project map
 
@@ -171,10 +182,181 @@ restart does not lose them.
 | `RECRUITMENT_SUBMISSION_ENABLED` | `false` disables automatic sending. |
 | `RECRUITMENT_DRY_RUN` | `true` prepares and verifies but sends nothing. |
 | `RECRUITMENT_CATCHUP_HOURS` | Catch-up window before a run is recorded as missed (default 6). |
-| `RECRUITMENT_SCHEDULER` | `false` disables the in-process tick. |
+| `RECRUITMENT_SCHEDULER` | `false` disables the in-process tick (and the daily executive brief tick). |
 
 `npx tsx --test tests/recruitment.test.ts` covers the DST-correct schedule,
 schedule persistence, duplicate-run protection, the 85% floor, cross-source
 deduplication, eligibility, the full orchestrated run, duplicate-submission
 blocking, threshold exclusion and missed-run recording. Discovery and submission
 use mocked HTTP boundaries; no test contacts a real employer.
+
+### Daily executive brief
+
+The Chief Coordinator publishes one consolidated executive brief at **17:00
+Europe/Zurich**. It is a separate durable `schedule_jobs` row (`daily_executive_brief`),
+so a completed recruitment run does not send its own competing email. Routine
+successes stay in-app; the brief carries the verified submission count, blocked
+exceptions, agent-by-agent reconciliation, Coordinator assessment and next
+priorities.
+
+The brief is written to the existing `notification_outbox`, deduplicated as
+`executive_brief:YYYY-MM-DD`. Gmail API acceptance, Sent-folder observation and
+recipient delivery remain separate facts. A failed attempt is retried with
+bounded backoff, and a retry checks the stored RFC Message-ID in Gmail Sent
+before submitting again. A missing public `APP_BASE_URL` omits the dashboard CTA
+but does not block the email; loopback and private links are never emitted. The
+admin **Email & reports** page shows the schedule, Send Now/Resend controls,
+Gmail message IDs, Sent-folder evidence and the exact delivery state.
+
+A public `APP_BASE_URL` is mandatory for a live brief: the dashboard link must
+open the existing `/dashboard` route on another device. If the origin is
+missing, loopback or private, the Coordinator refuses to queue the report and
+records the configuration blocker instead of sending a broken localhost link.
+`npx tsx --test tests/executive-brief.test.ts` covers metric truth, missing agent
+reports, empty periods, section order, plain-text/HTML rendering, the inline
+logo, deduplication, scheduler/DST, retries and the no-secret boundary.
+`npx tsx scripts/render-executive-brief-preview.ts` renders a clearly labelled
+**TEST DATA** sample under `artifacts/` without sending anything.
+
+## Android PWA and local HTTPS
+
+AT AI Workforce ships a web app manifest, shell-only service worker and icons
+generated from the original `Logo.jpeg`. The installed app launches in standalone
+mode with the AT Workforce icon.
+
+### Why the current LAN HTTP address is not installable
+
+Android Chrome treats `http://<Mac-LAN-IP>:3000` as an insecure origin. It will
+display the site, but service workers, PWA installation and microphone access
+are blocked outside a secure context. `localhost` is special-cased only on the
+Mac itself; it does not apply to the Samsung. Do not disable browser security or
+expose the development server publicly.
+
+### Start a private local HTTPS server
+
+```bash
+npm run dev:https
+```
+
+The first run creates a private local CA and a LAN certificate under `certs/`
+(ignored by Git). The server certificate is regenerated on each start so the
+Mac's current hotspot address is included in its SAN. The command listens on
+`0.0.0.0:3000`, registers the shell-only service worker on the HTTPS origin, and
+prints the LAN address(es). A plain HTTP development session does not register
+the worker or count as installable.
+
+If you only want to create or refresh the certificates:
+
+```bash
+npm run dev:https:cert
+```
+
+The generator includes `localhost`, the loopback address, the Mac's local
+hostname and every current LAN IPv4 address in the certificate's Subject
+Alternative Names. It also verifies those SANs and the CA signature before the
+server starts, so a stale or incomplete certificate fails loudly instead of
+producing a service-worker SSL error later.
+
+### Trust the local CA on macOS
+
+The Samsung and the Mac use separate trust stores. Trusting the CA on the phone
+does not trust it in Chrome on the Mac. From the project root, add only the
+public CA certificate to your login keychain:
+
+```bash
+security add-trusted-cert -r trustRoot -k "$HOME/Library/Keychains/login.keychain-db" certs/local-ca.crt
+```
+
+No private key is installed or copied. If macOS asks for your login/Keychain
+password, enter it. This grants trust to the current user only.
+
+If the command reports an authorization error, or your administrator policy
+requires system-wide trust, an administrator can instead run:
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain certs/local-ca.crt
+```
+
+Prefer the login-keychain command above unless system-wide trust is genuinely
+required. Never copy `certs/local-ca.key`, `certs/local.key` or any private key
+to a browser, phone or another device, and do not install either `.key` file
+anywhere.
+
+GUI alternative: open `certs/local-ca.crt` in **Keychain Access**, add it to the
+**login** keychain, double-click **AT AI Workforce Local CA**, expand **Trust**,
+set **When using this certificate** to **Always Trust**, close the window and
+authenticate. Fully quit and reopen Chrome afterward.
+
+Verify the Mac trust without bypassing certificate checks:
+
+```bash
+security verify-cert -c certs/local.crt -p ssl -n localhost -L
+curl -sS -o /dev/null -w '%{http_code}\n' https://localhost:3000/sw.js
+```
+
+The verification must succeed and curl must print `200`. If Chrome still shows
+the old offline screen, clear the site data for `localhost` once, then reload.
+
+### Trust the local CA on the Samsung
+
+1. Keep `certs/local-ca.crt` private to your devices. Never copy `*.key` files.
+2. Transfer only `certs/local-ca.crt` to the Samsung.
+3. Open **Settings → Security and privacy → More security settings →
+   Encryption & credentials → Install a certificate → CA certificate**.
+4. Select the AT AI Workforce local CA and confirm the Android warning.
+5. On the Samsung, open `https://<Mac-LAN-IP>:3000` in Chrome. The address must
+   match the LAN address printed by `npm run dev:https`.
+
+If the hotspot assigns a new address, stop the server, restart
+`npm run dev:https`, and use the newly printed address. The CA does not need to
+be reinstalled; only the server certificate is replaced.
+
+### Install from Samsung Chrome
+
+1. Open the HTTPS address and sign in.
+2. Open Chrome's three-dot menu.
+3. Choose **Add to Home screen** (or **Install app**) and confirm **Install**.
+4. Launch **AT Workforce** from the home screen. It should open without the
+   normal browser address bar.
+
+Keep the Mac awake and the Next.js process running. The app still uses the
+existing local SQLite backend and all existing server actions.
+
+### If Chrome still says the app cannot be installed
+
+Do not use the HTTP LAN address, and do not disable browser security. On the
+Samsung, open **Chrome → the HTTPS address → Settings → Mobile diagnostics**
+(or navigate directly to `/diagnostics`). The page checks all of the following
+without uploading anything:
+
+- `window.isSecureContext` and the exact origin
+- Manifest status, content type, `start_url`, `scope`, `display` and icon URLs
+- The natural dimensions of the 192, 512 and maskable icons
+- Active, waiting and installing service-worker registrations
+- Whether Chrome captured a `beforeinstallprompt` event
+
+If the HTTPS address shows a certificate warning, the CA was not installed as a
+**CA certificate**. Remove any CA installed under **VPN and app user
+certificate**, install `certs/local-ca.crt` again under **CA certificate**, then
+fully close and reopen Chrome. The lock icon must be normal before installation
+can work.
+
+If the diagnostics page shows a service-worker registration error or a stale
+waiting worker, stop the dev server, restart `npm run dev:https`, and reload.
+In Chrome, clear the site's storage from **Settings → Site settings → All sites →
+[the app host] → Clear & reset** if the old worker keeps serving a stale
+manifest. The current worker uses `atw-shell-v6` and fetches the manifest
+network-first, so a corrected manifest is not hidden by the old cache.
+
+If installation is still unavailable, copy the diagnostics report and include
+it with the exact Chrome error. A 200 response for the manifest or icons alone
+does not prove installability; Chrome must see a trusted secure context, an
+active fetch-capable service worker and a valid manifest with usable icons.
+
+### What the service worker caches
+
+Only the offline shell, manifest, icons and immutable static assets are cached.
+`/api/*`, `/admin`, `/login`, `/setup`, `/change-password`, `/documents`,
+`/applications` and `/inbox` are never served from cache. Authentication tokens,
+CV files, application records, employer correspondence and candidate data are
+not stored in the PWA cache. Logout and server-side session expiry are unchanged.

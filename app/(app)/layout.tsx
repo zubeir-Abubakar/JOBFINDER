@@ -4,6 +4,7 @@ import { AppShell } from "@/components/AppShell";
 import { unreadNotificationCount } from "@/lib/notify";
 import { avatarUrlFor } from "@/lib/account";
 import { chatHistory } from "@/lib/chat";
+import { activeAgentSession } from "@/lib/agent-sessions";
 
 export const dynamic = "force-dynamic";
 
@@ -16,6 +17,7 @@ export default async function OwnerLayout({ children }: { children: React.ReactN
       variant="app"
       unreadCount={unreadNotificationCount()}
       assistantMessages={chatHistory(user.id, 30).map((message) => ({ id: message.id, role: message.role, content: message.content, created_at: message.created_at }))}
+      activeAgentKey={activeAgentSession(user.id).agentKey}
     >
       {children}
     </AppShell>

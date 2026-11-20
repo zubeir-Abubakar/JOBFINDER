@@ -41,8 +41,8 @@ export default async function JobDetailPage({
     "SELECT id, status, approved_at, submitted_at, confirmation FROM applications WHERE job_id = ?",
     [job.id],
   );
-  const documents = all<{ id: string; display_name: string; kind: string; version: string; status: string; ats_score: number | null; created_at: string; mime: string }>(
-    "SELECT id, display_name, kind, version, status, ats_score, created_at, mime FROM documents WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
+  const documents = all<{ id: string; display_name: string; kind: string; version: string; status: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; created_at: string; mime: string }>(
+    "SELECT id, display_name, kind, version, status, ats_score, quality_status, quality_score, created_at, mime FROM documents WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
     [job.id],
   );
 
@@ -92,7 +92,7 @@ export default async function JobDetailPage({
                   <p className="card-sub">
                     {analysis
                       ? `${flagLabel(analysis.flag)} · scored ${formatDateTime(analysis.generatedAt)} by ${analysis.engine}`
-                      : "Not analysed yet. The analysis agent reads the full description against your verified profile."}
+                      : "Not analysed yet. Ali reads the full description against your verified profile."}
                   </p>
                 </div>
               </div>
@@ -218,7 +218,7 @@ export default async function JobDetailPage({
             <div className="card-head">
               <div>
                 <h2>Application package</h2>
-                <p className="card-sub">Tailored CV, cover letter and ATS audit for this vacancy.</p>
+                <p className="card-sub">Tailored CV, cover letter and separate CV-ATS/document-quality audits for this vacancy.</p>
               </div>
             </div>
             <div className="card-body stack" style={{ gap: 10 }}>
@@ -254,7 +254,9 @@ export default async function JobDetailPage({
                     <div key={doc.id} className="between card-quiet px-3 py-2">
                       <div>
                         <div className="text-[12px] font-medium">{doc.kind === "tailored_cv" ? "CV" : "Cover letter"} · v{doc.version} · {doc.mime.includes("pdf") ? "PDF" : "DOCX"}</div>
-                        <div className="text-[10.5px]" style={{ color: "var(--muted)" }}>ATS self-check {doc.ats_score ?? "—"}/100 · {doc.status}</div>
+                        <div className="text-[10.5px]" style={{ color: "var(--muted)" }}>
+                          {doc.kind === "tailored_cv" ? `CV ATS compatibility ${doc.ats_score ?? "—"}/100` : `Cover quality ${doc.quality_status ?? "not checked"}${doc.quality_score !== null ? ` (${doc.quality_score}/100)` : ""}`} · {doc.status}
+                        </div>
                       </div>
                       <a href={`/api/documents/${doc.id}`} className="btn btn-sm">Download</a>
                     </div>

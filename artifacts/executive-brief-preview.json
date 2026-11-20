@@ -1,0 +1,85 @@
+{
+  "note": "TEST DATA only. Generated from an isolated fixture database; no live application or email was used.",
+  "subject": "AT Workforce | Daily Executive Brief | 20 Nov 2026",
+  "period": {
+    "start": "2026-11-19T23:00:00.000Z",
+    "end": "2026-11-20T23:00:00.000Z",
+    "key": "2026-11-20",
+    "label": "20 November 2026",
+    "shortLabel": "20 Nov 2026"
+  },
+  "dashboardUrl": "https://app.example.test/dashboard",
+  "metrics": [
+    {
+      "key": "discovered",
+      "label": "Jobs discovered",
+      "value": 3,
+      "display": "3",
+      "note": "Stored in the reporting period.",
+      "tone": "#0d6fa8"
+    },
+    {
+      "key": "qualified",
+      "label": "Jobs qualified",
+      "value": 3,
+      "display": "3",
+      "note": "Met every qualification rule.",
+      "tone": "#1f7a4d"
+    },
+    {
+      "key": "submitted",
+      "label": "Submitted + verified",
+      "value": 1,
+      "display": "1",
+      "note": "Employer evidence only.",
+      "tone": "#1f7a4d"
+    },
+    {
+      "key": "blocked",
+      "label": "Applications blocked",
+      "value": 1,
+      "display": "1",
+      "note": "Current queue needing action.",
+      "tone": "#b42318"
+    },
+    {
+      "key": "pending",
+      "label": "Applications pending",
+      "value": 1,
+      "display": "1",
+      "note": "Current preparation queue.",
+      "tone": "#9a6700"
+    },
+    {
+      "key": "agents",
+      "label": "Agents reporting",
+      "value": 8,
+      "display": "8 / 8",
+      "note": "Reconciled with the run ledger.",
+      "tone": "#0d6fa8"
+    }
+  ],
+  "reportingAgents": 8,
+  "registeredAgents": 8,
+  "assessment": "8 of 8 registered agents produced a structured report. 1 application was verified as submitted; 3 vacancies qualified; 1 application remains blocked; 1 application remains in the preparation queue. 1 task failure was recorded. Reconciliation requires attention: 1 execution failure was recorded by the run ledger. Resolve the exceptions before increasing throughput or enabling further automation.",
+  "achievements": [
+    "1 application has verified employer evidence; first recorded: [TEST] Northstar Payments AG — [TEST] Senior QA Automation Engineer.",
+    "3 vacancies met every qualification rule in the reporting period.",
+    "2 tailored CV or cover-letter documents were generated.",
+    "All 8 registered agents produced a record in the run ledger."
+  ],
+  "exceptions": [
+    {
+      "kind": "blocked_application",
+      "title": "[TEST] Alpine Ledger AG — [TEST] QA Lead",
+      "detail": "Human Intervention Required. Do you require visa sponsorship? Owner answer required: Do you require visa sponsorship?",
+      "reference": "app_preview_2"
+    },
+    {
+      "kind": "failed_task",
+      "title": "ats — TEST source quality check",
+      "detail": "TEST fixture warning: one source returned no readable postings.",
+      "reference": "task_preview_failed"
+    }
+  ]
+}

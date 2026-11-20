@@ -1,7 +1,9 @@
 import {
   ActivityHandling,
+  EndSensitivity,
   GoogleGenAI,
   Modality,
+  StartSensitivity,
   Type,
   type FunctionDeclaration,
   type LiveConnectConfig,
@@ -10,12 +12,14 @@ import { all, one } from "./db";
 import { randomId } from "./security";
 import { setSetting } from "./settings";
 import { agentDefinition, type AgentKey } from "./agent-definitions";
-import { agentIdentity } from "./agent-identity";
+import { agentIdentity, agentKeyForName, agentRoster } from "./agent-identity";
 import { handleAssistantMessage } from "./assistant";
-import { pauseRunningWorkflow, resumeLatestWorkflow, stopRunningWorkflow } from "./workflow";
+import { pauseRunningWorkflow, resumeLatestWorkflow, stopRunningWorkflow, workflowActor } from "./workflow";
 import { LIVE_VOICE_IDS, voiceProfileForAgent, type LiveVoiceId } from "./agent-voices";
 import { activateAgentSession, recentConversationSummary } from "./agent-sessions";
 import { getOperationalSnapshot, operationsBrief } from "./operations";
+import { latestWorkflowSnapshotForUser } from "./workflow-view";
+import { profileBrief } from "./profile-brief";
 
 /**
  * Server-only Gemini Live adapter.
@@ -102,26 +106,12 @@ function agentRows(): AgentRow[] {
   );
 }
 
-function latestWorkflow() {
-  const workflow = one<{
-    id: string;
-    label: string;
-    status: string;
-    summary: string | null;
-    error: string | null;
-    created_at: string;
-  }>("SELECT id, label, status, summary, error, created_at FROM workflows ORDER BY created_at DESC LIMIT 1");
-  if (!workflow) return null;
-  const tasks = all<{ agent_key: string; title: string; status: string; error: string | null }>(
-    "SELECT agent_key, title, status, error FROM tasks WHERE workflow_id = ? ORDER BY created_at ASC LIMIT 16",
-    [workflow.id],
-  );
-  return { workflow, tasks };
-}
-
-function workspaceFacts(): string {
+function workspaceFacts(userId: string): string {
   const agents = agentRows();
-  const workflow = latestWorkflow();
+  const snapshot = latestWorkflowSnapshotForUser(workflowActor(userId));
+  const workflow = snapshot.workflow
+    ? { workflow: snapshot.workflow, tasks: snapshot.tasks.slice(0, 16) }
+    : null;
   const jobs = one<{ total: number; today: number; strong: number }>(
     `SELECT COUNT(*) AS total,
             SUM(CASE WHEN date(discovered_at) = date('now') THEN 1 ELSE 0 END) AS today,
@@ -175,12 +165,15 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
   const isCoordinator = agentKey === "coordinator";
   const voiceProfile = voiceProfileForAgent(agentKey);
   const common = [
-    `You are ${identity.name}, speaking live by voice inside AT AI Agency.`,
+    `You are ${identity.name}, ${identity.title}, speaking live by voice inside AT AI Workforce.`,
     `Your assigned voice is ${voiceProfile.voiceName} (${voiceProfile.voiceId}). Never claim a different voice; the server fixes the voice per agent.`,
     `The owner is ${name}. You are speaking with them, not writing a document.`,
     "Speak naturally and concisely: normally one to three short sentences. Do not use markdown, bullet points, emoji, or stage directions.",
     "Your visual form is The Oracle: a calm, ancient cosmic intelligence. Let that shape your tone through quiet authority, warmth and precision, never through theatrical mysticism, archaic language, grandiose claims or role-play speeches.",
     "Answer the substance immediately. Do not repeat the owner's question, do not open with filler such as 'Certainly' or 'I'd be happy to', and vary your phrasing so it sounds spoken rather than read.",
+    "Treat ordinary language as conversation. Remember the earlier turns in this session, answer follow-up questions directly, and never require command syntax or a magic phrase.",
+    "When the owner asks about their profile or CV, use the stored profile facts below. Separate stored account fields, facts extracted from the uploaded CV, and information that is missing. Never infer an employer, qualification, date or achievement.",
+    "If the information is unavailable or a tool fails, say so plainly. Do not fill the gap with a plausible assumption.",
     "Never invent a vacancy, employer, application, score, email, task, or agent status. Every factual claim about the workspace must come from the supplied workspace facts or a tool result.",
     "Never claim that you delegated a task, changed a setting, stopped a workflow, or generated a document unless the tool result confirms it.",
     "If the owner asks for an action, call the appropriate tool. If they ask about status, use the facts or call a status tool. If a tool fails, say plainly that it failed and why.",
@@ -189,8 +182,9 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
     "The system records the transcript. Do not read the transcript aloud. Never store or describe raw microphone audio.",
   ];
   const coordinator = [
-    "You are the Chief Coordinator and the owner's primary voice contact. You know all eight agents: Coordinator, Job Research (discovery), Job Analysis (matching), CV Optimisation (tailored CVs), ATS Quality Control (factual and ATS review), Cover Letter, Application (preparation and approval), and Email & Tracking.",
-    "When the session opens, greet the owner briefly in a calm, familiar way. Preferred: \"Welcome back Sir. What are we working on today?\" Do not perform a ritual, use archaic language, or make the greeting longer than two sentences.",
+    `You are ${agentIdentity("coordinator").name}, the ${agentIdentity("coordinator").title} and the owner's primary voice contact. The workforce is: ${agentRoster().map((agent) => `${agent.name} (${agent.title})`).join("; ")}.`,
+    `When the session opens, greet the owner naturally in one short sentence and make your role clear. Do not recite a fixed introduction, perform a ritual, use archaic language, or speak for more than two sentences.`,
+    "Use agent names by default. Use a professional title when the owner asks about responsibilities, agent details or a formal report.",
     "Ask one short clarification only when an action is genuinely ambiguous; do not ask for permission to answer a question.",
     "For a specialist request, call handoff_to_agent with the correct specialist key. Do not pretend to be the specialist before the handoff succeeds.",
     "For explicit workspace actions, use run_coordinator_command with the owner's exact instruction. Use control_workflow only for explicit pause, stop, or resume requests.",
@@ -198,13 +192,15 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
     "For questions about who uses which provider or model, token counts and costs, permissions, scheduler or recruitment health, call get_operational_data first. Answer only from its result.",
   ];
   const specialist = [
-    `You are currently speaking as ${identity.name}, role: ${definition?.role ?? "specialist"}.`,
-    "Stay in this specialist role for the current voice session. Do not claim to be the Chief Coordinator.",
+    `You are currently speaking as ${identity.name}, ${identity.title}.`,
+    `On first connection, acknowledge the handoff naturally in one short sentence and continue from the existing context. Do not repeat a full introduction on every turn or claim a fresh start.`,
+    `Stay in this specialist role for the current voice session. Do not claim to be ${agentIdentity("coordinator").name}.`,
     "You can explain your role and current status, but you cannot change the workforce from this voice handoff. If the owner asks to return, call return_to_coordinator.",
-    "If the owner asks for an action outside your role, say that the Chief Coordinator handles it and offer to return to the Coordinator.",
+    `If the owner asks for an action outside your role, say that ${agentIdentity("coordinator").name} handles it and offer to return.`,
   ];
   const facts = [
-    `Current workspace facts:\n${workspaceFacts()}`,
+    `Current workspace facts:\n${workspaceFacts(userId)}`,
+    `Owner profile and CV records (provenance is explicit):\n${profileBrief()}`,
     history ? `Earlier voice conversation in this session:\n${history}` : "",
   ].filter(Boolean);
   return [...common, ...(isCoordinator ? coordinator : specialist), ...facts,    "Keep spoken responses short enough to follow by ear. Do not read lists unless the owner asks for a list.",
@@ -231,8 +227,7 @@ function toolDeclarations(agentKey: AgentKey): FunctionDeclaration[] {
         properties: {
           agent: {
             type: Type.STRING,
-            description: "Specialist key.",
-            enum: SPECIALIST_KEYS,
+            description: `Specialist name or internal key. The roster is: ${agentRoster().filter((agent) => agent.key !== "coordinator").map((agent) => `${agent.name} (${agent.key})`).join(", ")}.`,
           },
         },
         required: ["agent"],
@@ -246,8 +241,7 @@ function toolDeclarations(agentKey: AgentKey): FunctionDeclaration[] {
         properties: {
           agent: {
             type: Type.STRING,
-            description: "The specialist to speak with.",
-            enum: SPECIALIST_KEYS,
+            description: `The specialist to speak with, by name or internal key: ${agentRoster().filter((agent) => agent.key !== "coordinator").map((agent) => `${agent.name} (${agent.key})`).join(", ")}.`,
           },
           reason: { type: Type.STRING, description: "One short reason for the handoff, in the owner's words." },
         },
@@ -256,7 +250,7 @@ function toolDeclarations(agentKey: AgentKey): FunctionDeclaration[] {
     },
     {
       name: "run_coordinator_command",
-      description: "Send an explicit workspace instruction or question through the existing Chief Coordinator command service. Use only when the owner actually asks for an action or a report. The exact result is returned to you and must not be embellished.",
+      description: `Send an explicit workspace instruction or question through the existing ${agentIdentity("coordinator").name} command service. Use only when the owner actually asks for an action or a report. The exact result is returned to you and must not be embellished.`,
       parameters: {
         type: Type.OBJECT,
         properties: {
@@ -280,7 +274,7 @@ function toolDeclarations(agentKey: AgentKey): FunctionDeclaration[] {
   if (agentKey !== "coordinator") {
     declarations.push({
       name: "return_to_coordinator",
-      description: "Return the live voice conversation to the Chief Coordinator when the owner asks to go back.",
+      description: `Return the live voice conversation to the ${agentIdentity("coordinator").name} Coordinator when the owner asks to go back.`,
       parameters: { type: Type.OBJECT, properties: {} },
     });
   }
@@ -300,7 +294,13 @@ function liveConfig(userId: string, agentKey: AgentKey, sessionId: string, voice
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     realtimeInputConfig: {
-      automaticActivityDetection: { disabled: false },
+      automaticActivityDetection: {
+        disabled: false,
+        startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+        endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+        prefixPaddingMs: 300,
+        silenceDurationMs: 1050,
+      },
       activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
     },
     sessionResumption: {},
@@ -308,7 +308,6 @@ function liveConfig(userId: string, agentKey: AgentKey, sessionId: string, voice
 }
 
 export type LiveSession = {
-  voiceName: string;
   wsUrl: string;
   setup: {
     model: string;
@@ -330,9 +329,11 @@ export type LiveSession = {
   sessionExpiresAt: string;
   agentKey: AgentKey;
   agentName: string;
+  agentTitle: string;
   sessionId: string;
   model: string;
   voice: LiveVoiceName;
+  voiceName: string;
   greeting: boolean;
 };
 
@@ -394,7 +395,13 @@ export async function createLiveSession(input: {
     inputAudioTranscription: {},
     outputAudioTranscription: {},
     realtimeInputConfig: {
-      automaticActivityDetection: { disabled: false },
+      automaticActivityDetection: {
+        disabled: false,
+        startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
+        endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+        prefixPaddingMs: 300,
+        silenceDurationMs: 1050,
+      },
       activityHandling: "START_OF_ACTIVITY_INTERRUPTS",
     },
     sessionResumption: {},
@@ -411,6 +418,7 @@ export async function createLiveSession(input: {
     sessionExpiresAt,
     agentKey: input.agentKey,
     agentName: agentIdentity(input.agentKey).name,
+    agentTitle: agentIdentity(input.agentKey).title,
     sessionId: input.sessionId,
     model: config.model,
     voice: profile.voiceId,
@@ -440,6 +448,7 @@ function agentStatusPayload(agentKey: string) {
   return {
     key: agentKey,
     name: identity.name,
+    title: identity.title,
     role: row.role,
     status: row.enabled ? row.status : "disabled",
     currentTask: row.current_task,
@@ -493,15 +502,20 @@ export async function executeLiveTool(input: {
   }
 
   if (name === "get_agent_status") {
-    const target = String(args.agent ?? "");
+    const requested = String(args.agent ?? "");
+    const target = agentKeyForName(requested) ?? requested;
     const agent = snapshot.agents.find((item) => item.key === target);
-    if (!agent) return { response: { ok: false, error: "Unknown specialist." } };
+    if (!agent) return { response: { ok: false, error: `Unknown specialist “${requested}”.` } };
     return { response: { ok: true, agent } };
   }
 
   if (name === "handoff_to_agent") {
-    const target = String(args.agent ?? "");
-    if (!isSpecialistKey(target)) return { response: { ok: false, error: "Unknown specialist." } };
+    const requested = String(args.agent ?? "");
+    const resolved = agentKeyForName(requested);
+    if (!resolved || !isSpecialistKey(resolved)) {
+      return { response: { ok: false, error: `Unknown specialist “${requested}”. The roster is ${agentRoster().filter((agent) => agent.key !== "coordinator").map((agent) => agent.name).join(", ")}.` } };
+    }
+    const target = resolved;
     if (target === agentKey) return { response: { ok: false, error: "You are already speaking with that specialist." } };
     const activation = activateAgentSession(userId, target, recentConversationSummary(userId, 8));
     if (!activation.ok) return { response: { ok: false, error: activation.reason } };
@@ -511,20 +525,21 @@ export async function executeLiveTool(input: {
         ok: true,
         agentKey: target,
         agent: agentIdentity(target).name,
+        agentTitle: agentIdentity(target).title,
         voice: profile.voiceName,
-        message: `Authenticated handoff to ${agentIdentity(target).name} is ready. Say one short bridge; the app will cut audio immediately and reconnect with the assigned voice ${profile.voiceName}.`,
+        message: `Authenticated handoff to ${agentIdentity(target).name}, ${agentIdentity(target).title}, is ready. Say one short bridge; the app will cut audio immediately and reconnect with the assigned voice ${profile.voiceName}.`,
       },
       handoff: { agentKey: target },
     };
   }
 
   if (name === "return_to_coordinator") {
-    if (agentKey === "coordinator") return { response: { ok: false, error: "You are already the Chief Coordinator." } };
+    if (agentKey === "coordinator") return { response: { ok: false, error: `You are already speaking with ${agentIdentity("coordinator").name}, the ${agentIdentity("coordinator").title}.` } };
     const activation = activateAgentSession(userId, "coordinator", recentConversationSummary(userId, 8));
     if (!activation.ok) return { response: { ok: false, error: activation.reason } };
     const profile = voiceProfileForAgent("coordinator");
     return {
-      response: { ok: true, agentKey: "coordinator", voice: profile.voiceName, message: `Returning to the Chief Coordinator with voice ${profile.voiceName}.` },
+      response: { ok: true, agentKey: "coordinator", agent: agentIdentity("coordinator").name, voice: profile.voiceName, message: `Returning to ${agentIdentity("coordinator").name}, ${agentIdentity("coordinator").title}, with voice ${profile.voiceName}.` },
       handoff: { agentKey: "coordinator" },
     };
   }
@@ -555,17 +570,18 @@ export async function executeLiveTool(input: {
 
   if (name === "control_workflow") {
     const action = String(args.action ?? "");
+    const actor = workflowActor(userId);
     try {
       if (action === "pause") {
-        const message = await pauseRunningWorkflow();
+        const message = await pauseRunningWorkflow(actor);
         return { response: { ok: true, action, message } };
       }
       if (action === "stop") {
-        const message = await stopRunningWorkflow();
+        const message = await stopRunningWorkflow(actor);
         return { response: { ok: true, action, message } };
       }
       if (action === "resume") {
-        const result = await resumeLatestWorkflow(userId);
+        const result = await resumeLatestWorkflow(actor);
         return { response: { ok: result.ok, action, message: result.message, workflowId: result.workflowId } };
       }
       return { response: { ok: false, error: "Unsupported workflow action." } };

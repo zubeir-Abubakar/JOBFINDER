@@ -9,6 +9,7 @@ import { param } from "@/lib/format";
 import { PasswordForm } from "@/components/PasswordForm";
 import { SubmitButton } from "@/components/SubmitButton";
 import { UserAvatar } from "@/components/UserAvatar";
+import { MfaSettings } from "@/components/MfaSettings";
 import { avatarUrlFor } from "@/lib/account";
 import { updateAccountNameAction, uploadAccountAvatarAction, removeAccountAvatarAction } from "@/lib/actions/account";
 import {
@@ -47,6 +48,7 @@ export default async function SettingsPage({
   const stats = storageStats();
   const cache = tempStorageStats();
   const account = one<{ created_at: string; last_login_at: string | null }>("SELECT created_at, last_login_at FROM users WHERE id = ?", [user.id]);
+  const mfa = one<{ mfa_enabled: number }>("SELECT mfa_enabled FROM users WHERE id = ?", [user.id]);
   const sessions = countSessions(user.id);
   const avatarUrl = avatarUrlFor(user);
 
@@ -62,7 +64,12 @@ export default async function SettingsPage({
       <PageHead
         title="Settings"
         sub="Recruitment preferences, automation guardrails, documents and notifications for your workspace."
-        actions={<a href="#account" className="btn">Account & security</a>}
+        actions={
+          <>
+            <a href="#account" className="btn">Account & security</a>
+            <a href="/diagnostics" className="btn">Mobile diagnostics</a>
+          </>
+        }
       />
 
       <div className="tabs">
@@ -189,7 +196,7 @@ export default async function SettingsPage({
             </div>
             <div>
               <label className="label" htmlFor="max_applications_per_day">Maximum applications per day</label>
-              <input id="max_applications_per_day" name="max_applications_per_day" type="number" min={1} max={10} className="input" defaultValue={settings.max_applications_per_day ?? 3} />
+              <input id="max_applications_per_day" name="max_applications_per_day" type="number" min={1} max={10} className="input" defaultValue={settings.max_applications_per_day ?? 5} />
             </div>
             <div>
               <label className="label" htmlFor="search_frequency">Search frequency</label>
@@ -271,9 +278,9 @@ export default async function SettingsPage({
                 </p>
               </div>
               {[
-                ["notify_daily_report", "Daily report", settings.notify_daily_report !== false],
+                ["notify_daily_report", "Daily executive brief (one consolidated Coordinator report)", settings.notify_daily_report !== false],
                 ["notify_weekly_report", "Weekly summary", settings.notify_weekly_report !== false],
-                ["notify_immediate", "Immediate events (strong match, document ready, submission)", settings.notify_immediate !== false],
+                ["notify_immediate", "Exception alerts (blocked applications, failed submissions, interviews)", settings.notify_immediate !== false],
                 ["notify_agent_failure", "Agent failure alerts", settings.notify_agent_failure !== false],
                 ["notify_interview", "Interview invitations", settings.notify_interview !== false],
               ].map(([name, label, checked]) => (
@@ -320,7 +327,9 @@ export default async function SettingsPage({
         </section>
       </div>
 
-      <div className="split" id="security">
+      <MfaSettings enabled={mfa?.mfa_enabled === 1} />
+
+      <div className="split">
         <section className="card">
           <div className="card-head">
             <div>

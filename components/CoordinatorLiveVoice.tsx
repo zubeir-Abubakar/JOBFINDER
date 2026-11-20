@@ -5,9 +5,11 @@ import dynamic from "next/dynamic";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { OrbLevels, OrbState } from "./CosmicOrb";
+import { CosmicOrbBoundary } from "./CosmicOrbBoundary";
 import { VoiceAssistant } from "./VoiceAssistant";
-import { agentDefinition } from "@/lib/agent-definitions";
+import { agentIdentity } from "@/lib/agent-identity";
 import { voiceProfileForAgent, type LiveVoiceId } from "@/lib/agent-voices";
+import { isIntentionalBargeIn, mergeTranscript, reconnectDelay } from "@/lib/voice-stream";
 
 const CosmicOrb = dynamic(() => import("./CosmicOrb"), {
   ssr: false,
@@ -30,7 +32,13 @@ type LiveSetup = {
   inputAudioTranscription: Record<string, never>;
   outputAudioTranscription: Record<string, never>;
   realtimeInputConfig: {
-    automaticActivityDetection: { disabled: boolean };
+    automaticActivityDetection: {
+      disabled: boolean;
+      startOfSpeechSensitivity?: string;
+      endOfSpeechSensitivity?: string;
+      prefixPaddingMs?: number;
+      silenceDurationMs?: number;
+    };
     activityHandling: string;
   };
   sessionResumption: Record<string, never>;
@@ -52,16 +60,7 @@ type SessionPayload = {
 
 type ToolCall = { id?: string; name?: string; args?: Record<string, unknown> };
 
-const AGENT_LABELS: Record<AgentKey, string> = {
-  coordinator: "Chief Coordinator",
-  research: "Job Research",
-  analysis: "Job Analysis",
-  cv: "CV Optimisation",
-  ats: "ATS Quality Control",
-  cover: "Cover Letter",
-  application: "Application",
-  email: "Email & Tracking",
-};
+const agentName = (key: AgentKey): string => agentIdentity(key).name;
 
 const STATUS: Record<LiveState, { label: string; hint: string; tone: string }> = {
   idle: { label: "Ready", hint: "Start a live voice conversation.", tone: "neutral" },
@@ -75,6 +74,23 @@ const STATUS: Record<LiveState, { label: string; hint: string; tone: string }> =
 };
 
 const SESSION_KEY = "atw.live.session.v1";
+
+type VoiceDiagnosticDetail = Record<string, string | number | boolean | null>;
+type VoiceDiagnosticEvent = { event: string; at: string; detail?: VoiceDiagnosticDetail };
+
+declare global {
+  interface Window {
+    __atwVoiceDiagnostics?: { events: VoiceDiagnosticEvent[] };
+  }
+}
+
+/** Safe pipeline evidence only: no audio, transcripts, URLs or credentials. */
+function emitVoiceDiagnostic(event: string, detail?: VoiceDiagnosticDetail): void {
+  if (typeof window === "undefined") return;
+  const log = (window.__atwVoiceDiagnostics ??= { events: [] });
+  log.events.push({ event, at: new Date().toISOString(), ...(detail ? { detail } : {}) });
+  if (log.events.length > 300) log.events.splice(0, log.events.length - 300);
+}
 
 function makeId(prefix: string): string {
   if (typeof crypto !== "undefined" && "randomUUID" in crypto) return `${prefix}${crypto.randomUUID().replace(/-/g, "")}`;
@@ -97,7 +113,13 @@ function base64ToInt16(base64: string): Int16Array {
   return new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
 }
 
-export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg[] }) {
+export function CoordinatorLiveVoice({
+  initialMessages,
+  initialAgentKey = "coordinator",
+}: {
+  initialMessages: Msg[];
+  initialAgentKey?: AgentKey;
+}) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<LiveState>("idle");
   const [messages, setMessages] = useState<Msg[]>(initialMessages);
@@ -105,9 +127,10 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   const [partialAssistant, setPartialAssistant] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [speechHeard, setSpeechHeard] = useState(false);
   const [model, setModel] = useState("Gemini Live");
   const [muted, setMuted] = useState(false);
-  const [activeAgent, setActiveAgent] = useState<AgentKey>("coordinator");
+  const [activeAgent, setActiveAgent] = useState<AgentKey>(initialAgentKey);
   const [usage, setUsage] = useState<{ prompt: number; response: number; total: number } | null>(null);
   const usageRef = useRef<{ prompt: number; response: number; total: number } | null>(null);
   const reportedUsage = useRef({ prompt: 0, response: 0, total: 0 });
@@ -119,10 +142,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   const intentionalClose = useRef(false);
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const interruptResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handoffTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionIdRef = useRef("");
-  const activeAgentRef = useRef<AgentKey>("coordinator");
+  const activeAgentRef = useRef<AgentKey>(initialAgentKey);
   const stateRef = useRef<LiveState>("idle");
   const greetingRef = useRef(false);
   const resumptionHandle = useRef("");
@@ -139,6 +165,12 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   const interruptQuietSince = useRef(0);
   const interruptReadyForUser = useRef(false);
   const bargeFrames = useRef(0);
+  const speakingSince = useRef(0);
+  const micFramesGenerated = useRef(0);
+  const micFramesSent = useRef(0);
+  const outputAudioSeen = useRef(false);
+  const assistantResponseSeen = useRef(false);
+  const playbackStarted = useRef(false);
 
   const micStream = useRef<MediaStream | null>(null);
   const micContext = useRef<AudioContext | null>(null);
@@ -166,6 +198,16 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   useEffect(() => {
     activeAgentRef.current = activeAgent;
   }, [activeAgent]);
+
+  // The text conversation may have selected a specialist while the shell was
+  // already mounted. Adopt that persisted session before the next voice start,
+  // but never replace an agent the owner is currently speaking with.
+  useEffect(() => {
+    if (open || (state !== "idle" && state !== "disconnected" && state !== "error")) return;
+    if (initialAgentKey === activeAgentRef.current) return;
+    setActiveAgent(initialAgentKey);
+    activeAgentRef.current = initialAgentKey;
+  }, [initialAgentKey, open, state]);
 
   useEffect(() => {
     try {
@@ -224,6 +266,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
           ignoreAudio.current = false;
           interruptReadyForUser.current = false;
           interruptQuietSince.current = 0;
+          setState("listening");
         } else {
           interruptQuietSince.current = 0;
         }
@@ -250,7 +293,47 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     setMessages((previous) => [...previous, { id: makeId("live-msg-"), role, content: content.trim(), agentKey: activeAgentRef.current }]);
   }
 
+  function clearInterruptRecovery() {
+    if (interruptResetTimer.current) {
+      clearTimeout(interruptResetTimer.current);
+      interruptResetTimer.current = null;
+    }
+  }
+
+  function scheduleInterruptRecovery(mode: "manual" | "provider") {
+    clearInterruptRecovery();
+    interruptResetTimer.current = setTimeout(() => {
+      interruptResetTimer.current = null;
+      if (!mounted.current || stateRef.current !== "interrupted") return;
+      if (mode === "provider") {
+        // The provider already cancelled the old turn. Clearing the mute here
+        // prevents a provider interruption from silencing every later reply.
+        ignoreAudio.current = false;
+        interrupted.current = false;
+      }
+      setState("listening");
+      emitVoiceDiagnostic("LISTENING_RESUMED", { mode });
+    }, 900);
+  }
+
+  function clearStableConnectionTimer() {
+    if (reconnectResetTimer.current) {
+      clearTimeout(reconnectResetTimer.current);
+      reconnectResetTimer.current = null;
+    }
+  }
+
+  function markConnectionStableAfterDelay() {
+    clearStableConnectionTimer();
+    reconnectResetTimer.current = setTimeout(() => {
+      reconnectResetTimer.current = null;
+      reconnectAttempts.current = 0;
+      emitVoiceDiagnostic("CONNECTION_STABLE");
+    }, 10_000);
+  }
+
   function stopPlayback() {
+    clearInterruptRecovery();
     orbLevels.current.output = 0;
     heroRef.current?.style.setProperty("--lv-output", "0");
     heroRef.current?.style.setProperty("--lv-wave", "0");
@@ -267,13 +350,16 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     }
     playbackSources.current.clear();
     nextPlaybackAt.current = 0;
+    speakingSince.current = 0;
   }
 
   function ensurePlayback() {
-    if (playbackContext.current) {
+    if (playbackContext.current && playbackContext.current.state !== "closed") {
       void playbackContext.current.resume();
       return playbackContext.current;
     }
+    playbackContext.current = null;
+    playbackAnalyser.current = null;
     const context = new AudioContext({ latencyHint: "interactive" });
     const gain = context.createGain();
     const analyser = context.createAnalyser();
@@ -300,6 +386,11 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     if (playbackAnalyser.current) source.connect(playbackAnalyser.current);
     const startAt = Math.max(context.currentTime + 0.035, nextPlaybackAt.current);
     source.start(startAt);
+    if (!playbackStarted.current) {
+      playbackStarted.current = true;
+      emitVoiceDiagnostic("AUDIO_PLAYBACK_STARTED");
+    }
+    if (!speakingSince.current) speakingSince.current = performance.now();
     nextPlaybackAt.current = startAt + audio.duration;
     playbackSources.current.add(source);
     source.onended = () => playbackSources.current.delete(source);
@@ -307,6 +398,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   }
 
   async function stopMicrophone() {
+    const hadMicrophone = Boolean(micStream.current || micNode.current);
     micStarting.current = false;
     micNode.current?.port.close();
     micNode.current?.disconnect();
@@ -319,8 +411,11 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     micContext.current = null;
     if (context && context.state !== "closed") await context.close().catch(() => undefined);
     micLevel.current = 0;
+    micFramesGenerated.current = 0;
+    micFramesSent.current = 0;
     orbLevels.current.input = 0;
     heroRef.current?.style.setProperty("--lv-input", "0");
+    if (hadMicrophone) emitVoiceDiagnostic("MIC_STOPPED");
   }
 
   async function ensureMicrophone(): Promise<boolean> {
@@ -331,6 +426,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       if (!navigator.mediaDevices?.getUserMedia || typeof AudioWorkletNode === "undefined") {
         throw new Error("This browser does not support continuous microphone streaming.");
       }
+      emitVoiceDiagnostic("MIC_PERMISSION_REQUESTED", { secureContext: window.isSecureContext });
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           channelCount: 1,
@@ -341,9 +437,15 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       });
       const context = new AudioContext({ latencyHint: "interactive" });
       await context.resume();
+      emitVoiceDiagnostic("MIC_STREAM_ACTIVE", {
+        tracks: stream.getAudioTracks().length,
+        liveTracks: stream.getAudioTracks().filter((track) => track.readyState === "live").length,
+        sampleRate: context.sampleRate,
+      });
       await context.audioWorklet.addModule("/gemini-pcm-worklet.js");
       const source = context.createMediaStreamSource(stream);
       const node = new AudioWorkletNode(context, "gemini-pcm-processor");
+      emitVoiceDiagnostic("AUDIOWORKLET_READY", { sampleRate: context.sampleRate });
       // A silent sink keeps the worklet graph alive without routing the mic to the speakers.
       const sink = context.createGain();
       sink.gain.value = 0;
@@ -352,16 +454,30 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       node.port.onmessage = (event: MessageEvent<{ type?: string; buffer?: ArrayBuffer; level?: number }>) => {
         const data = event.data;
         if (data?.type !== "audio" || !(data.buffer instanceof ArrayBuffer)) return;
+        micFramesGenerated.current += 1;
+        if (micFramesGenerated.current === 1) {
+          emitVoiceDiagnostic("INPUT_FRAMES_GENERATED", { bytes: data.buffer.byteLength, sampleRate: 16000 });
+        }
         micLevel.current = Math.max(0, Math.min(1, Number(data.level ?? 0)));
         if (stateRef.current === "speaking") {
-          if (micLevel.current > 0.075) bargeFrames.current += 1;
+          if (micLevel.current > 0.09) bargeFrames.current += 1;
           else bargeFrames.current = 0;
-          if (bargeFrames.current >= 3) {
+          const speakingMs = speakingSince.current ? performance.now() - speakingSince.current : 0;
+          if (
+            isIntentionalBargeIn({
+              level: micLevel.current,
+              frames: bargeFrames.current,
+              speakingMs,
+              state: stateRef.current,
+              muted: micMuted.current,
+            })
+          ) {
             bargeFrames.current = 0;
             ignoreAudio.current = true;
             interrupted.current = true;
             stopPlayback();
             setState("interrupted");
+            emitVoiceDiagnostic("INTERRUPTION_DETECTED", { source: "microphone" });
           }
         } else {
           bargeFrames.current = 0;
@@ -375,6 +491,8 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
               },
             }),
           );
+          micFramesSent.current += 1;
+          if (micFramesSent.current === 1) emitVoiceDiagnostic("INPUT_FRAMES_SENT");
         }
       };
       source.connect(node);
@@ -386,6 +504,10 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       if (track) track.enabled = !micMuted.current;
       return true;
     } catch (cause) {
+      emitVoiceDiagnostic("MIC_ERROR", {
+        errorName: cause instanceof Error ? cause.name : "unknown",
+        secureContext: window.isSecureContext,
+      });
       setError(cause instanceof Error ? cause.message : "Microphone access was denied.");
       setState("error");
       await stopMicrophone();
@@ -468,7 +590,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     // Cut the old agent's speech immediately. The handoff must not wait for
     // queued audio, a model turn or a timer before the identity changes.
     stopPlayback();
-    setNotice(`Switching to ${AGENT_LABELS[target]}…`);
+    setNotice(`Switching to ${agentName(target)}…`);
     flushTranscripts();
     setActiveAgent(target);
     activeAgentRef.current = target;
@@ -564,10 +686,16 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       if (playbackDrainTimer.current) clearTimeout(playbackDrainTimer.current);
       playbackDrainTimer.current = setTimeout(() => {
         playbackDrainTimer.current = null;
-        if (mounted.current && !ignoreAudio.current) setState("listening");
+        if (mounted.current && !ignoreAudio.current) {
+          setState("listening");
+          if (wasInterrupted) emitVoiceDiagnostic("LISTENING_RESUMED", { mode: "turn-drain" });
+        }
       }, Math.min(8000, remaining + 80));
     } else {
       setState("listening");
+      if (wasInterrupted) {
+        emitVoiceDiagnostic("LISTENING_RESUMED", { mode: manualInterrupt.current ? "manual" : "turn" });
+      }
     }
     const target = pendingHandoff.current;
     if (target) void performHandoff(target);
@@ -586,7 +714,14 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     }
 
     if (message.setupComplete) {
-      reconnectAttempts.current = 0;
+      if (connectTimer.current) {
+        clearTimeout(connectTimer.current);
+        connectTimer.current = null;
+      }
+      // Keep the retry budget until the replacement session has remained
+      // stable. Resetting at setup made an unstable link reconnect forever.
+      markConnectionStableAfterDelay();
+      emitVoiceDiagnostic("LIVE_SESSION_CONNECTED", { agentKey: activeAgentRef.current, model });
       setState("listening");
       setError("");
       const ready = await ensureMicrophone();
@@ -597,9 +732,10 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       }
       if (greetingRef.current) {
         const isCoordinator = activeAgentRef.current === "coordinator";
+        const identity = agentIdentity(activeAgentRef.current);
         const request = isCoordinator
-          ? "[Session control: the live voice session has just opened. Greet the owner briefly in your own voice, then wait for their instruction.]"
-          : `[Session control: the owner has just been handed to you, ${AGENT_LABELS[activeAgentRef.current]}. Greet them briefly in character, state your role in one sentence, and wait.]`;
+          ? `[Session control: the live voice session has just opened. Greet the owner naturally in one short sentence as ${identity.name}, ${identity.title}, then wait for their instruction. Do not recite a canned script or list your capabilities.]`
+          : `[Session control: the owner has just been handed to you, ${identity.name}. Acknowledge the handoff naturally in one short sentence and continue from the existing conversation context. Do not repeat a full introduction.]`;
         wsRef.current?.send(
           JSON.stringify({
             clientContent: { turns: [{ role: "user", parts: [{ text: request }] }], turnComplete: true },
@@ -628,17 +764,33 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
         ignoreAudio.current = true;
         stopPlayback();
         setState("interrupted");
+        emitVoiceDiagnostic("INTERRUPTION_DETECTED", { source: "provider" });
+        scheduleInterruptRecovery("provider");
       }
       if (serverContent.modelTurn?.parts) {
         for (const part of serverContent.modelTurn.parts) {
-          if (part.inlineData?.data) playPcm(part.inlineData.data);
-          if (part.text) {
-            outputTranscript.current += part.text;
+          if (part.inlineData?.data) {
+            if (!outputAudioSeen.current) {
+              outputAudioSeen.current = true;
+              emitVoiceDiagnostic("OUTPUT_AUDIO_RECEIVED");
+            }
+            playPcm(part.inlineData.data);
+          }
+          if (part.text && !serverContent.outputTranscription?.text) {
+            if (!assistantResponseSeen.current) {
+              assistantResponseSeen.current = true;
+              emitVoiceDiagnostic("ASSISTANT_RESPONSE_STARTED");
+            }
+            outputTranscript.current = mergeTranscript(outputTranscript.current, part.text);
             setPartialAssistant(outputTranscript.current);
           }
         }
       }
       if (serverContent.inputTranscription?.text) {
+        if (!inputTranscript.current) {
+          setSpeechHeard(true);
+          emitVoiceDiagnostic("USER_SPEECH_RECEIVED");
+        }
         inputTranscript.current += serverContent.inputTranscription.text;
         setPartialUser(inputTranscript.current);
       }
@@ -646,7 +798,11 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
         setPartialUser(serverContent.interimInputTranscription.text);
       }
       if (serverContent.outputTranscription?.text) {
-        outputTranscript.current += serverContent.outputTranscription.text;
+        if (!assistantResponseSeen.current) {
+          assistantResponseSeen.current = true;
+          emitVoiceDiagnostic("ASSISTANT_RESPONSE_STARTED");
+        }
+        outputTranscript.current = mergeTranscript(outputTranscript.current, serverContent.outputTranscription.text);
         setPartialAssistant(outputTranscript.current);
       }
       if (serverContent.waitingForInput && !serverContent.turnComplete) {
@@ -681,6 +837,10 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   }
 
   function closeSocket(): void {
+    if (connectTimer.current) {
+      clearTimeout(connectTimer.current);
+      connectTimer.current = null;
+    }
     wsGeneration.current += 1;
     const ws = wsRef.current;
     wsRef.current = null;
@@ -701,11 +861,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       return;
     }
     reconnectAttempts.current += 1;
-    const delay = Math.min(6000, 800 * 2 ** (reconnectAttempts.current - 1));
+    const delay = reconnectDelay(reconnectAttempts.current);
     setState("connecting");
     setNotice(`Connection lost. Reconnecting (${reconnectAttempts.current}/3)…`);
+    emitVoiceDiagnostic("RECONNECT_SCHEDULED", { attempt: reconnectAttempts.current, delayMs: delay });
     if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
     reconnectTimer.current = setTimeout(() => {
+      emitVoiceDiagnostic("RECONNECT_ATTEMPT", { attempt: reconnectAttempts.current });
       void startLive(activeAgentRef.current, { greet: false, fresh: false, preserveMessages: true });
     }, delay);
   }
@@ -713,6 +875,14 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   function connectSocket(payload: SessionPayload, generation: number) {
     const ws = new WebSocket(payload.wsUrl);
     wsRef.current = ws;
+    if (connectTimer.current) clearTimeout(connectTimer.current);
+    connectTimer.current = setTimeout(() => {
+      if (generation !== wsGeneration.current) return;
+      closeSocket();
+      void stopMicrophone();
+      setError("The Gemini Live connection timed out before the session was ready. Check the network, the HTTPS certificate and the Gemini Live configuration.");
+      setState("error");
+    }, 15000);
     intentionalClose.current = false;
     const setup = {
       ...payload.setup,
@@ -731,7 +901,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       setNotice("The live connection reported an error.");
     };
     ws.onclose = (event) => {
+      if (connectTimer.current) {
+        clearTimeout(connectTimer.current);
+        connectTimer.current = null;
+      }
       if (generation !== wsGeneration.current || intentionalClose.current) return;
+      clearStableConnectionTimer();
+      emitVoiceDiagnostic("LIVE_SESSION_CLOSED", { code: event.code, reconnecting: true });
       flushTranscripts();
       if (event.code === 1008 || /quota|billing|permission|not found|invalid/i.test(event.reason ?? "")) {
         void stopMicrophone();
@@ -749,42 +925,64 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
   }
 
   async function requestToken(agentKey: AgentKey, greet: boolean): Promise<SessionPayload> {
-    const response = await fetch("/api/voice/live/session", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        agentKey,
-        sessionId: sessionIdRef.current,
-        greet,
-      }),
-    });
-    const payload = (await response.json().catch(() => ({}))) as SessionPayload & { error?: string; code?: string };
-    if (!response.ok) {
-      const message =
-        payload.code === "LIVE_NOT_CONFIGURED"
-          ? payload.error ?? "Live voice is not configured."
-          : response.status === 429
-            ? "Gemini Live free-tier quota is exhausted or cooling down. No paid fallback was attempted."
-            : payload.error ?? "The live voice session could not start.";
-      throw new Error(message);
-    }
-    if (!payload.wsUrl || !payload.setup) throw new Error("The live voice session was incomplete.");
-    sessionIdRef.current = payload.sessionId;
-    setModel(payload.model || "Gemini Live");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 12000);
     try {
-      window.sessionStorage.setItem(SESSION_KEY, payload.sessionId);
-    } catch {
-      // Ignore private-mode storage failures.
+      const response = await fetch("/api/voice/live/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentKey,
+          sessionId: sessionIdRef.current,
+          greet,
+        }),
+        signal: controller.signal,
+      });
+      const payload = (await response.json().catch(() => ({}))) as SessionPayload & { error?: string; code?: string };
+      if (!response.ok) {
+        const message =
+          payload.code === "LIVE_NOT_CONFIGURED"
+            ? payload.error ?? "Live voice is not configured."
+            : response.status === 429
+              ? "Gemini Live free-tier quota is exhausted or cooling down. No paid fallback was attempted."
+              : payload.error ?? "The live voice session could not start.";
+        throw new Error(message);
+      }
+      if (!payload.wsUrl || !payload.setup) throw new Error("The live voice session was incomplete.");
+      sessionIdRef.current = payload.sessionId;
+      setModel(payload.model || "Gemini Live");
+      try {
+        window.sessionStorage.setItem(SESSION_KEY, payload.sessionId);
+      } catch {
+        // Ignore private-mode storage failures.
+      }
+      return payload;
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") {
+        throw new Error("The live voice session request timed out. Check that the app server is reachable over HTTPS.");
+      }
+      throw cause;
+    } finally {
+      clearTimeout(timeout);
     }
-    return payload;
   }
 
   async function startLive(
     agentKey: AgentKey = "coordinator",
     options: { greet?: boolean; fresh?: boolean; preserveMessages?: boolean } = {},
   ) {
+    if (!window.isSecureContext) {
+      setError("Live voice requires a secure HTTPS origin. Open the app over HTTPS and try again; the browser does not grant microphone access on plain HTTP.");
+      setState("error");
+      return;
+    }
     if (starting.current) return;
     starting.current = true;
+    clearStableConnectionTimer();
+    setSpeechHeard(false);
+    outputAudioSeen.current = false;
+    assistantResponseSeen.current = false;
+    playbackStarted.current = false;
     manualInterrupt.current = false;
     interruptQuietSince.current = 0;
     interruptReadyForUser.current = false;
@@ -822,8 +1020,16 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     setNotice("");
     setState("connecting");
     stopPlayback();
+    emitVoiceDiagnostic("SESSION_REQUESTED", { agentKey });
     greetingRef.current = Boolean(options.greet);
-    ensurePlayback();
+    try {
+      ensurePlayback();
+    } catch (cause) {
+      starting.current = false;
+      setError(cause instanceof Error ? cause.message : "Audio playback could not be started on this browser.");
+      setState("error");
+      return;
+    }
     closeSocket();
     intentionalClose.current = false;
     const generation = wsGeneration.current;
@@ -837,13 +1043,59 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       starting.current = false;
     } catch (cause) {
       starting.current = false;
-      setError(cause instanceof Error ? cause.message : "Live voice could not start.");
+      const message = cause instanceof Error ? cause.message : "Live voice could not start.";
+      // A reconnect attempt can fail before a socket exists (for example while
+      // the network is still down). Keep the bounded retry budget alive rather
+      // than turning one failed fetch into a permanently dead session.
+      if (!options.fresh && !intentionalClose.current && reconnectAttempts.current < 3) {
+        setNotice(`Reconnect failed: ${message.slice(0, 180)}`);
+        emitVoiceDiagnostic("RECONNECT_FAILED", { attempt: reconnectAttempts.current });
+        scheduleReconnect();
+        return;
+      }
+      setError(message);
       setState("error");
     }
   }
 
+  function handleBrowserOffline() {
+    const current = stateRef.current;
+    if (current === "idle" || current === "disconnected" || current === "error") return;
+    emitVoiceDiagnostic("BROWSER_OFFLINE");
+    emitVoiceDiagnostic("LIVE_SESSION_CLOSED", { code: 0, reconnecting: true, reason: "browser-offline" });
+    clearStableConnectionTimer();
+    flushTranscripts();
+    stopPlayback();
+    stateRef.current = "connecting";
+    setState("connecting");
+    setNotice("Network connection lost. Waiting for the network, then reconnecting…");
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+    const ws = wsRef.current;
+    wsRef.current = null;
+    wsGeneration.current += 1;
+    if (ws && ws.readyState < WebSocket.CLOSING) ws.close(1000, "Browser offline");
+    intentionalClose.current = false;
+  }
+
+  function handleBrowserOnline() {
+    if (!mounted.current || intentionalClose.current || stateRef.current !== "connecting") return;
+    emitVoiceDiagnostic("BROWSER_ONLINE");
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+    reconnectAttempts.current = 0;
+    void startLive(activeAgentRef.current, { greet: false, fresh: false, preserveMessages: true });
+  }
+
   function endSession() {
     intentionalClose.current = true;
+    clearStableConnectionTimer();
+    clearInterruptRecovery();
+    emitVoiceDiagnostic("SESSION_ENDED", { agentKey: activeAgentRef.current });
     manualInterrupt.current = false;
     interruptQuietSince.current = 0;
     interruptReadyForUser.current = false;
@@ -858,6 +1110,10 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     micMuted.current = false;
     setNotice("");
     if (idleTimer.current) clearTimeout(idleTimer.current);
+    if (connectTimer.current) {
+      clearTimeout(connectTimer.current);
+      connectTimer.current = null;
+    }
     idleTimer.current = setTimeout(() => {
       if (!mounted.current || wsRef.current) return;
       setState("idle");
@@ -882,10 +1138,23 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     interruptQuietSince.current = interruptReadyForUser.current ? performance.now() : 0;
     stopPlayback();
     setState("interrupted");
+    emitVoiceDiagnostic("INTERRUPTION_DETECTED", { source: "control" });
+    scheduleInterruptRecovery("manual");
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       // Gemini 3.8 treats a client turn completion as a generation interrupt.
       ws.send(JSON.stringify({ clientContent: { turnComplete: true } }));
+    }
+  }
+
+  async function copyDiagnostics() {
+    const events = window.__atwVoiceDiagnostics?.events ?? [];
+    const safe = JSON.stringify(events, null, 2);
+    try {
+      await navigator.clipboard.writeText(safe);
+      setNotice("Safe pipeline diagnostics copied. No audio, transcript text, URLs or credentials are included.");
+    } catch {
+      setNotice("Clipboard access was blocked. Run this in the browser console: copy(JSON.stringify(window.__atwVoiceDiagnostics?.events ?? []))");
     }
   }
 
@@ -901,10 +1170,26 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
     }
     setLegacyOpen(false);
     setOpen(true);
+    if (!window.isSecureContext) {
+      setError("Live voice requires a secure HTTPS origin. Open the app over HTTPS and try again; the browser does not grant microphone access on plain HTTP.");
+      setState("error");
+      return;
+    }
     if (state === "idle" || state === "disconnected" || state === "error") {
       void startLive(activeAgentRef.current, { greet: true, fresh: true, preserveMessages: false });
     }
   }
+
+  useEffect(() => {
+    const offline = () => handleBrowserOffline();
+    const online = () => handleBrowserOnline();
+    window.addEventListener("offline", offline);
+    window.addEventListener("online", online);
+    return () => {
+      window.removeEventListener("offline", offline);
+      window.removeEventListener("online", online);
+    };
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -915,7 +1200,10 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       if (handoffTimer.current) clearTimeout(handoffTimer.current);
       if (idleTimer.current) clearTimeout(idleTimer.current);
+      if (connectTimer.current) clearTimeout(connectTimer.current);
       if (playbackDrainTimer.current) clearTimeout(playbackDrainTimer.current);
+      clearStableConnectionTimer();
+      clearInterruptRecovery();
       orbLevels.current.input = 0;
       orbLevels.current.output = 0;
       stopPlayback();
@@ -928,10 +1216,12 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
 
   const status = STATUS[state];
   const live = state !== "idle" && state !== "disconnected" && state !== "error";
-  const connected = state === "listening" || state === "speaking" || state === "processing" || state === "interrupted";
+  const micActive = state === "listening" || state === "speaking" || state === "processing" || state === "interrupted";
+  const connected = micActive;
   const badgeTone = state === "error" ? "badge-bad" : state === "speaking" || state === "listening" ? "badge-good" : "badge-info";
   const activeProfile = voiceProfileForAgent(activeAgent);
-  const activeRole = agentDefinition(activeAgent)?.role ?? "Specialist";
+  const activeIdentity = agentIdentity(activeAgent);
+  const activeRole = activeIdentity.title;
   const orbState: OrbState = state === "idle" ? "IDLE"
     : state === "connecting" ? "CONNECTING"
       : state === "listening" ? "LISTENING"
@@ -962,14 +1252,22 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
       </button>
 
       {open && typeof document !== "undefined" ? createPortal(
-        <div className="lv-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closePanel(); }}>
-          <section className="lv-panel" role="dialog" aria-modal="true" aria-label={`${AGENT_LABELS[activeAgent]} live voice`}>
+        <div className="lv-backdrop" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) closePanel(); }}>
+          <section
+            className="lv-panel"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`${activeIdentity.name} live voice`}
+            data-live-state={state}
+            data-agent-key={activeAgent}
+            data-speech-heard={speechHeard ? "true" : "false"}
+          >
             <header className="lv-head">
               <div className="lv-title">
                 <span className="lv-head-mark" aria-hidden="true"><i /></span>
                 <div className="min-w-0">
-                  <div className="lv-eyebrow">AT AI AGENCY <span>· {activeAgent === "coordinator" ? "Chief Coordinator" : activeRole}</span></div>
-                  <h2>{AGENT_LABELS[activeAgent]}</h2>
+                  <div className="lv-eyebrow">AT AI AGENCY <span>· {activeIdentity.title}</span></div>
+                  <h2>{activeIdentity.name}</h2>
                 </div>
               </div>
               <div className="lv-head-actions">
@@ -980,7 +1278,9 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
 
             <div className={`lv-hero ${state}`} ref={heroRef}>
               <div className="lv-avatar" aria-hidden="true">
-                <CosmicOrb state={orbState} levelsRef={orbLevels} compact={compactOrb} />
+                <CosmicOrbBoundary>
+                  <CosmicOrb state={orbState} levelsRef={orbLevels} compact={compactOrb} />
+                </CosmicOrbBoundary>
               </div>
               <div className="lv-wave" role="img" aria-label="Live audio activity">
                 {[0, 1, 2, 3, 4, 5, 6].map((index) => (
@@ -988,12 +1288,13 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
                 ))}
               </div>
               <div className="lv-status" aria-live="polite">
-                <strong>{AGENT_LABELS[activeAgent]} — {status.label}</strong>
+                <strong>{activeIdentity.name} — {status.label}</strong>
                 <span>{status.hint}</span>
               </div>
               <div className="lv-meta">
                 <span className={`lv-presence ${connected ? "online" : ""}`}><i /> {connected ? "Connected" : state === "connecting" ? "Connecting" : "Not connected"}</span>
-                <span className={`lv-mic ${muted ? "is-muted" : live ? "is-live" : ""}`}><i /> {muted ? "Mic muted" : live ? "Mic live" : "Mic idle"}</span>
+                <span className={`lv-mic ${muted ? "is-muted" : micActive ? "is-live" : ""}`}><i /> {muted ? "Mic muted" : micActive ? "Mic live" : state === "connecting" ? "Mic paused" : "Mic idle"}</span>
+                {speechHeard ? <span className="lv-heard" data-testid="voice-speech-received">Speech received</span> : null}
                 <span>{activeProfile.voiceName} · {model}</span>
                 <span>English</span>
               </div>
@@ -1006,6 +1307,9 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
                 <div className="lv-alert-actions">
                   <Link href="/assistant" className="btn btn-sm">Open text assistant</Link>
                   <button type="button" className="btn btn-sm btn-ghost" onClick={() => void startLive(activeAgent, { greet: true, fresh: true })}>Try again</button>
+                  <button type="button" className="btn btn-sm btn-ghost" onClick={() => void copyDiagnostics()}>
+                    Copy diagnostics
+                  </button>
                   <button
                     type="button"
                     className="btn btn-sm btn-ghost"
@@ -1024,19 +1328,19 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
             <div className="lv-transcript" ref={scrollRef}>
               {messages.length === 0 && !partialUser && !partialAssistant ? (
                 <div className="lv-empty">
-                  <p>One click starts a continuous conversation with {AGENT_LABELS[activeAgent]}. Speak naturally, pause, or interrupt at any time.</p>
-                  <p className="hint">{activeAgent === "coordinator" ? "Try: “How many agents are working, and which models are they using?” or “Transfer me to the research agent.”" : `You are speaking directly with ${activeRole} using ${activeProfile.voiceName}. Say “return to the coordinator” to go back.`}</p>
+                  <p>One click starts a continuous conversation with {activeIdentity.name}. Speak naturally, pause, or interrupt at any time.</p>
+                  <p className="hint">{activeAgent === "coordinator" ? `Try: “How many agents are working, and which models are they using?” or “Connect me to ${agentIdentity("application").name}.”` : `You are speaking directly with ${activeIdentity.name}, ${activeRole}, using ${activeProfile.voiceName}. Say “return to ${agentIdentity("coordinator").name}” to go back.`}</p>
                 </div>
               ) : (
                 messages.slice(-8).map((message) => (
                   <div key={message.id} className={`lv-msg ${message.role === "user" ? "is-user" : "is-assistant"}`}>
-                    <div className="lv-msg-role">{message.role === "user" ? "You" : AGENT_LABELS[message.agentKey ?? activeAgent]}</div>
+                    <div className="lv-msg-role">{message.role === "user" ? "You" : agentName(message.agentKey ?? activeAgent)}</div>
                     <div>{message.content}</div>
                   </div>
                 ))
               )}
               {partialUser ? <div className="lv-msg is-user is-live"><div className="lv-msg-role">You · live</div><div>{partialUser}</div></div> : null}
-              {partialAssistant ? <div className="lv-msg is-assistant is-live"><div className="lv-msg-role">{AGENT_LABELS[activeAgent]} · live</div><div>{partialAssistant}</div></div> : null}
+              {partialAssistant ? <div className="lv-msg is-assistant is-live"><div className="lv-msg-role">{activeIdentity.name} · live</div><div>{partialAssistant}</div></div> : null}
               {state === "processing" ? <div className="lv-thinking"><span className="dot" /> Coordinating…</div> : null}
             </div>
 
@@ -1061,7 +1365,7 @@ export function CoordinatorLiveVoice({ initialMessages }: { initialMessages: Msg
                 )}
               </div>
               <div className="lv-options">
-                <span className="lv-usage">Voice {activeProfile.voiceName} · assigned to {AGENT_LABELS[activeAgent]}</span>
+                <span className="lv-usage">Voice {activeProfile.voiceName} · assigned to {activeIdentity.name}</span>
                 {usage ? <span className="lv-usage">{usage.total.toLocaleString("en-GB")} session tokens</span> : null}
                 <Link href="/assistant" className="lv-text-link">Text chat</Link>
               </div>

@@ -107,7 +107,7 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
               <th>Document</th>
               <th>Vacancy</th>
               <th>Version</th>
-              <th>ATS</th>
+              <th>CV ATS</th>
               <th>Quality</th>
               <th>Status</th>
               <th>Created</th>
@@ -121,7 +121,7 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
               return (
                 <tr key={doc.id} className={selected.has(doc.id) ? "is-selected" : undefined}>
                   {selectMode ? (
-                    <td className="select-cell">
+                    <td className="select-cell" data-label="Select">
                       <input
                         type="checkbox"
                         checked={selected.has(doc.id)}
@@ -130,7 +130,7 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
                       />
                     </td>
                   ) : null}
-                  <td>
+                  <td data-label="Document">
                     <div className="doc-cell">
                       <span className={`file-glyph ${doc.mime.includes("pdf") ? "is-pdf" : "is-docx"}`}>
                         {doc.mime.includes("pdf") ? "PDF" : "DOCX"}
@@ -141,7 +141,7 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
                       </span>
                     </div>
                   </td>
-                  <td>
+                  <td data-label="Vacancy">
                     {doc.job_id ? (
                       <Link href={`/jobs/${doc.job_id}`} className="table-link">
                         <span className="cell-title">{doc.title}</span>
@@ -149,11 +149,15 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
                       </Link>
                     ) : "—"}
                   </td>
-                  <td className="num">v{doc.version}</td>
-                  <td>
-                    <span className="score-pill">{doc.ats_score ?? "—"}<small>/100</small></span>
+                  <td className="num" data-label="Version">v{doc.version}</td>
+                  <td data-label="CV ATS">
+                    {doc.kind === "tailored_cv" ? (
+                      <span className="score-pill">{doc.ats_score ?? "—"}<small>/100</small></span>
+                    ) : (
+                      <span className="cell-sub">Not applicable</span>
+                    )}
                   </td>
-                  <td>
+                  <td data-label="Quality">
                     {doc.quality_status ? (
                       <span className={`badge ${doc.quality_status === "passed" ? "badge-good" : doc.quality_status === "failed" ? "badge-warn" : "badge-neutral"}`}>
                         {doc.quality_status}{doc.quality_score !== null ? ` · ${doc.quality_score}` : ""}
@@ -162,15 +166,15 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
                       <span className="badge badge-neutral">Not checked</span>
                     )}
                   </td>
-                  <td>
+                  <td data-label="Status">
                     <div className="row" style={{ gap: 4 }}>
                       <span className="badge badge-neutral">{doc.status}</span>
                       {doc.pinned ? <span className="badge badge-warn">Pinned</span> : null}
                     </div>
                   </td>
-                  <td className="cell-sub">{formatDate(doc.created_at)}</td>
-                  <td className="cell-sub">{doc.expires_at ? formatDate(doc.expires_at) : "No expiry"}</td>
-                  <td>
+                  <td className="cell-sub" data-label="Created">{formatDate(doc.created_at)}</td>
+                  <td className="cell-sub" data-label="Expires">{doc.expires_at ? formatDate(doc.expires_at) : "No expiry"}</td>
+                  <td data-label="Actions">
                     <div className="row row-actions" style={{ justifyContent: "flex-end", gap: 4 }}>
                       <Link href={`/documents/${doc.id}`} className="btn btn-sm">Preview</Link>
                       <a href={`/api/documents/${doc.id}`} className="btn btn-sm">Download</a>

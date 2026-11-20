@@ -77,6 +77,10 @@ test("notification events are deduplicated and Gmail acceptance is recorded sepa
     db.one<{ n: number }>("SELECT COUNT(*) AS n FROM notification_outbox WHERE dedupe_key = 'test:discovery:one'")?.n,
     1,
   );
+  const storedHtml = db.one<{ html_body: string | null }>(
+    "SELECT html_body FROM notification_outbox WHERE dedupe_key = 'test:discovery:one'",
+  );
+  assert.match(storedHtml?.html_body ?? "", /cid:atw-logo/);
 
   const sent = await notifications.drainNotificationQueue({
     send: async () => ({ messageId: "gmail-test-id", threadId: "gmail-thread-id" }),
@@ -86,7 +90,7 @@ test("notification events are deduplicated and Gmail acceptance is recorded sepa
     "SELECT status, delivery, provider_message_id FROM notification_outbox WHERE dedupe_key = 'test:discovery:one'",
   );
   assert.equal(row?.status, "sent");
-  assert.equal(row?.delivery, "accepted");
+  assert.equal(row?.delivery, "accepted_by_gmail");
   assert.equal(row?.provider_message_id, "gmail-test-id");
 });
 

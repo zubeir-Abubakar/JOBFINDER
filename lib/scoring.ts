@@ -1,5 +1,6 @@
 import type { ProfileData, Skill } from "./profile";
 import { classifyVacancy } from "./vacancy-classification";
+import { agentIdentity } from "./agent-identity";
 
 export type MatchFlag = "strong" | "possible" | "weak" | "not_suitable";
 
@@ -505,7 +506,7 @@ export function analyseJob(
 
   const recommendation =
     flag === "strong"
-      ? "Strong match. Send to the CV agent and prepare an application package."
+      ? `Strong match. Send to ${agentIdentity("cv").name} and prepare an application package.`
       : flag === "possible"
         ? "Possible match. Review the missing or preferred skills, then decide whether to tailor documents."
         : flag === "weak"

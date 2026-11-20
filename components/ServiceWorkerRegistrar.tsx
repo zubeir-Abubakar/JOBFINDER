@@ -2,61 +2,63 @@
 
 import { useEffect, useState } from "react";
 
+type PwaDetail = {
+  type?: string;
+  registration?: ServiceWorkerRegistration;
+  worker?: ServiceWorker;
+};
+
 /**
- * Registers the shell-only service worker. A new worker is never allowed to
- * take control mid-session without asking, so an active voice call or form is
- * not reloaded unexpectedly.
+ * The actual registration lives in public/pwa-bootstrap.js so it still runs
+ * when React hydration fails. This component only exposes the update prompt
+ * and marks the document as hydrated for diagnostics.
  */
 export function ServiceWorkerRegistrar() {
   const [waiting, setWaiting] = useState<ServiceWorker | null>(null);
 
   useEffect(() => {
-    if (process.env.NODE_ENV !== "production" || !("serviceWorker" in navigator)) return;
+    // This marker means React effects ran. It is deliberately separate from
+    // service-worker registration, which is handled by the static bootstrap.
+    document.documentElement.dataset.atwHydrated = "true";
 
-    let registration: ServiceWorkerRegistration | null = null;
     let disposed = false;
-    const hadController = Boolean(navigator.serviceWorker.controller);
+    let registration: ServiceWorkerRegistration | null = null;
 
-    const watchWorker = (worker: ServiceWorker | null) => {
-      if (!worker) return;
-      worker.addEventListener("statechange", () => {
-        if (disposed || worker.state !== "installed" || !navigator.serviceWorker.controller) return;
-        setWaiting(worker);
-      });
+    const syncWaiting = () => {
+      if (!disposed && registration?.waiting) setWaiting(registration.waiting);
     };
 
-    const register = async () => {
-      try {
-        registration = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
-        if (disposed) return;
-        watchWorker(registration.installing);
-        registration.addEventListener("updatefound", () => watchWorker(registration?.installing ?? null));
-        if (registration.waiting && navigator.serviceWorker.controller) setWaiting(registration.waiting);
-        await registration.update().catch(() => undefined);
-      } catch {
-        // PWA support is an enhancement; failure never blocks the workspace.
+    const onPwa = (event: Event) => {
+      const detail = (event as CustomEvent<PwaDetail>).detail;
+      if (detail?.registration) {
+        registration = detail.registration;
+        syncWaiting();
       }
     };
 
-    const onLoad = () => void register();
-    const onVisible = () => {
-      if (document.visibilityState === "visible") void registration?.update().catch(() => undefined);
-    };
     const onControllerChange = () => {
-      // The first install claims the page; only reload for an actual update.
-      if (hadController) window.location.reload();
+      try {
+        if (window.sessionStorage.getItem("atw.sw.reload") === "1") {
+          window.sessionStorage.removeItem("atw.sw.reload");
+          window.location.reload();
+        }
+      } catch {
+        // Private mode: the update still activates on the next navigation.
+      }
     };
 
-    if (document.readyState === "complete") void register();
-    else window.addEventListener("load", onLoad, { once: true });
-    document.addEventListener("visibilitychange", onVisible);
-    navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
+    window.addEventListener("atw:pwa", onPwa);
+    navigator.serviceWorker?.addEventListener("controllerchange", onControllerChange);
+    navigator.serviceWorker?.getRegistration("/").then((value) => {
+      if (disposed || !value) return;
+      registration = value;
+      syncWaiting();
+    }).catch(() => undefined);
 
     return () => {
       disposed = true;
-      window.removeEventListener("load", onLoad);
-      document.removeEventListener("visibilitychange", onVisible);
-      navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
+      window.removeEventListener("atw:pwa", onPwa);
+      navigator.serviceWorker?.removeEventListener("controllerchange", onControllerChange);
     };
   }, []);
 
@@ -69,6 +71,11 @@ export function ServiceWorkerRegistrar() {
         type="button"
         className="btn btn-sm btn-primary"
         onClick={() => {
+          try {
+            window.sessionStorage.setItem("atw.sw.reload", "1");
+          } catch {
+            // The new worker still activates; the user can refresh once.
+          }
           waiting.postMessage({ type: "SKIP_WAITING" });
           setWaiting(null);
         }}

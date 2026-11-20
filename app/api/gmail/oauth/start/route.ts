@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { currentUser } from "@/lib/auth";
+import { currentUser, secureCookieForRequest } from "@/lib/auth";
 import { authUrl, gmailConfig, gmailMissing, stateToken } from "@/lib/gmail";
 
 export const dynamic = "force-dynamic";
@@ -20,7 +20,7 @@ export async function GET(request: Request) {
   response.cookies.set("atw_gmail_state", state, {
     httpOnly: true,
     sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
+    secure: secureCookieForRequest(request.headers),
     path: "/api/gmail/oauth",
     maxAge: 600,
   });

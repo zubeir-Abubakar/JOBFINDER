@@ -12,6 +12,7 @@ import { applyExtractionAction, discardExtractionAction } from "@/lib/actions/do
 import { Icon } from "@/components/icons";
 import { DocumentDeleteButton } from "@/components/DocumentDeleteButton";
 import { DocumentsBulkTable } from "@/components/DocumentsBulkTable";
+import { agentIdentity } from "@/lib/agent-identity";
 
 export const dynamic = "force-dynamic";
 
@@ -212,7 +213,7 @@ export default async function DocumentsPage({
         <div className="card-head">
           <div>
             <h2>{kindFilter === "tailored_cv" ? "Tailored CVs" : kindFilter === "cover_letter" ? "Cover letters" : "Tailored documents"}</h2>
-            <p className="card-sub">Each file is tied to the vacancy it was written for. ATS scores are internal self-assessments.</p>
+            <p className="card-sub">Each file is tied to the vacancy it was written for. CV ATS compatibility applies to CVs only; cover letters are assessed by their document-quality gate. Both are internal self-assessments, separate from candidate-to-job suitability.</p>
           </div>
           <div className="row">
             {kindFilter ? <Link href="/documents#tailored-documents" className="btn btn-sm">Show all documents</Link> : null}
@@ -221,7 +222,7 @@ export default async function DocumentsPage({
         </div>
         {generated.length === 0 ? (
           <Empty title={kindFilter ? `No ${kindFilter === "tailored_cv" ? "tailored CVs" : "cover letters"} yet` : "No tailored documents yet"}>
-            Open a vacancy and generate a package. The CV agent will only use facts from your master profile.
+            Open a vacancy and generate a package. {agentIdentity("cv").name} will only use facts from your master profile.
           </Empty>
         ) : (
           <div className="card-body documents-table-body">

@@ -1,16 +1,29 @@
 import type { JobAnalysis } from "./scoring";
+import {
+  hasSwissPermitB,
+  normaliseClaimText,
+  unsupportedMetricClaims,
+  unsupportedTechClaims,
+  workAuthorisationRequired,
+} from "./claim-validation";
 
 /**
- * Pre-document-generation readiness gate.
+ * Evidence-based application readiness.
  *
- * Every item is mandatory. A package is never generated silently around a
- * failed check: the caller stores this checklist on the application and queues
- * it for human review with the exact reasons.
- *
- * The checks use only supplied evidence. Claims in the generated CV are compared
- * with the verified master text, so a model cannot add a technology or metric
- * that the candidate has not evidenced.
+ * Documents existing is not enough. A package is ready only when the CV and
+ * cover letter are present, each passed its own quality gate, the claims are
+ * grounded, no duplicate submission exists and the stored submission policy is
+ * satisfied. A warning is not silently promoted to ready: it produces
+ * quality_review_required so the coordinator can explain the exact evidence.
  */
+
+export type ReadinessState =
+  | "documents_pending"
+  | "documents_generating"
+  | "documents_ready"
+  | "quality_review_required"
+  | "blocked"
+  | "ready_for_submission";
 
 export type ReadinessItem = {
   key: string;
@@ -21,6 +34,7 @@ export type ReadinessItem = {
 
 export type ReadinessResult = {
   ready: boolean;
+  state: ReadinessState;
   reasons: string[];
   items: ReadinessItem[];
   checkedAt: string;
@@ -31,6 +45,7 @@ export type ReadinessDocument = {
   id: string | null;
   text: string | null;
   qualityStatus: string | null;
+  qualityScore: number | null;
   fileExists: boolean;
 } | null;
 
@@ -57,6 +72,7 @@ export type ReadinessInput = {
     fullName: string | null;
     email: string | null;
     phone: string | null;
+    workAuthorisation: string | null;
     skills: string[];
     certifications: string[];
     languages: string[];
@@ -65,47 +81,27 @@ export type ReadinessInput = {
   cv: ReadinessDocument;
   cover: ReadinessDocument;
   threshold: number;
+  duplicateApplication?: boolean;
+  submissionPolicy?: {
+    active: boolean;
+    autonomousSubmission: boolean;
+    approvalRequired: boolean;
+    dailyRemaining: number | null;
+  };
   now: Date;
 };
 
-const TECH_CLAIMS = [
-  "playwright", "cypress", "selenium", "appium", "espresso", "xcuitest", "rest assured", "postman",
-  "python", "javascript", "typescript", "java", "c#", ".net", "sql", "jenkins", "azure devops",
-  "docker", "kubernetes", "terraform", "aws", "azure", "gcp", "ci/cd", "jmeter", "k6", "grafana",
-  "jira", "xray", "testrail", "zephyr", "cucumber", "bdd", "robot framework", "testng", "junit",
-  "pytest", "kotlin", "swift", "gatling", "loadrunner", "tricentis tosca", "github actions",
-  "gitlab ci", "graphql", "kafka", "browserstack", "sauce labs", "maestro", "detox",
-];
-
 const PLACEHOLDER_COMPANY =
   /^(company\s+[a-z]|company\s+\d+|employer\s+[a-z]|example(\s+(company|employer|inc|ltd))?|sample(\s+company)?|test\s+company|acme(\s+corp(oration)?)?|placeholder|not specified|unknown)$/i;
-
-function normalise(value: string): string {
-  return value.toLowerCase().replace(/[’‘]/g, "'").replace(/[“”]/g, '"').replace(/[–—]/g, "-").replace(/\s+/g, " ").trim();
-}
 
 function item(key: string, label: string, passed: boolean, detail: string): ReadinessItem {
   return { key, label, passed, detail };
 }
 
-function metricTokens(value: string): string[] {
-  return (
-    value.match(
-      /\b\d+(?:\.\d+)?\+?\s*(?:%|percent|hours?|hrs?|minutes?|days?|weeks?|months?|tests?|cases?|engineers?|people?|users?|clients?|countries?|projects?|releases?)(?![A-Za-z])/gi,
-    ) ?? []
-  ).map((token) => token.toLowerCase().replace(/\s+/g, " "));
-}
-
-function supportedClaims(text: string, evidence: string, profileSkills: string[]): string[] {
-  const haystack = normalise(evidence);
-  const skills = profileSkills.map((skill) => normalise(skill));
-  return TECH_CLAIMS.filter((tech) => normalise(text).includes(tech) && !haystack.includes(tech) && !skills.some((skill) => skill.includes(tech)));
-}
-
 function titleReferenced(coverText: string, title: string): boolean {
-  const text = normalise(coverText);
-  if (text.includes(normalise(title))) return true;
-  const tokens = normalise(title)
+  const text = normaliseClaimText(coverText);
+  if (text.includes(normaliseClaimText(title))) return true;
+  const tokens = normaliseClaimText(title)
     .split(/[^a-z0-9+#.]+/)
     .filter((token) => token.length > 2 && !/^(the|and|for|with|senior|junior|m|f|d|w)$/.test(token));
   if (tokens.length === 0) return false;
@@ -120,6 +116,13 @@ function freshness(publishedAt: string | null, now: Date): { passed: boolean; de
   const days = Math.floor((now.getTime() - time) / 86_400_000);
   if (days > 7) return { passed: false, detail: `The vacancy was published ${days} day(s) ago; the limit is seven.` };
   return { passed: true, detail: `Published ${Math.max(0, days)} day(s) ago.` };
+}
+
+function qualityDetail(document: ReadinessDocument, label: string): string {
+  if (!document) return `${label} is not attached.`;
+  if (!document.fileExists) return `${label} is missing from storage.`;
+  if (!document.qualityStatus) return `${label} has not passed a quality gate.`;
+  return `${label} quality is ${document.qualityStatus}${document.qualityScore !== null ? ` (${document.qualityScore}/100)` : ""}.`;
 }
 
 export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
@@ -161,7 +164,7 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
       "threshold",
       `Match score at least ${input.threshold}%`,
       scoreOk,
-      job.matchScore === null ? "No match score is stored." : `Stored score is ${job.matchScore}%.`,
+      job.matchScore === null ? "No match score is stored." : `Stored score is ${job.matchScore}%. This is suitability, not document quality.`,
     ),
   );
 
@@ -182,36 +185,51 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
     ),
   );
 
-  const masterComplete = Boolean(input.profile.fullName?.trim() && input.profile.email?.trim() && input.cv?.text && input.cv.text.trim().length >= 200);
+  const cvText = input.cv?.text ?? "";
+  const cvPresent = Boolean(input.profile.fullName?.trim() && input.profile.email?.trim() && cvText.trim().length >= 200 && input.cv?.fileExists);
   items.push(
     item(
-      "master_cv",
-      "Master CV is available and complete",
-      masterComplete && input.cv?.fileExists === true,
+      "cv_present",
+      "Tailored CV is present and complete",
+      cvPresent,
       !input.cv
         ? "No tailored CV document is attached."
         : !input.cv.fileExists
           ? "The tailored CV file is missing from storage."
-          : !masterComplete
-            ? "The verified profile or master CV text is incomplete."
-            : "Master identity, contact details and CV text are present.",
+          : !input.profile.fullName?.trim() || !input.profile.email?.trim()
+            ? "The verified profile is missing the name or email."
+            : cvText.trim().length < 200
+              ? "The tailored CV text is too short to be a complete document."
+              : "Candidate identity, contact details and CV text are present.",
     ),
   );
 
-  const cvText = input.cv?.text ?? "";
-  const unsupportedCv = supportedClaims(cvText, input.profile.sourceText, input.profile.skills);
-  const sourceMetrics = new Set(metricTokens(input.profile.sourceText));
-  const inventedMetrics = [...new Set(metricTokens(cvText))].filter((metric) => !sourceMetrics.has(metric));
-  const claimsOk = unsupportedCv.length === 0 && inventedMetrics.length === 0;
+  const cvQualityOk = input.cv?.qualityStatus === "passed";
+  items.push(
+    item(
+      "cv_quality",
+      "CV passed its document-quality gate",
+      cvQualityOk,
+      qualityDetail(input.cv, "CV"),
+    ),
+  );
+
+  const unsupportedCv = unsupportedTechClaims(
+    cvText,
+    input.profile.sourceText,
+    input.profile.skills,
+  );
+  const inventedCvMetrics = unsupportedMetricClaims(cvText, input.profile.sourceText, `${job.title} ${job.company}`);
+  const cvClaimsOk = unsupportedCv.length === 0 && inventedCvMetrics.length === 0;
   items.push(
     item(
       "cv_claims",
       "Every CV claim is supported",
-      claimsOk,
-      !claimsOk
+      cvClaimsOk,
+      !cvClaimsOk
         ? [
             unsupportedCv.length ? `Unsupported technologies: ${unsupportedCv.join(", ")}.` : "",
-            inventedMetrics.length ? `Unsupported metrics: ${inventedMetrics.join(", ")}.` : "",
+            inventedCvMetrics.length ? `Unsupported metrics: ${inventedCvMetrics.join(", ")}.` : "",
           ]
             .filter(Boolean)
             .join(" ")
@@ -220,28 +238,70 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
   );
 
   const coverText = input.cover?.text ?? "";
-  const coverOk = Boolean(coverText.trim() && titleReferenced(coverText, job.title) && normalise(coverText).includes(normalise(job.company)));
+  const coverPresent = Boolean(coverText.trim() && input.cover?.fileExists);
+  items.push(
+    item(
+      "cover_present",
+      "Cover letter is present",
+      coverPresent,
+      !input.cover
+        ? "No cover letter is attached."
+        : !input.cover.fileExists
+          ? "The cover letter file is missing from storage."
+          : coverText.trim().length > 0
+            ? "Cover letter text and file are present."
+            : "The cover letter text is empty.",
+    ),
+  );
+
+  const coverQualityOk = input.cover?.qualityStatus === "passed";
+  items.push(
+    item(
+      "cover_quality",
+      "Cover letter passed its document-quality gate",
+      coverQualityOk,
+      qualityDetail(input.cover, "Cover letter"),
+    ),
+  );
+
+  const coverTargetOk = Boolean(coverText.trim() && titleReferenced(coverText, job.title) && normaliseClaimText(coverText).includes(normaliseClaimText(job.company)));
   items.push(
     item(
       "cover_target",
       "Cover letter names the actual role and employer",
-      coverOk,
-      coverOk ? "Role and employer are both referenced." : "The cover letter does not reference both the role title and the employer.",
+      coverTargetOk,
+      coverTargetOk ? "Role and employer are both referenced." : "The cover letter does not reference both the role title and the employer.",
     ),
   );
 
-  const unsupportedCover = supportedClaims(coverText, input.profile.sourceText, input.profile.skills);
-  const coverQualityOk = input.cover?.qualityStatus !== "failed";
+  const unsupportedCover = unsupportedTechClaims(coverText, input.profile.sourceText, input.profile.skills);
+  const inventedCoverMetrics = unsupportedMetricClaims(coverText, input.profile.sourceText, `${job.title} ${job.company}`);
+  const coverClaimsOk = unsupportedCover.length === 0 && inventedCoverMetrics.length === 0;
   items.push(
     item(
       "cover_claims",
-      "No unsupported AI claims in the cover letter",
-      unsupportedCover.length === 0 && coverQualityOk,
-      !coverQualityOk
-        ? "The cover letter failed the document quality gate."
-        : unsupportedCover.length
-          ? `Unsupported technologies: ${unsupportedCover.join(", ")}.`
-          : "No unsupported technology was introduced by AI.",
+      "No unsupported claims in the cover letter",
+      coverClaimsOk,
+      unsupportedCover.length
+        ? `Unsupported technologies: ${unsupportedCover.join(", ")}.`
+        : inventedCoverMetrics.length
+          ? `Unsupported metrics: ${inventedCoverMetrics.join(", ")}.`
+          : "No unsupported technology or metric was introduced.",
+    ),
+  );
+
+  const authorisationRequired = workAuthorisationRequired(job.description ?? "");
+  const verifiedPermit = hasSwissPermitB(input.profile.workAuthorisation);
+  items.push(
+    item(
+      "work_authorisation",
+      "Work authorisation requirement is satisfied",
+      !authorisationRequired || verifiedPermit,
+      authorisationRequired
+        ? verifiedPermit
+          ? "The vacancy asks about work authorisation; a verified Swiss Permit B is recorded."
+          : "The vacancy asks about work authorisation, but no verified Swiss Permit B is recorded."
+        : "The vacancy does not ask about work authorisation or sponsorship.",
     ),
   );
 
@@ -255,12 +315,62 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
     ),
   );
 
+  if (input.duplicateApplication) {
+    items.push(item("duplicate_application", "No duplicate application", false, "A verified submission already exists for this vacancy."));
+  } else {
+    items.push(item("duplicate_application", "No duplicate application", true, "No prior verified submission is recorded."));
+  }
+
+  if (input.submissionPolicy) {
+    const policy = input.submissionPolicy;
+    const policyOk =
+      policy.active &&
+      policy.autonomousSubmission &&
+      !policy.approvalRequired &&
+      (policy.dailyRemaining === null || policy.dailyRemaining > 0);
+    const detail = !policy.active
+      ? "Standing authorisation is not active."
+      : !policy.autonomousSubmission
+        ? "Autonomous submission is disabled."
+        : policy.approvalRequired
+          ? "Per-application approval is required before submission."
+          : policy.dailyRemaining !== null && policy.dailyRemaining <= 0
+            ? "Today's submission limit has been reached."
+            : "Standing authorisation, approval mode and daily limit are satisfied.";
+    items.push(item("submission_policy", "Submission policy is satisfied", policyOk, detail));
+  }
+
   const reasons = items.filter((entry) => !entry.passed).map((entry) => `${entry.label}: ${entry.detail}`);
+  const failed = new Set(items.filter((entry) => !entry.passed).map((entry) => entry.key));
+  const cvQualityWarning = input.cv?.qualityStatus === "warning";
+  const coverQualityWarning = input.cover?.qualityStatus === "warning";
+  const qualityReview = cvQualityWarning || coverQualityWarning;
+  const missingDocuments = !input.cv || !input.cover;
+  const policyOnlyFailure = failed.size > 0 && [...failed].every((key) => key === "submission_policy");
+  const qualityKeys = new Set(["cv_quality", "cover_quality"]);
+  const nonQualityCritical = [...failed].some((key) => key !== "submission_policy" && !qualityKeys.has(key));
+
+  let state: ReadinessState;
+  if (reasons.length === 0) {
+    state = "ready_for_submission";
+  } else if (missingDocuments) {
+    state = ["documents_preparing", "preparing_documents"].includes(input.application.status)
+      ? "documents_generating"
+      : "documents_pending";
+  } else if (policyOnlyFailure) {
+    state = "documents_ready";
+  } else if (qualityReview && !nonQualityCritical) {
+    state = "quality_review_required";
+  } else {
+    state = "blocked";
+  }
+
   return {
     ready: reasons.length === 0,
+    state,
     reasons,
     items,
     checkedAt: input.now.toISOString(),
-    engine: "application-readiness-v1",
+    engine: "application-readiness-v2",
   };
 }

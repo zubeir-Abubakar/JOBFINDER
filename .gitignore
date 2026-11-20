@@ -2,6 +2,11 @@ node_modules/
 .next/
 out/
 data/
+.e2e-runtime/
+playwright-report/
+test-results/
+blob-report/
+certs/
 *.log
 .env
 .env.local

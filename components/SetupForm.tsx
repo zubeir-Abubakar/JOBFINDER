@@ -5,7 +5,7 @@ import { setupAction, type SetupState } from "@/app/setup/actions";
 import { SubmitButton } from "./SubmitButton";
 import { PasswordInput } from "./PasswordInput";
 
-export function SetupForm() {
+export function SetupForm({ tokenRequired = false }: { tokenRequired?: boolean }) {
   const [state, action] = useActionState<SetupState | undefined, FormData>(setupAction, undefined);
 
   return (
@@ -44,6 +44,21 @@ export function SetupForm() {
           </div>
         </div>
       </div>
+      {tokenRequired ? (
+        <div className="card p-4">
+          <h3 className="text-[14px]">Setup authorization</h3>
+          <p className="card-sub mb-3">Enter the one-time token configured by the operator. It is never displayed or returned by the server.</p>
+          <label className="label" htmlFor="setup_token">Setup token</label>
+          <input
+            id="setup_token"
+            name="setup_token"
+            type="password"
+            className="input"
+            autoComplete="off"
+            required
+          />
+        </div>
+      ) : null}
       <SubmitButton pendingLabel="Provisioning…" className="btn btn-primary w-full">
         Create accounts and open workspace
       </SubmitButton>
