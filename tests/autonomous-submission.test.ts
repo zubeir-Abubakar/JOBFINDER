@@ -302,29 +302,37 @@ function fakePackage(jobId: string) {
   };
 }
 
-test("defaults are 85%, 7 days, 5/day, and activation is deliberately absent", () => {
+test("defaults are 85%, 7 days, 5/day and automatic submission with no per-application approval", () => {
   const current = policy.getRecruitmentPolicy();
   assert.equal(current.minMatchScore, 85);
   assert.equal(current.maxSubmissionsPerDay, 5);
   assert.equal(current.freshnessDays, 7);
-  assert.equal(current.autonomousSubmission, false);
-  assert.equal(current.requirePerApplicationApproval, true);
-  assert.equal(current.activatedAt, null);
-  assert.equal(current.active, false);
+  assert.equal(current.autonomousSubmission, true);
+  assert.equal(current.requirePerApplicationApproval, false);
+  assert.equal(current.active, true);
 });
 
-test("before activation no application leaves the app", async () => {
+test("an eligible application is submitted without a per-application approval flag", async () => {
   const { jobId, applicationId } = makeJob({
     id: "gated_job",
     title: "Senior QA Automation Engineer",
     company: "Gated Employer AG",
     path: "/apply",
   });
+  const app = db.one<{ approved_at: string | null; status: string }>("SELECT approved_at, status FROM applications WHERE id = ?", [applicationId]);
+  assert.equal(app?.approved_at, null, "no approval flag is set");
+  assert.equal(app?.status, "ready_to_submit");
   const before = posts.length;
   const outcome = await submission.submitApplication(submissionInput(jobId, applicationId));
-  assert.equal(outcome.status, "blocked");
-  assert.match(outcome.detail, /standing authorisation is not activated/i);
-  assert.equal(posts.length, before, "no HTTP POST is made before activation");
+  assert.equal(outcome.status, "verified", outcome.detail);
+  assert.equal(posts.length, before + 1, "the eligible application was actually sent");
+  const recorded = db.one<{ approved_at: string | null; status: string; submission_status: string }>(
+    "SELECT approved_at, status, submission_status FROM applications WHERE id = ?",
+    [applicationId],
+  );
+  assert.equal(recorded?.approved_at, null);
+  assert.equal(recorded?.status, "submitted");
+  assert.equal(recorded?.submission_status, "verified");
 });
 
 test("one blocked application does not stop another qualifying application", async () => {

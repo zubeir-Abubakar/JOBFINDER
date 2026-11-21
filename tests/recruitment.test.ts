@@ -174,21 +174,22 @@ db.run("UPDATE settings SET value = 'false' WHERE key = 'approval_mode'");
 db.run("UPDATE settings SET value = '5' WHERE key = 'max_applications_per_day'");
 db.run("INSERT INTO settings (key, value, updated_at) VALUES ('standing_authorisation_activated_at', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [JSON.stringify(new Date().toISOString()), new Date().toISOString()]);
 
-test("the daily schedule is 10:00 Europe/Zurich and survives both DST transitions", () => {
-  assert.equal(schedule.nextDailyRun(new Date("2026-01-15T08:00:00Z")).toISOString(), "2026-01-15T09:00:00.000Z");
-  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T07:00:00Z")).toISOString(), "2026-07-15T08:00:00.000Z");
-  // After 10:00 local the next execution is tomorrow, still at 10:00 local.
-  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T09:00:00Z")).toISOString(), "2026-07-16T08:00:00.000Z");
+test("the weekly schedule is 09:00 Europe/Zurich on Monday–Friday and survives both DST transitions", () => {
+  assert.equal(schedule.nextDailyRun(new Date("2026-01-15T07:00:00Z")).toISOString(), "2026-01-15T08:00:00.000Z");
+  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T06:00:00Z")).toISOString(), "2026-07-15T07:00:00.000Z");
+  // After 09:00 local the next execution is tomorrow, still at 09:00 local.
+  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T08:00:00Z")).toISOString(), "2026-07-16T07:00:00.000Z");
   // Spring forward (29 Mar 2026) and autumn back (25 Oct 2026).
-  assert.equal(schedule.nextDailyRun(new Date("2026-03-28T12:00:00Z")).toISOString(), "2026-03-29T08:00:00.000Z");
-  assert.equal(schedule.nextDailyRun(new Date("2026-10-24T12:00:00Z")).toISOString(), "2026-10-25T09:00:00.000Z");
+  assert.equal(schedule.nextDailyRun(new Date("2026-03-28T12:00:00Z")).toISOString(), "2026-03-29T07:00:00.000Z");
+  assert.equal(schedule.nextDailyRun(new Date("2026-10-24T12:00:00Z")).toISOString(), "2026-10-25T08:00:00.000Z");
   assert.equal(schedule.localDateKey(new Date("2026-11-18T23:30:00Z")), "2026-11-19");
 });
 
 test("the schedule is persisted in SQLite, not only in memory", () => {
   const row = schedule.ensureSchedule();
-  assert.equal(row.time, "10:00");
+  assert.equal(row.time, "09:00");
   assert.equal(row.timezone, "Europe/Zurich");
+  assert.deepEqual(schedule.parseWeekdays(row.weekdays), [1, 2, 3, 4, 5]);
   assert.ok(row.next_run_at);
   const toggled = schedule.setScheduleEnabled(false);
   assert.equal(toggled.enabled, 0);
@@ -602,7 +603,10 @@ test("a vacancy scoring below 85% is excluded before any document work", async (
 });
 
 test("a missed scheduled run is recorded rather than silently skipped", async () => {
-  db.run("UPDATE schedule_jobs SET enabled = 1, next_run_at = ? WHERE key = ?", [
+  // Make the occurrence due today, including when the test host runs on a
+  // weekend, so this exercises the missed-window path rather than the rest day.
+  db.run("UPDATE schedule_jobs SET enabled = 1, weekdays = ?, next_run_at = ? WHERE key = ?", [
+    JSON.stringify([1, 2, 3, 4, 5, 6, 7]),
     new Date(Date.now() - 48 * 3600_000).toISOString(),
     schedule.RECRUITMENT_SCHEDULE_KEY,
   ]);

@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { AgentAvatar } from "./AgentAvatar";
 import { agentIdentity } from "@/lib/agent-identity";
 import { formatDateTime } from "@/lib/format";
+import { dispatchVisualCommand } from "@/lib/visual-session";
+import { visualViewForPath, type VisualCommand } from "@/lib/visual-types";
 
 type ChatMessage = {
   id: number | string;
@@ -22,7 +24,14 @@ type MessageMeta = {
 
 type StreamEvent =
   | { type: "delta"; delta: string }
-  | { type: "done"; reply: string; agentKey?: string; agentKeys?: string[]; handover?: MessageMeta["handover"] }
+  | {
+      type: "done";
+      reply: string;
+      agentKey?: string;
+      agentKeys?: string[];
+      handover?: MessageMeta["handover"];
+      visual?: VisualCommand | null;
+    }
   | { type: "error"; error: string };
 
 function parseMeta(value: string | null): MessageMeta {
@@ -97,7 +106,10 @@ export function AssistantChat({
       const response = await fetch("/api/assistant/message/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: content }),
+        body: JSON.stringify({
+          message: content,
+          view: visualViewForPath(window.location.pathname) ?? null,
+        }),
         signal: controller.signal,
       });
       if (!response.ok || !response.body) {
@@ -134,6 +146,7 @@ export function AssistantChat({
           } else if (event.type === "done") {
             done = true;
             completed = true;
+            if (event.visual) dispatchVisualCommand(event.visual);
             const finalText = event.reply || assistant;
             update(finalText, metaFor(event.agentKey ?? activeAgentKey, event.agentKeys ?? [event.agentKey ?? activeAgentKey], event.handover));
             setMessages((previous) =>

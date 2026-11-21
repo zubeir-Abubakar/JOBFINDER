@@ -28,7 +28,7 @@ import {
 import { notify } from "./notify";
 import { enqueueDocumentRecovery } from "./recruitment-recovery";
 import { audit } from "./audit";
-import { catchUpWindowHours, localDateKey, nextDailyRun, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, formatInZone } from "./recruitment-schedule";
+import { catchUpWindowHours, localDateKey, nextScheduledRun, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, RECRUITMENT_WEEKDAYS, formatInZone } from "./recruitment-schedule";
 import { acquireRuntimeLock, refreshRuntimeLock, releaseRuntimeLock, runtimeLockActive } from "./runtime-state";
 import { recordApplicationEvent } from "./application-events";
 import { generateText, providerConfigured, scrubProviderError } from "./providers";
@@ -494,7 +494,11 @@ export function createRecruitmentRun(input: {
   }
 
   const id = `run_${randomId()}`;
-  const scheduledFor = input.scheduledFor ?? (input.trigger === "manual" ? now.toISOString() : nextDailyRun(now).toISOString());
+  const scheduledFor =
+    input.scheduledFor ??
+    (input.trigger === "manual"
+      ? now.toISOString()
+      : nextScheduledRun(now, { time: RECRUITMENT_TIME, weekdays: RECRUITMENT_WEEKDAYS }).toISOString());
   try {
     run(
       `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, jobs_discovered, jobs_eligible, jobs_qualified,
@@ -796,16 +800,15 @@ export async function executeRun(
     Math.max(1, options.maxApplications ?? policy.maxSubmissionsPerDay),
   );
   const threshold = qualifyingThreshold();
-  const dryRun = getSetting<boolean>("recruitment_dry_run", true) || process.env.RECRUITMENT_DRY_RUN === "true";
+  const dryRun = getSetting<boolean>("recruitment_dry_run", false) || process.env.RECRUITMENT_DRY_RUN === "true";
   const submissionEnabled =
     getSetting<boolean>("recruitment_submission_enabled", true) && process.env.RECRUITMENT_SUBMISSION_ENABLED !== "false";
-  const submissionAllowed =
-    policy.active && policy.autonomousSubmission && !policy.requirePerApplicationApproval && submissionEnabled;
+  const submissionAllowed = policy.active && policy.autonomousSubmission && submissionEnabled;
   const usageToday = dailySubmissionUsage(now);
   const selectionLimit = Math.min(maxApplications, usageToday.remaining);
   if (!policy.active) {
     warnings.push(
-      "Standing authorisation is not activated. This run is a non-submitting simulation: packages may be prepared, but no application is sent.",
+      "Automatic submission is paused in settings. This run is a non-submitting simulation: packages may be prepared, but no application is sent.",
     );
   } else if (usageToday.remaining === 0) {
     warnings.push(
@@ -1310,15 +1313,18 @@ export async function executeRun(
           body: `${job.company} was not submitted because a quality gate returned a warning: ${readiness.reasons.slice(0, 3).join(" ")}`,
         });
       } else if (readiness.state === "documents_ready") {
-        run("UPDATE applications SET status = 'awaiting_approval', last_update = ? WHERE id = ?", [nowIso(), app.id]);
+        // The documents and quality gates passed; only the owner's automatic
+        // submission switch is paused. This is not a per-application approval
+        // gate and must not create an approval queue item.
+        run("UPDATE applications SET status = 'ready_to_submit', last_update = ? WHERE id = ?", [nowIso(), app.id]);
         recordApplicationEvent({ applicationId: app.id, type: "quality.ready", message: readiness.reasons.join(" ") });
         logAgent({
           runId,
           agentKey: "ats",
           assignment: `Quality check ${job.title}`,
           status: "completed",
-          output: `Documents are ready; submission policy/approval remains: ${readiness.reasons.join(" ")}`,
-          decision: "Coordinator left the package awaiting approval rather than treating document existence as submission readiness.",
+          output: `Documents are ready; automatic submission is paused: ${readiness.reasons.join(" ")}`,
+          decision: "Coordinator marked the package ready for submission. No per-application approval is required; sending waits only for the owner-level automatic-submission switch.",
           finishedAt: nowIso(),
         });
       } else {
@@ -1348,15 +1354,14 @@ export async function executeRun(
     let unverified = 0;
     let intervention = 0;
     let simulated = 0;
-    if (ready.length > 0) {
-      pushState(
+    if (ready.length > 0) {        pushState(
         runId,
         "submitting",
         dryRun
           ? "Dry run: packages are recorded without contacting an employer."
           : !policy.active
-            ? "Simulation: the standing authorisation is not activated, so nothing is sent."
-            : "Submitting qualified applications through the verified candidate channel.",
+            ? "Simulation: automatic submission is paused, so nothing is sent."
+            : "Submitting qualified applications through the verified candidate channel without per-application approval.",
       );
       for (const item of ready) {
         const usage = dailySubmissionUsage(deps.now ?? now);
@@ -1386,7 +1391,7 @@ export async function executeRun(
           const reason = dryRun
             ? "Dry run requested: nothing was sent."
             : !policy.active
-              ? "Standing authorisation is not activated: this is a non-submitting simulation."
+              ? "Automatic submission is paused in settings: this is a non-submitting simulation."
               : "Automatic submission is disabled in settings.";
           recordPolicySimulation({ applicationId: item.applicationId, jobId: item.jobId, reason, at: nowIso() });
           run(
@@ -1394,7 +1399,7 @@ export async function executeRun(
             [nowIso(), item.applicationId],
           );
           recordApplicationEvent({ applicationId: item.applicationId, type: "submission.simulated", message: reason });
-          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", output: reason, decision: "The package reached the submission stage without approval; no application was sent.", finishedAt: nowIso() });
+          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", output: reason, decision: "The package reached the submission stage without per-application approval; no application was sent only because automatic submission is paused.", finishedAt: nowIso() });
           if (!dryRun) {
             notify({
               kind: "application_approval_required",
@@ -1603,7 +1608,14 @@ export async function executeRun(
     run("UPDATE recruitment_runs SET report = ? WHERE id = ?", [finalReport, runId]);
     finishWorkflow(workflowId, runStatus === "failed" ? "failed" : "completed", finalReport.split("\n")[1] ?? "Daily recruitment run completed.");
     // A discovery-only run does not consume the daily schedule slot.
-    if (!discoveryOnly) recordScheduleRun({ runId, status: runStatus, now: deps.now ?? now });
+    if (!discoveryOnly && runRow.trigger !== "manual") {
+      recordScheduleRun({
+        runId,
+        status: runStatus,
+        now: deps.now ?? now,
+        scheduledFor: runRow.scheduled_for ?? null,
+      });
+    }
 
     // The Coordinator's daily brief is the single owner-facing consolidated
     // report. Keep run completion visible in-app without emitting a competing
@@ -1655,7 +1667,15 @@ export async function executeRun(
     closeOpenAssignments(runId, "failed", "Run terminated before this assignment completed.", workflowId);
     pushState(runId, "failed", message);
     if (workflowId) finishWorkflow(workflowId, "failed", message);
-    recordScheduleRun({ runId, status: "failed", error: message, now: deps.now ?? now });
+    if (runRow.trigger !== "manual") {
+      recordScheduleRun({
+        runId,
+        status: "failed",
+        error: message,
+        now: deps.now ?? now,
+        scheduledFor: runRow.scheduled_for ?? null,
+      });
+    }
     notify({
       userId,
       kind: "recruitment_run_failed",

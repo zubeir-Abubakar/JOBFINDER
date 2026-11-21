@@ -49,8 +49,8 @@ export const AGENT_VOICE_PROFILES: Record<AgentKey, AgentVoiceProfile> = {
   },
   research: {
     agentKey: "research",
-    voiceId: "Orus",
-    voiceName: "Orus — firm, composed",
+    voiceId: "Leda",
+    voiceName: "Leda — youthful, clear",
     provider: "gemini-live",
     language: "English",
     style: "Focused and evidence-led",
@@ -104,8 +104,8 @@ export const AGENT_VOICE_PROFILES: Record<AgentKey, AgentVoiceProfile> = {
   },
   application: {
     agentKey: "application",
-    voiceId: "Leda",
-    voiceName: "Leda — youthful, clear",
+    voiceId: "Orus",
+    voiceName: "Orus — firm, composed",
     provider: "gemini-live",
     language: "English",
     style: "Practical and process-driven",

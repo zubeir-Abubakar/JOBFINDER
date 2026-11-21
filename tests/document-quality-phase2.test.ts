@@ -394,9 +394,17 @@ test("readiness requires document quality and policy, and distinguishes review f
   assert.equal(duplicate.ready, false);
   assert.equal(duplicate.state, "blocked");
 
-  const approval = evaluateReadiness(readinessInput({
+  // Per-application approval no longer blocks readiness. Only the owner-level
+  // automatic-submission switch does, and that leaves the documents ready.
+  const approved = evaluateReadiness(readinessInput({
     submissionPolicy: { active: true, autonomousSubmission: true, approvalRequired: true, dailyRemaining: 5 },
   }));
-  assert.equal(approval.ready, false);
-  assert.equal(approval.state, "documents_ready");
+  assert.equal(approved.ready, true);
+  assert.equal(approved.state, "ready_for_submission");
+
+  const paused = evaluateReadiness(readinessInput({
+    submissionPolicy: { active: false, autonomousSubmission: false, approvalRequired: false, dailyRemaining: 5 },
+  }));
+  assert.equal(paused.ready, false);
+  assert.equal(paused.state, "documents_ready");
 });

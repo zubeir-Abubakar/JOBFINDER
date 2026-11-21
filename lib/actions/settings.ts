@@ -11,6 +11,11 @@ import { maskEmail, runGmailTestEmail } from "@/lib/gmail";
 import { cleanupExpiredDocuments } from "@/lib/retention";
 import { cleanupTempObjects } from "@/lib/temp-store";
 import { effectiveMinMatchScore } from "@/lib/scoring";
+import {
+  RECRUITMENT_SCHEDULE_KEY,
+  REPORT_SCHEDULE_KEY,
+  saveScheduleConfiguration,
+} from "@/lib/recruitment-schedule";
 
 const list = (value: FormDataEntryValue | null) =>
   String(value ?? "")
@@ -41,7 +46,9 @@ export async function saveProfessionalPreferencesAction(formData: FormData): Pro
 
 export async function saveAutomationAction(formData: FormData): Promise<void> {
   const user = await requireUser();
-  setSetting("approval_mode", formData.get("approval_mode") === "on");
+  // Per-application approval is retired. The owner-level switch is the only
+  // approval control.
+  setSetting("approval_mode", false);
   setSetting("autonomous_submission", formData.get("autonomous_submission") === "on");
   // The floor is enforced here as well as in the scoring engine: a stored value
   // below 85% would otherwise be displayed as if it were the active threshold.
@@ -52,6 +59,50 @@ export async function saveAutomationAction(formData: FormData): Promise<void> {
   audit({ action: "settings.automation", entity: "settings", detail: `Approval mode: ${formData.get("approval_mode") === "on"}`, userId: user.id });
   revalidatePath("/settings");
   redirect("/settings?saved=1#automation");
+}
+
+/** Validated recruitment-run schedule. Weekdays and time are persisted. */
+export async function saveRecruitmentScheduleAction(formData: FormData): Promise<void> {
+  const user = await requireUser();
+  const result = saveScheduleConfiguration(RECRUITMENT_SCHEDULE_KEY, {
+    enabled: formData.get("enabled") === "on",
+    weekdays: formData.getAll("weekdays").map((value) => Number(value)),
+    time: formData.get("time"),
+    timezone: formData.get("timezone") ?? "Europe/Zurich",
+  });
+  if (!result.ok) redirect(`/settings?error=${encodeURIComponent(result.error)}#scheduling`);
+  audit({
+    action: "settings.recruitment_schedule",
+    entity: "schedule",
+    entityId: RECRUITMENT_SCHEDULE_KEY,
+    detail: `${result.schedule.enabled ? "enabled" : "disabled"} · ${result.schedule.time} ${result.schedule.timezone} · ${result.schedule.weekdays}`,
+    userId: user.id,
+  });
+  revalidatePath("/settings");
+  revalidatePath("/recruitment");
+  redirect("/settings?saved=1#scheduling");
+}
+
+/** Validated daily-report schedule, independent from recruitment days. */
+export async function saveReportScheduleAction(formData: FormData): Promise<void> {
+  const user = await requireUser();
+  const result = saveScheduleConfiguration(REPORT_SCHEDULE_KEY, {
+    enabled: formData.get("enabled") === "on",
+    weekdays: formData.getAll("weekdays").map((value) => Number(value)),
+    time: formData.get("time"),
+    timezone: formData.get("timezone") ?? "Europe/Zurich",
+  });
+  if (!result.ok) redirect(`/settings?error=${encodeURIComponent(result.error)}#scheduling`);
+  audit({
+    action: "settings.report_schedule",
+    entity: "schedule",
+    entityId: REPORT_SCHEDULE_KEY,
+    detail: `${result.schedule.enabled ? "enabled" : "disabled"} · ${result.schedule.time} ${result.schedule.timezone} · ${result.schedule.weekdays}`,
+    userId: user.id,
+  });
+  revalidatePath("/settings");
+  revalidatePath("/recruitment");
+  redirect("/settings?saved=1#scheduling");
 }
 
 export async function saveNotificationSettingsAction(formData: FormData): Promise<void> {

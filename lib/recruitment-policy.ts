@@ -7,13 +7,12 @@ import { audit } from "./audit";
 /**
  * Standing authorisation for autonomous recruitment.
  *
- * The policy is persisted in `settings`; the activation timestamp is a separate
- * switch. Approval is required and autonomous submission is off by default. A
- * fresh installation is also a dry run and is deliberately not activated: the
- * owner must explicitly change the policy and activate standing authorisation
- * before anything can leave the machine. The effective limit is always read
- * from persisted settings, so an existing owner's cap is never silently raised
- * or lowered.
+ * The owner authorises the operating policy once in settings. From then on an
+ * application that passes every check is submitted without another approval.
+ * Approval mode is no longer a per-application gate; it is retained as a legacy
+ * read-only value so older rows remain understandable. The effective limit is
+ * always read from persisted settings, so an existing owner's cap is never
+ * silently raised or lowered.
  */
 
 export const DEFAULT_MAX_SUBMISSIONS_PER_DAY = 5;
@@ -45,8 +44,7 @@ function positiveInt(value: unknown, fallback: number, max: number): number {
 export function getRecruitmentPolicy(): RecruitmentPolicy {
   const activatedAtRaw = getSetting<string | null>("standing_authorisation_activated_at", null);
   const activatedAt = typeof activatedAtRaw === "string" && activatedAtRaw.trim() ? activatedAtRaw : null;
-  const approvalRequired = getSetting<boolean>("approval_mode", true) === true;
-  const autonomousSubmission = getSetting<boolean>("autonomous_submission", false) === true;
+  const autonomousSubmission = getSetting<boolean>("autonomous_submission", true) === true;
   return {
     autonomousSubmission,
     minMatchScore: effectiveMinMatchScore(getSetting<number>("min_match_score", 85)),
@@ -58,9 +56,11 @@ export function getRecruitmentPolicy(): RecruitmentPolicy {
     freshnessDays: FRESHNESS_DAYS,
     verifiedOpenOnly: true,
     blockDuplicates: true,
-    requirePerApplicationApproval: approvalRequired,
+    // Per-application approval is deliberately retired. Only the owner-level
+    // automatic-submission switch and the eligibility checks can stop a send.
+    requirePerApplicationApproval: false,
     activatedAt,
-    active: autonomousSubmission && !approvalRequired && Boolean(activatedAt),
+    active: autonomousSubmission,
     engine: RECRUITMENT_POLICY_ENGINE,
   };
 }
@@ -85,13 +85,31 @@ export function activateStandingAuthorisation(userId?: string): string {
 }
 
 export function pauseStandingAuthorisation(userId?: string): void {
-  setSetting("standing_authorisation_activated_at", null);
+  setSetting("autonomous_submission", false);
+  setSetting("approval_mode", false);
   audit({
     action: "recruitment.standing_authorisation_paused",
     entity: "settings",
-    detail: "Automatic submission was paused; no application will be sent until reactivated.",
+    detail: "Automatic submission was paused; no application will be sent until it is resumed.",
     userId: userId ?? null,
   });
+}
+
+/** Re-enables automatic submission without restoring a per-application gate. */
+export function resumeStandingAuthorisation(userId?: string): string {
+  const at = nowIso();
+  if (!getSetting<string | null>("standing_authorisation_activated_at", null)) {
+    setSetting("standing_authorisation_activated_at", at);
+  }
+  setSetting("autonomous_submission", true);
+  setSetting("approval_mode", false);
+  audit({
+    action: "recruitment.standing_authorisation_resumed",
+    entity: "settings",
+    detail: "Automatic submission resumed. Eligible applications will be submitted without per-application approval.",
+    userId: userId ?? null,
+  });
+  return at;
 }
 
 /** Owner-editable policy. The threshold floor and the hard daily cap are enforced here. */
@@ -104,8 +122,9 @@ export function saveRecruitmentPolicy(input: {
   const minScore = Math.min(100, effectiveMinMatchScore(input.minMatchScore));
   const maxPerDay = positiveInt(input.maxSubmissionsPerDay, DEFAULT_MAX_SUBMISSIONS_PER_DAY, MAX_SUBMISSIONS_PER_DAY_LIMIT);
   setSetting("autonomous_submission", input.autonomousSubmission);
-  // Turning automatic submission off must restore the per-application gate.
-  setSetting("approval_mode", !input.autonomousSubmission);
+  // Per-application approval is retired. Pausing automatic submission is the
+  // owner-level control; it never silently re-enables a per-application gate.
+  setSetting("approval_mode", false);
   setSetting("min_match_score", minScore);
   setSetting("max_applications_per_day", maxPerDay);
   setSetting("duplicate_detection", true);

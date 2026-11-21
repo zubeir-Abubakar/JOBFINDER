@@ -164,7 +164,7 @@ export default async function JobsPage({
         </form>
       </details>
 
-      <section className="card mb-4" id="vacancies">
+      <section className="card mb-4" id="vacancies" data-visual-id="job-results">
         <div className="card-head">
           <div>
             <h2>Vacancies <span className="num" style={{ color: "var(--muted)", fontWeight: 500 }}>({jobs.length})</span></h2>

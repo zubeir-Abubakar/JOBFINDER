@@ -3,6 +3,7 @@ import { getSetting, setSetting } from "./settings";
 import { notify } from "./notify";
 import { clearProviderCooldowns,
   classifyProviderFailure,
+  isFailClosedFailure,
   isRouteFailure,
   isTransientFailure,
   providerCooldown,
@@ -1400,8 +1401,15 @@ function errorStatus(error: unknown): number | null {
 function routeFailure(error: unknown): { kind: ProviderFailureKind; message: string; retryAfterMs: number | null; status: number | null } {
   const message = scrub(error instanceof Error ? error.message : "provider failure");
   const status = errorStatus(error);
+  // The error class is authoritative. A locally raised configuration error can
+  // carry wording that the message classifier would not recognise, so it must
+  // never be downgraded to a generic transient failure and retried elsewhere.
+  const kind: ProviderFailureKind =
+    error instanceof AiProviderConfigError
+      ? "configuration"
+      : classifyProviderFailure(message, status);
   return {
-    kind: classifyProviderFailure(message, status),
+    kind,
     message,
     retryAfterMs: error instanceof AiRateLimitedError ? error.retryAfterMs : null,
     status,
@@ -1505,10 +1513,10 @@ export async function generateText(input: GenerateInput): Promise<GenerateResult
             primaryError = error;
             if (streamed) throw new ProvidersUnavailableError(`FreeLLMAPI stream interrupted after a partial response: ${failure.message}. No duplicate fallback was attempted.`);
 
-            if (failure.kind === "authentication") {
-              throw new AiProviderConfigError("freellmapi", failure.message);
-            }
-            if (failure.kind === "configuration") {
+            if (isFailClosedFailure(failure.kind)) {
+              // Invalid credentials, malformed requests and model-policy
+              // violations fail closed. They are never answered by Ollama, so a
+              // configuration defect cannot hide behind a successful reply.
               throw new AiProviderConfigError("freellmapi", failure.message);
             }
             if (failure.kind === "quota_exhausted" || failure.kind === "rate_limited" || failure.kind === "cooldown") {

@@ -14,27 +14,37 @@ import { existingVerifiedSubmission } from "@/lib/submission";
 import { recordApplicationEvent } from "@/lib/application-events";
 import { latestWorkflowForUser } from "@/lib/workflow-view";
 
+/**
+ * Legacy compatibility only. Per-application approval is retired, so a package
+ * that is otherwise ready is released to the automatic queue without an
+ * approval flag. New packages never enter this state.
+ */
 export async function approveApplicationAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") ?? "");
-  const app = one<{ id: string; job_id: string; status: string }>("SELECT id, job_id, status FROM applications WHERE id = ?", [id]);
+  const app = one<{ id: string; job_id: string; status: string; readiness: string | null }>(
+    "SELECT id, job_id, status, readiness FROM applications WHERE id = ?",
+    [id],
+  );
   if (!app) redirect("/applications?error=Application+not+found");
-  if (app.status !== "awaiting_approval") redirect("/applications?error=Only+packages+awaiting+approval+can+be+approved");
-  run("UPDATE applications SET approved_at = ?, last_update = ? WHERE id = ?", [nowIso(), nowIso(), id]);
-  audit({ action: "application.approved", entity: "application", entityId: id, detail: `Job ${app.job_id}`, userId: user.id });
+  if (!readinessAllowsSubmission(app!.readiness)) {
+    redirect(`/applications/${id}?error=${encodeURIComponent("The readiness checklist has not passed. No approval is required, but the application is not ready to send.")}`);
+  }
+  run("UPDATE applications SET status = 'ready_to_submit', approved_at = NULL, last_update = ? WHERE id = ?", [nowIso(), id]);
+  audit({ action: "application.released_to_automatic_queue", entity: "application", entityId: id, detail: `Job ${app!.job_id}. No per-application approval is required.`, userId: user.id });
   const workflow = latestWorkflowForUser(user);
   if (workflow) {
     emitWorkflowEvent({
       workflowId: workflow.id,
       type: "approval.granted",
       agentKey: "application",
-      message: "Owner approved the package. Submission is still recorded manually with an employer reference.",
+      message: "The package was released to the automatic submission queue. Employer evidence is still required before it is counted as submitted.",
       meta: { applicationId: id },
     });
   }
   revalidatePath("/applications");
   revalidatePath("/dashboard");
-  redirect(`/applications/${id}?ok=${encodeURIComponent("Approved. Submit through the employer channel, then record the confirmation reference.")}`);
+  redirect(`/applications/${id}?ok=${encodeURIComponent("Released to the automatic submission queue. No per-application approval is required.")}`);
 }
 
 export type SubmissionState = { error?: string; ok?: string };
@@ -83,7 +93,7 @@ export async function recordSubmissionAction(_prev: SubmissionState | undefined,
   }
   const blocked = submissionBlockedReason({
     found: true,
-    approvalMode: getSetting<boolean>("approval_mode", true),
+    approvalMode: false,
     approvedAt: app.approved_at,
     confirmation,
     status: app.status,

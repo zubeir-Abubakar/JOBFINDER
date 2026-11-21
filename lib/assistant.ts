@@ -11,9 +11,19 @@ import { latestWorkflowSnapshotForUser } from "./workflow-view";
 import { latestPausedWorkflow, workflowActor } from "./workflow";
 import { latestExecutiveBriefDelivery, refreshLatestExecutiveBriefDelivery, sendExecutiveBriefNow } from "./executive-brief";
 import { isProfileQuestion, profileBrief } from "./profile-brief";
+import { detectVisualIntent } from "./visual-companion";
+import { explainVisualQuestion } from "./visual-context";
+import type { VisualCommand } from "./visual-types";
 
 export type AssistantPendingAction = "cleanup_expired";
-export type AssistantResult = { reply: string; taskIds: string[]; agentKeys?: string[]; pendingAction?: AssistantPendingAction };
+export type AssistantResult = {
+  reply: string;
+  taskIds: string[];
+  agentKeys?: string[];
+  pendingAction?: AssistantPendingAction;
+  /** Approved in-app navigation or highlight, dispatched by the browser host. */
+  visual?: VisualCommand;
+};
 
 const HELP = `I can talk through your workspace and act on it. Try:
 • "Hello" / "What should I do next?"
@@ -170,7 +180,7 @@ function taskAgentKeys(): string[] {
 export async function handleAssistantMessage(
   userId: string,
   message: string,
-  options: { sessionId?: string | null; onDelta?: (delta: string) => void } = {},
+  options: { sessionId?: string | null; view?: string | null; onDelta?: (delta: string) => void } = {},
 ): Promise<AssistantResult> {
   const text = normalise(message);
   const taskIds: string[] = [];
@@ -195,6 +205,21 @@ export async function handleAssistantMessage(
   if (pending && /^(no|cancel|stop|don't|do not)\b/.test(text)) {
     return { reply: "Cancelled. Nothing was deleted or changed.", taskIds };
   }
+
+  // Visual-understanding questions are answered from the actual stored charts,
+  // tables, page data or owned document text before any model call. This is the
+  // structured source of truth; a screenshot is never required when the data is
+  // already available.
+  const explanation = explainVisualQuestion(userId, message, options.view ?? undefined);
+  if (explanation) {
+    return { reply: explanation.reply, taskIds, agentKeys: explanation.agentKeys as AssistantResult["agentKeys"] };
+  }
+
+  // Explicit visual requests are resolved deterministically against real
+  // records before any model call. This keeps navigation available even when a
+  // provider is down and prevents invented ids or destinations.
+  const visualIntent = detectVisualIntent(userId, message);
+  if (visualIntent) return visualIntent;
 
   // Profile and CV questions are answered from the stored account records and
   // the extracted original CV, without sending personal data to a text model.
@@ -336,7 +361,7 @@ export async function handleAssistantMessage(
   if (/\b(today|today's|daily)\b/.test(text) && /\b(recruit|activity|summary|summarise|summarize|happened)\b/.test(text)) {
     const today = todaySnapshot();
     return {
-      reply: `Today’s recruitment activity:\n• ${today.jobs.today} new vacancies discovered (${today.jobs.total} total, ${today.jobs.analysed} analysed, ${today.jobs.strong} strong)\n• ${today.apps.awaiting} application package(s) awaiting your approval\n• ${today.apps.submitted_today} confirmed submission(s) today\n• ${today.apps.interviews} interview invitation(s) recorded\n• ${today.tasks.completed_today} task(s) completed, ${today.tasks.failed_today} failed\n• ${today.messages} recruiter message(s) stored\nAll figures are read directly from SQLite.`,
+      reply: `Today’s recruitment activity:\n• ${today.jobs.today} new vacancies discovered (${today.jobs.total} total, ${today.jobs.analysed} analysed, ${today.jobs.strong} strong)\n• ${today.apps.awaiting} application package(s) needing your attention\n• ${today.apps.submitted_today} confirmed submission(s) today\n• ${today.apps.interviews} interview invitation(s) recorded\n• ${today.tasks.completed_today} task(s) completed, ${today.tasks.failed_today} failed\n• ${today.messages} recruiter message(s) stored\nAll figures are read directly from SQLite.`,
       taskIds,
     };
   }
@@ -356,7 +381,7 @@ export async function handleAssistantMessage(
         : pausedWorkflow
           ? `Resume the paused workflow “${pausedWorkflow.label}” or start a fresh run now that the agents are available.`
         : awaiting
-          ? `Review ${awaiting} generated package(s) awaiting your approval before any submission.`
+          ? `Review ${awaiting} application(s) that stopped for a legitimate human step.`
           : newJobs
             ? `${newJobs} vacancy(ies) still need analysis. Run “Analyse unanalysed vacancies”.`
             : totalJobs === 0
@@ -478,7 +503,7 @@ export async function handleAssistantMessage(
     const outcome = await generateApplicationPackage(userId, job.id);
     return {
       reply: outcome.ok
-        ? `Documents prepared for ${job.title} at ${job.company}. ATS self-check ${outcome.atsScore}/100.${outcome.warnings.length ? ` Warnings: ${outcome.warnings.slice(0, 2).join(" ")}` : ""} The package is awaiting your approval; nothing was submitted.`
+        ? `Documents prepared for ${job.title} at ${job.company}. ATS self-check ${outcome.atsScore}/100.${outcome.warnings.length ? ` Warnings: ${outcome.warnings.slice(0, 2).join(" ")}` : ""} The package is ready for the independent readiness check; eligible applications are submitted automatically without per-application approval.`
         : `I could not prepare documents: ${outcome.message}`,
       taskIds: outcome.applicationId ? [outcome.applicationId] : taskIds,
       agentKeys: ["cv", "ats", "cover", "application"],

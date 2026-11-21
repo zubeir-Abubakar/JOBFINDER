@@ -116,9 +116,11 @@ export function submissionBlockedReason(input: {
   status: string;
 }): string | null {
   if (!input.found) return "Application not found.";
-  if (input.approvalMode && !input.approvedAt) {
-    return "Approval mode is on. Approve the package before recording a submission.";
-  }
+  // Per-application approval is retired. An eligible package no longer waits
+  // for an approval flag; recording a submission still requires real employer
+  // evidence. `approvalMode`/`approvedAt` remain accepted for old callers.
+  void input.approvalMode;
+  void input.approvedAt;
   if (!input.confirmation) return "Enter the confirmation reference or message shown by the employer portal.";
   if (["submitted", "acknowledged"].includes(input.status)) {
     return "This application is already recorded as submitted or acknowledged.";

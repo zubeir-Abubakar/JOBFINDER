@@ -60,7 +60,7 @@ export default async function ApplicationsPage({
   const counts = {
     total: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications")?.c ?? 0,
     submitted: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('submitted','acknowledged')")?.c ?? 0,
-    awaiting: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'awaiting_approval'")?.c ?? 0,
+    awaiting: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'human_intervention_required'")?.c ?? 0,
     interviews: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('interview_invited','interview_completed','offer_received')")?.c ?? 0,
     rejected: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'rejected'")?.c ?? 0,
   };
@@ -81,10 +81,10 @@ export default async function ApplicationsPage({
         }
       />
 
-      <section className="stats mb-4">
+      <section className="stats mb-4" data-visual-id="approval-queue">
         <Stat label="Total records" value={counts.total} />
         <Stat label="Submitted" value={counts.submitted} tone="good" />
-        <Stat label="Awaiting approval" value={counts.awaiting} tone={counts.awaiting ? "warn" : undefined} />
+        <Stat label="Needs attention" value={counts.awaiting} tone={counts.awaiting ? "warn" : undefined} />
         <Stat label="Interviews" value={counts.interviews} tone={counts.interviews ? "good" : undefined} />
         <Stat label="Rejected" value={counts.rejected} tone={counts.rejected ? "bad" : undefined} />
       </section>
@@ -124,7 +124,7 @@ export default async function ApplicationsPage({
         </form>
       </details>
 
-      <section className="card" id="applications">
+      <section className="card" id="applications" data-visual-id="application-tracker">
         {group ? (
           <div className="card-head">
             <div>
@@ -139,7 +139,7 @@ export default async function ApplicationsPage({
         <div className="table-wrap">
           {rows.length === 0 ? (
             <Empty title="No applications yet">
-              Generate a package for a shortlisted vacancy. Approval mode is on by default, so nothing is submitted without you.
+              Generate a package for a shortlisted vacancy. Eligible applications are submitted automatically after every check passes; only legitimate blockers wait for you.
             </Empty>
           ) : (
             <table className="data application-table">

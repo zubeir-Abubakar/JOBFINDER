@@ -12,14 +12,16 @@ import { dailySubmissionUsage, getRecruitmentPolicy } from "@/lib/recruitment-po
 import { recruitmentSchedulerStatus } from "@/lib/recruitment-ticker";
 import { sourceHealth, type SourceMetrics } from "@/lib/recruitment-discovery";
 import { agentIdentity } from "@/lib/agent-identity";
+import { handoffQueue } from "@/lib/handoff";
 import {
-  activateStandingAuthorisationAction,
   pauseStandingAuthorisationAction,
+  resumeStandingAuthorisationAction,
   runRecruitmentDiscoveryNowAction,
   runRecruitmentNowAction,
   saveRecruitmentPolicyAction,
   toggleRecruitmentScheduleAction,
 } from "@/lib/actions/recruitment";
+import { executiveBriefScheduleSnapshot } from "@/lib/executive-brief";
 
 export const dynamic = "force-dynamic";
 
@@ -34,12 +36,14 @@ export default async function RecruitmentPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  await requireUser();
+  const user = await requireUser();
   const sp = await searchParams;
+  const handoffs = handoffQueue(user.id, 20);
   const runs = recentRuns(12);
   const latest = runs[0] ?? null;
   const latestManifest = latest ? buildExecutionManifest(latest.id) : null;
   const schedule = scheduleSnapshot();
+  const reportSchedule = executiveBriefScheduleSnapshot();
   const policy = getRecruitmentPolicy();
   const usage = dailySubmissionUsage();
   const scheduler = recruitmentSchedulerStatus();
@@ -133,7 +137,7 @@ export default async function RecruitmentPage({
       <Flash ok={param(sp.ok)} error={param(sp.error)} />
       <PageHead
         title="Autonomous Recruitment"
-        sub={`${agentIdentity("coordinator").name} runs the team every day at ${schedule.time} ${schedule.timezone}. Qualifying applications (${qualifyingThreshold()}% or higher) are ${policy.active ? "prepared and automatically submitted" : "prepared but not submitted until the standing authorisation is active"}.`}
+        sub={`${agentIdentity("coordinator").name} runs the team on ${schedule.weekdayLabels.join(", ")} at ${schedule.time} ${schedule.timezone}. Qualifying applications (${qualifyingThreshold()}% or higher) are ${policy.active ? "prepared and automatically submitted without per-application approval" : "prepared but not submitted while automatic submission is paused"}.`}
         actions={
           <>
             <form action={runRecruitmentDiscoveryNowAction}>
@@ -163,11 +167,11 @@ export default async function RecruitmentPage({
       <section className="card mb-4" id="standing-authorisation">
         <div className="card-head">
           <div>
-            <h2>Standing authorisation</h2>
-            <p className="card-sub">You authorise straightforward, qualifying applications once, here. The team interrupts you only for an unknown essential answer, a consequential declaration, a security challenge or an unsupported workflow.</p>
+            <h2>Automatic submission</h2>
+            <p className="card-sub">Eligible applications are submitted automatically. There is no per-application approval. The team interrupts you only for an unknown essential answer, a consequential declaration, a security challenge or an unsupported workflow.</p>
           </div>
           <span className={`badge ${policy.active ? "badge-good" : "badge-warn"}`}>
-            {policy.active ? "Active" : policy.autonomousSubmission ? "Not activated" : "Disabled"}
+            {policy.active ? "Active" : "Paused"}
           </span>
         </div>
         <div className="card-body">
@@ -195,7 +199,7 @@ export default async function RecruitmentPage({
               {policy.active ? (
                 <>
                   <div className="alert alert-info">
-                    Automatic submission is active since {formatInZone(policy.activatedAt)}. Only applications that pass every check and carry employer confirmation are counted as submitted.
+                    Automatic submission is active. Only applications that pass every eligibility, document, duplicate and safety check are sent; only employer-confirmed submissions are counted.
                   </div>
                   <form action={pauseStandingAuthorisationAction}>
                     <SubmitButton className="btn" pendingLabel="Pausing…">Pause automatic submission</SubmitButton>
@@ -204,17 +208,14 @@ export default async function RecruitmentPage({
               ) : (
                 <>
                   <div className="alert alert-warn">
-                    Simulation mode. Packages can be prepared and reviewed, but nothing is sent until you activate the standing authorisation. This default is intentional.
+                    Automatic submission is paused. Packages can still be prepared and reviewed, but nothing is sent until you resume the owner-level switch.
                   </div>
-                  <form action={activateStandingAuthorisationAction} className="stack" style={{ gap: 8 }}>
-                    <label className="flex items-start gap-2 text-[12px]">
-                      <input type="checkbox" name="confirm" /> I authorise automatic submission of straightforward applications that meet every rule above.
-                    </label>
-                    <div><SubmitButton className="btn btn-primary" pendingLabel="Activating…">Activate standing authorisation</SubmitButton></div>
+                  <form action={resumeStandingAuthorisationAction}>
+                    <SubmitButton className="btn btn-primary" pendingLabel="Resuming…">Resume automatic submission</SubmitButton>
                   </form>
                 </>
               )}
-              <p className="hint">Real applications are sent only after activation. CAPTCHAs, MFA, logins, payments and unsupported legal declarations always stop the workflow.</p>
+              <p className="hint">CAPTCHAs, MFA, logins, payments, unsupported portals and consequential legal declarations always stop the workflow and create a handoff. Unknown essential answers are queued for you.</p>
             </div>
           </div>
         </div>
@@ -224,13 +225,16 @@ export default async function RecruitmentPage({
         <section className="card">
           <div className="card-head">
             <div>
-              <h2>Daily schedule</h2>
-              <p className="card-sub">Persisted in the database, so a restart cannot forget it.</p>
+              <h2>Weekly schedule</h2>
+              <p className="card-sub">Persisted in the database, so a restart cannot forget it. Change the two schedules in Settings.</p>
             </div>
             <span className={`badge ${schedulerHealth === "Running" ? "badge-good" : schedulerHealth === "Missed" ? "badge-bad" : schedulerHealth === "Paused" ? "badge-neutral" : "badge-warn"}`}>{schedulerHealth}</span>
           </div>
           <div className="card-body stack text-[12.5px]" style={{ gap: 8 }}>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Time</span><span className="num">{schedule.time} · {schedule.timezone}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Days</span><span>{schedule.weekdayLabels.join(", ")}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Recruitment time</span><span className="num">{schedule.time} · {schedule.timezone}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Daily report</span><span className="num">{reportSchedule.weekdaysList.map((day) => ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day]).join(", ")} · {reportSchedule.time}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Next report</span><span>{formatInZone(reportSchedule.next_run_at, reportSchedule.timezone)}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Next execution</span><span>{formatInZone(schedule.nextRunAt)}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Last execution</span><span>{formatInZone(schedule.lastRunAt)}{schedule.lastStatus ? ` · ${schedule.lastStatus.replace(/_/g, " ")}` : ""}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Scheduler process</span><span>{schedulerLive ? "Ticker running" : "Ticker not detected"}{schedule.lastCheckedAt ? ` · checked ${formatInZone(schedule.lastCheckedAt)}` : ""}</span></div>
@@ -238,7 +242,7 @@ export default async function RecruitmentPage({
             <div className="between"><span style={{ color: "var(--muted)" }}>Minimum match</span><span>{qualifyingThreshold()}% (cannot be lowered automatically)</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Applications per day</span><span>{policy.maxSubmissionsPerDay} · {usage.remaining} remaining today</span></div>
             <p className="hint">
-              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at {schedule.time} {schedule.timezone} for the run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped.
+              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at {schedule.time} {schedule.timezone} for the run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
             </p>
           </div>
         </section>
@@ -376,6 +380,50 @@ export default async function RecruitmentPage({
                 ))}
               </tbody>
             </table>
+          )}
+        </div>
+      </section>
+
+      <section className="card mb-4" id="handoffs" data-visual-id="approval-queue">
+        <div className="card-head">
+          <div>
+            <h2>Human intervention queue</h2>
+            <p className="card-sub">
+              Persistent handoff packages for applications that stopped at a legitimate human step. The package includes the direct employer link, the original posting, the final CV and cover letter, prepared answers and the remaining steps. An eligible application does not enter this queue for approval.
+            </p>
+          </div>
+          <span className={`badge ${handoffs.length ? "badge-warn" : "badge-good"}`}>{handoffs.length} item(s)</span>
+        </div>
+        <div className="card-body stack" style={{ gap: 10 }}>
+          {handoffs.length === 0 ? (
+            <p className="text-[12px]" style={{ color: "var(--muted)" }}>Nothing is waiting for a human step. Eligible applications are submitted automatically.</p>
+          ) : (
+            handoffs.map((item) => (
+              <div key={item.applicationId} className="card-quiet p-3 stack" style={{ gap: 8 }}>
+                <div className="between flex-wrap gap-2">
+                  <div>
+                    <div className="text-[13px] font-semibold">{item.jobTitle} — {item.employer}</div>
+                    <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                      Match {item.matchScore ?? "—"}% · {item.queueStatusLabel} · blocker: {item.blocker.kind.replace(/_/g, " ")}
+                    </div>
+                  </div>
+                  <div className="row">
+                    <Link href={`/applications/${item.applicationId}`} className="btn btn-sm">Open package</Link>
+                    {item.applicationUrl ? <a href={item.applicationUrl} target="_blank" rel="noreferrer" className="btn btn-sm btn-primary">Employer page</a> : null}
+                    {item.postingUrl && item.postingUrl !== item.applicationUrl ? <a href={item.postingUrl} target="_blank" rel="noreferrer" className="btn btn-sm">Original posting</a> : null}
+                  </div>
+                </div>
+                <div className="text-[11.5px]" style={{ color: "var(--muted)" }}>{item.stopExplanation}</div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {item.cv ? <Link href={item.cv.previewHref} className="badge badge-info">CV: {item.cv.name}</Link> : <span className="badge badge-warn">CV missing</span>}
+                  {item.coverLetter ? <Link href={item.coverLetter.previewHref} className="badge badge-info">Cover letter: {item.coverLetter.name}</Link> : <span className="badge badge-warn">Cover letter missing</span>}
+                  {item.preparedAnswers.length ? <span className="badge badge-neutral">{item.preparedAnswers.length} prepared answer(s)</span> : null}
+                </div>
+                <ol className="text-[11.5px] pl-4" style={{ color: "var(--muted)", listStyle: "decimal" }}>
+                  {item.remainingSteps.map((step) => <li key={step}>{step}</li>)}
+                </ol>
+              </div>
+            ))
           )}
         </div>
       </section>

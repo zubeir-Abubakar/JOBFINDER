@@ -765,7 +765,9 @@ export async function generateApplicationPackage(
   details.push(`Cover letter v${version}: PDF + DOCX, document quality ${coverQuality.status} (${coverQuality.score}/100)`);
   details.push(`Package quality: ${combinedQuality.status} (${combinedQuality.score}/100)`);
 
-  const approval = getSetting<boolean>("approval_mode", true);
+  // Per-application approval is retired. A package that passed both quality
+  // gates goes straight to the independent readiness check; it never waits for
+  // the owner to click "approve" on an otherwise eligible application.
   const bothQualityPassed = cvQuality.status === "passed" && coverQuality.status === "passed";
   const qualityReviewState = bothQualityPassed ? "documents_ready" : "quality_review_required";
   const qualityReasons = [
@@ -783,11 +785,7 @@ export async function generateApplicationPackage(
     checkedAt: nowIso(),
     engine: "document-quality-v2",
   };
-  const nextStatus = bothQualityPassed
-    ? approval
-      ? "awaiting_approval"
-      : "quality_check"
-    : "quality_review_required";
+  const nextStatus = bothQualityPassed ? "quality_check" : "quality_review_required";
   const existingApp = one<{ id: string; status: string }>("SELECT id, status FROM applications WHERE job_id = ?", [job.id]);
   let applicationId: string;
   if (existingApp) {
@@ -815,13 +813,13 @@ export async function generateApplicationPackage(
     );
   }
   run("UPDATE jobs SET status = CASE WHEN status = 'rejected' THEN status ELSE 'documents' END WHERE id = ?", [job.id]);
-  run("UPDATE documents SET status = ? WHERE job_id = ? AND version = ?", [bothQualityPassed ? (approval ? "awaiting_approval" : "ready") : "quality_review_required", job.id, version]);
+  run("UPDATE documents SET status = ? WHERE job_id = ? AND version = ?", [bothQualityPassed ? "ready" : "quality_review_required", job.id, version]);
 
   notify({
     userId,
     kind: "documents_ready",
     subject: `${bothQualityPassed ? "Documents ready" : "Documents need review"}: ${job.title} at ${job.company}`,
-    body: `CV ATS compatibility ${cvAts.score}/100. Cover letter quality ${coverQuality.status} (${coverQuality.score}/100). ${bothQualityPassed ? (approval ? "Awaiting your approval before submission." : "Quality checks passed; full readiness is evaluated before submission.") : "The cover-letter quality gate requires review before this package can become ready."}`,
+    body: `CV ATS compatibility ${cvAts.score}/100. Cover letter quality ${coverQuality.status} (${coverQuality.score}/100). ${bothQualityPassed ? "Quality checks passed; full readiness is evaluated before automatic submission. No per-application approval is required." : "The cover-letter quality gate requires review before this package can become ready."}`,
     email: false,
   });
   if (!options.workflowId) finishWorkflow(workflowId, bothQualityPassed ? "completed" : "paused", `Package prepared (${flagLabel(analysis.flag)})`);

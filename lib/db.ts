@@ -393,11 +393,13 @@ CREATE TABLE IF NOT EXISTS schedule_jobs (
   time TEXT NOT NULL,
   timezone TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  weekdays TEXT,
   next_run_at TEXT,
   last_run_at TEXT,
   last_run_id TEXT,
   last_status TEXT,
   last_error TEXT,
+  last_scheduled_for TEXT,
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runtime_locks (
@@ -644,18 +646,18 @@ export function v(value: unknown): string | number | null {
 const DEFAULT_SETTINGS: Record<string, unknown> = {
   retention_days: 30,
   auto_delete_expired: true,
-  // Safe operating defaults. Approval is required, autonomous submission is
-  // off, and every recruitment run is a dry run until the owner explicitly
-  // changes the policy. Unknown or unsafe answers still queue for a human, and
-  // no submission is ever recorded without employer evidence.
-  approval_mode: true,
-  autonomous_submission: false,
+  // Operating defaults. Eligible applications are submitted autonomously.
+  // There is no per-application approval gate; a fresh installation submits
+  // only applications that pass every eligibility, document, duplicate and
+  // safety check. Consequential declarations, CAPTCHAs, MFA and unsupported
+  // portals still stop the workflow for a human. The owner can pause automatic
+  // submission at any time.
+  approval_mode: false,
+  autonomous_submission: true,
   min_match_score: 85,
   max_applications_per_day: 5,
-  recruitment_dry_run: true,
+  recruitment_dry_run: false,
   recruitment_submission_enabled: true,
-  // Phase 2.6: automatic submission defaults on, but a fresh installation is
-  // not activated until the owner explicitly activates the standing policy.
   standing_authorisation_activated_at: null as string | null,
   authorised_answers: {} as Record<string, string>,
   ashby_job_boards: [] as string[],
@@ -767,7 +769,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 22;
+export const SCHEMA_VERSION = 23;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -893,6 +895,8 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "discovery_source_status", "last_attempts", "last_attempts INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "discovery_source_status", "last_duration_ms", "last_duration_ms INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "schedule_jobs", "last_checked_at", "last_checked_at TEXT");
+  ensureColumn(db, "schedule_jobs", "weekdays", "weekdays TEXT");
+  ensureColumn(db, "schedule_jobs", "last_scheduled_for", "last_scheduled_for TEXT");
   // Execution provenance per assigned agent. A step that only recorded a task is
   // distinguishable from one that actually called a model, and the serving
   // provider/model is stored beside it. Historical rows stay NULL (unknown).
@@ -1041,6 +1045,9 @@ function migrate(db: DatabaseSync) {
   migrateAdminIdentity(db);
   migrateAutonomyDefaults(db);
   migrateStandingAuthorisationDefaults(db);
+  migrateAutonomousSubmissionPolicy(db);
+  migrateLegacyApprovalQueue(db);
+  migrateWeeklyScheduleDefaults(db);
   enforceThresholdFloor(db);
 
   // Normalise legacy statuses written by earlier builds.
@@ -1289,6 +1296,80 @@ function migrateStandingAuthorisationDefaults(db: DatabaseSync) {
   if (read("authorised_answers") === undefined) write("authorised_answers", {});
   db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autonomy_defaults_v3', ?, ?)").run(
     JSON.stringify({ applied_at: nowIso(), version: 3, activated: false }),
+    nowIso(),
+  );
+}
+
+/**
+ * One-time move from per-application approval to automatic submission. This is
+ * the policy the owner asked for. The marker ensures a later deliberate pause
+ * (autonomous_submission=false) is preserved on subsequent starts; it is not
+ * re-enabled by every migration.
+ */
+function migrateAutonomousSubmissionPolicy(db: DatabaseSync) {
+  const marker = db.prepare("SELECT value FROM settings WHERE key = 'autonomy_defaults_v4'").get();
+  if (marker) return;
+  const write = (key: string, value: unknown) => {
+    const exists = db.prepare("SELECT 1 FROM settings WHERE key = ?").get(key);
+    if (exists) db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?").run(JSON.stringify(value), nowIso(), key);
+    else db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)").run(key, JSON.stringify(value), nowIso());
+  };
+  write("approval_mode", false);
+  write("autonomous_submission", true);
+  write("recruitment_dry_run", false);
+  const activated = db.prepare("SELECT value FROM settings WHERE key = 'standing_authorisation_activated_at'").get() as { value?: string } | undefined;
+  if (!activated?.value || activated.value === "null") write("standing_authorisation_activated_at", nowIso());
+  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('autonomy_defaults_v4', ?, ?)").run(
+    JSON.stringify({ applied_at: nowIso(), version: 4, perApplicationApproval: false }),
+    nowIso(),
+  );
+}
+
+/**
+ * Retire the old per-application approval queue. A legacy awaiting_approval
+ * package that already passed its readiness checklist is released to the
+ * automatic queue; one without that evidence goes back to the quality check.
+ * No application is marked submitted and no employer is contacted.
+ */
+function migrateLegacyApprovalQueue(db: DatabaseSync) {
+  const marker = db.prepare("SELECT value FROM settings WHERE key = 'approval_queue_retired_v1'").get();
+  if (marker) return;
+  db.exec(`
+    UPDATE applications
+    SET status = 'ready_to_submit', approved_at = NULL, last_update = '${nowIso()}'
+    WHERE status = 'awaiting_approval'
+      AND readiness LIKE '%"state":"ready_for_submission"%'
+  `);
+  db.exec(`
+    UPDATE applications
+    SET status = 'quality_check', approved_at = NULL, last_update = '${nowIso()}'
+    WHERE status = 'awaiting_approval'
+  `);
+  db.exec("UPDATE documents SET status = 'ready' WHERE status = 'awaiting_approval'");
+  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('approval_queue_retired_v1', ?, ?)").run(
+    JSON.stringify({ applied_at: nowIso(), version: 1, perApplicationApproval: false }),
+    nowIso(),
+  );
+}
+
+/**
+ * Initial weekly schedule: Monday–Friday, recruitment 09:00 and the daily
+ * report 16:00 in Europe/Zurich. Existing custom times or weekday sets are
+ * preserved; only the legacy defaults (10:00 recruitment / 17:00 report and no
+ * weekday list) are upgraded once.
+ */
+function migrateWeeklyScheduleDefaults(db: DatabaseSync) {
+  const marker = db.prepare("SELECT value FROM settings WHERE key = 'schedule_defaults_v1'").get();
+  if (marker) return;
+  const update = db.prepare(
+    "UPDATE schedule_jobs SET time = ?, timezone = ?, weekdays = ?, updated_at = ? WHERE key = ? AND (weekdays IS NULL OR weekdays = '')",
+  );
+  update.run("09:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5]), nowIso(), "daily_recruitment");
+  update.run("16:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5]), nowIso(), "daily_executive_brief");
+  // Legacy rows may already have a weekday value after this build; fix only the
+  // known old clock defaults when the row still has no explicit weekday list.
+  db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('schedule_defaults_v1', ?, ?)").run(
+    JSON.stringify({ applied_at: nowIso(), version: 1, recruitmentTime: "09:00", reportTime: "16:00" }),
     nowIso(),
   );
 }

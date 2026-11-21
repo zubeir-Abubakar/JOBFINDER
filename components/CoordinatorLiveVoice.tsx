@@ -10,6 +10,9 @@ import { VoiceAssistant } from "./VoiceAssistant";
 import { agentIdentity } from "@/lib/agent-identity";
 import { voiceProfileForAgent, type LiveVoiceId } from "@/lib/agent-voices";
 import { isIntentionalBargeIn, mergeTranscript, reconnectDelay } from "@/lib/voice-stream";
+import { dispatchVisualCommand, exitVisualMode, startVisualWalkthrough, useVisualSession } from "@/lib/visual-session";
+import { visualViewForPath, type VisualCommand } from "@/lib/visual-types";
+import { ProviderStatusPill } from "./visual/ProviderStatusPill";
 
 const CosmicOrb = dynamic(() => import("./CosmicOrb"), {
   ssr: false,
@@ -136,6 +139,10 @@ export function CoordinatorLiveVoice({
   const reportedUsage = useRef({ prompt: 0, response: 0, total: 0 });
   const [legacyOpen, setLegacyOpen] = useState(false);
   const [compactOrb, setCompactOrb] = useState(false);
+  // Visual walkthroughs collapse the large panel into a small dock without
+  // touching the WebSocket, microphone or agent context.
+  const [compact, setCompact] = useState(false);
+  const visual = useVisualSession();
 
   const wsRef = useRef<WebSocket | null>(null);
   const wsGeneration = useRef(0);
@@ -198,6 +205,10 @@ export function CoordinatorLiveVoice({
   useEffect(() => {
     activeAgentRef.current = activeAgent;
   }, [activeAgent]);
+
+  useEffect(() => {
+    if (!visual.active) setCompact(false);
+  }, [visual.active]);
 
   // The text conversation may have selected a specialist while the shell was
   // already mounted. Adopt that persisted session before the next voice start,
@@ -612,7 +623,15 @@ export function CoordinatorLiveVoice({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             name: call.name,
-            args: call.args ?? {},
+            args: {
+              ...(call.args ?? {}),
+              // The server cannot see the browser route. Supply the approved
+              // current view so "this page" is grounded in the real page, not a
+              // model guess. It is ignored by non-visual tools.
+              ...(visualViewForPath(window.location.pathname)
+                ? { current_view: visualViewForPath(window.location.pathname) }
+                : {}),
+            },
             agentKey: activeAgentRef.current,
             sessionId: sessionIdRef.current,
           }),
@@ -620,6 +639,7 @@ export function CoordinatorLiveVoice({
         const payload = (await response.json().catch(() => ({}))) as {
           response?: Record<string, unknown>;
           handoff?: { agentKey?: AgentKey };
+          visual?: VisualCommand;
           error?: string;
         };
         responses.push({
@@ -627,6 +647,12 @@ export function CoordinatorLiveVoice({
           name: call.name,
           response: payload.response ?? { ok: false, error: payload.error ?? "The workspace tool failed." },
         });
+        if (payload.visual) {
+          // Keep the live session; only the presentation collapses.
+          dispatchVisualCommand(payload.visual);
+          setCompact(true);
+          setOpen(true);
+        }
         const ids = payload.response?.taskIds;
         if (Array.isArray(ids)) {
           turnTaskIds.current = ids.filter((id): id is string => typeof id === "string").slice(0, 12);
@@ -1092,6 +1118,8 @@ export function CoordinatorLiveVoice({
   }
 
   function endSession() {
+    // Screen capture stops when the voice session ends; no hidden capture remains.
+    exitVisualMode();
     intentionalClose.current = true;
     clearStableConnectionTimer();
     clearInterruptRecovery();
@@ -1251,7 +1279,56 @@ export function CoordinatorLiveVoice({
         <span className="voice-trigger-dot" data-live={live} />
       </button>
 
-      {open && typeof document !== "undefined" ? createPortal(
+      {open && compact && live && typeof document !== "undefined" ? createPortal(
+        <section
+          className="vc-float"
+          aria-label={`${activeIdentity.name} visual companion`}
+          data-testid="voice-companion-float"
+          data-agent-key={activeAgent}
+          data-live-state={state}
+        >
+          <div className="vc-float-head">
+            <span className="vc-float-orb" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+                <rect x="9" y="3" width="6" height="10" rx="3" />
+                <path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" />
+              </svg>
+            </span>
+            <div className="vc-float-id">
+              <strong>{activeIdentity.name}</strong>
+              <span>{activeIdentity.title}</span>
+            </div>
+            <span className={`badge ${badgeTone}`}>{status.label}</span>
+          </div>
+          <div className="vc-float-status">
+            <span className={`lv-presence ${connected ? "online" : ""}`}><i /> {connected ? "Connected" : "Connecting"}</span>
+            <span className={`lv-mic ${muted ? "is-muted" : micActive ? "is-live" : ""}`}><i /> {muted ? "Mic muted" : micActive ? "Mic live" : "Mic paused"}</span>
+            <ProviderStatusPill compact />
+          </div>
+          {visual.active ? (
+            <p className="vc-share-note">
+              Guiding: {visual.label}.{" "}
+              <button type="button" className="lv-text-link" onClick={() => exitVisualMode()}>
+                Stop walkthrough
+              </button>
+            </p>
+          ) : null}
+          <div className="vc-float-actions">
+            <button type="button" className="btn btn-sm" onClick={toggleMute} disabled={state === "connecting"}>
+              {muted ? "Unmute" : "Mute"}
+            </button>
+            <button type="button" className="btn btn-sm" onClick={() => setCompact(false)} data-testid="voice-companion-expand">
+              Expand
+            </button>
+            <button type="button" className="btn btn-sm btn-danger" onClick={closePanel} data-testid="voice-companion-end">
+              Disconnect
+            </button>
+          </div>
+        </section>,
+        document.body,
+      ) : null}
+
+      {open && !(compact && live) && typeof document !== "undefined" ? createPortal(
         <div className="lv-backdrop" role="presentation" onPointerDown={(event) => { if (event.target === event.currentTarget) closePanel(); }}>
           <section
             className="lv-panel"
@@ -1366,7 +1443,19 @@ export function CoordinatorLiveVoice({
               </div>
               <div className="lv-options">
                 <span className="lv-usage">Voice {activeProfile.voiceName} · assigned to {activeIdentity.name}</span>
+                <ProviderStatusPill compact />
                 {usage ? <span className="lv-usage">{usage.total.toLocaleString("en-GB")} session tokens</span> : null}
+                <button
+                  type="button"
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => {
+                    startVisualWalkthrough("Workspace walkthrough");
+                    setCompact(true);
+                  }}
+                  data-testid="visual-start"
+                >
+                  Visual companion
+                </button>
                 <Link href="/assistant" className="lv-text-link">Text chat</Link>
               </div>
               <p className="lv-privacy">

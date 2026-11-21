@@ -17,10 +17,15 @@ import {
   saveAutomationAction,
   saveDocumentSettingsAction,
   saveNotificationSettingsAction,
+  saveRecruitmentScheduleAction,
+  saveReportScheduleAction,
   clearExpiredDocumentsAction,
   cleanTempCacheAction,
   testEmailAction,
 } from "@/lib/actions/settings";
+import { scheduleSnapshot, halfHourOptions, formatInZone, weekdayLabel } from "@/lib/recruitment-schedule";
+import { executiveBriefScheduleSnapshot } from "@/lib/executive-brief";
+import { Icon } from "@/components/icons";
 import { tempStorageStats } from "@/lib/temp-store";
 import { effectiveMinMatchScore } from "@/lib/scoring";
 import { relativeTime } from "@/lib/format";
@@ -51,6 +56,10 @@ export default async function SettingsPage({
   const mfa = one<{ mfa_enabled: number }>("SELECT mfa_enabled FROM users WHERE id = ?", [user.id]);
   const sessions = countSessions(user.id);
   const avatarUrl = avatarUrlFor(user);
+  const recruitmentSchedule = scheduleSnapshot();
+  const reportSchedule = executiveBriefScheduleSnapshot();
+  const timeOptions = halfHourOptions();
+  const weekdayOptions = [1, 2, 3, 4, 5, 6, 7];
 
   return (
     <>
@@ -74,6 +83,7 @@ export default async function SettingsPage({
 
       <div className="tabs">
         <a className="tab active" href="#professional">Professional</a>
+        <a className="tab" href="#scheduling">Scheduling</a>
         <a className="tab" href="#automation">Automation</a>
         <a className="tab" href="#documents">Documents</a>
         <a className="tab" href="#cache">Cache</a>
@@ -177,17 +187,14 @@ export default async function SettingsPage({
       <section className="card mb-4" id="automation">
         <div className="card-head">
           <div>
-            <h2>Automation & approval</h2>
-            <p className="card-sub">Standing authorisation is managed on the Recruitment page. The policy defaults to automatic submission, but real submissions stay off until you explicitly activate it there.</p>
+            <h2>Automation &amp; submission</h2>
+            <p className="card-sub">Eligible applications are submitted automatically after every eligibility, document, duplicate and safety check passes. There is no per-application approval step; consequential declarations, CAPTCHAs, MFA and unsupported portals still stop the workflow for you.</p>
           </div>
         </div>
         <div className="card-body">
           <form action={saveAutomationAction} className="grid g2" style={{ gap: 12 }}>
             <label className="flex items-center gap-2 text-[12.5px]">
-              <input type="checkbox" name="approval_mode" defaultChecked={settings.approval_mode === true} /> Require my approval before each submission
-            </label>
-            <label className="flex items-center gap-2 text-[12.5px]">
-              <input type="checkbox" name="autonomous_submission" defaultChecked={settings.autonomous_submission === true} /> Allow autonomous submission when every condition passes
+              <input type="checkbox" name="autonomous_submission" defaultChecked={settings.autonomous_submission !== false} /> Submit eligible applications automatically (no per-application approval)
             </label>
             <div>
               <label className="label" htmlFor="min_match_score">Minimum match score to prepare documents</label>
@@ -217,6 +224,113 @@ export default async function SettingsPage({
             </div>
             <div className="flex items-end">
               <SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save automation</SubmitButton>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section id="scheduling" className="mb-4">
+        <div className="between mb-3 schedule-head">
+          <div>
+            <h2 className="text-[15px] font-semibold">Automation schedule</h2>
+            <p className="card-sub">Two independent weekly schedules. Times are local to Europe/Zurich and survive restarts and daylight-saving changes.</p>
+          </div>
+          <span className="badge badge-neutral"><Icon name="clock" size={12} /> Europe/Zurich</span>
+        </div>
+        <div className="schedule-grid">
+          <form action={saveRecruitmentScheduleAction} className="card schedule-card" data-testid="recruitment-schedule-card">
+            <div className="card-head">
+              <div className="flex items-center gap-2.5">
+                <span className="schedule-icon"><Icon name="jobs" size={17} /></span>
+                <div>
+                  <h3 className="text-[13.5px] font-semibold">Recruitment runs</h3>
+                  <p className="card-sub">Choose when your agents should discover, assess, prepare and submit job applications.</p>
+                </div>
+              </div>
+              <span className={`badge ${recruitmentSchedule.enabled ? (recruitmentSchedule.runsToday ? "badge-good" : "badge-neutral") : "badge-warn"}`}>
+                {recruitmentSchedule.enabled ? (recruitmentSchedule.runsToday ? "Active today" : "Rest day today") : "Disabled"}
+              </span>
+            </div>
+            <div className="card-body stack" style={{ gap: 12 }}>
+              <label className="schedule-toggle">
+                <input type="checkbox" name="enabled" defaultChecked={recruitmentSchedule.enabled} />
+                <span>Enable scheduled recruitment</span>
+              </label>
+              <div>
+                <span className="label">Days</span>
+                <div className="weekday-picker" role="group" aria-label="Recruitment weekdays">
+                  {weekdayOptions.map((day) => (
+                    <label key={`recruitment-${day}`} className={`weekday-chip ${recruitmentSchedule.weekdays.includes(day) ? "is-on" : ""}`}>
+                      <input type="checkbox" name="weekdays" value={day} defaultChecked={recruitmentSchedule.weekdays.includes(day)} />
+                      <span>{weekdayLabel(day).slice(0, 3)}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="schedule-time-row">
+                <div>
+                  <label className="label" htmlFor="recruitment-time">Start time</label>
+                  <select id="recruitment-time" name="time" className="select" defaultValue={recruitmentSchedule.time}>
+                    {timeOptions.map((option) => <option key={`recruitment-time-${option}`} value={option}>{option}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <span className="label">Timezone</span>
+                  <span className="schedule-timezone">Europe/Zurich<input type="hidden" name="timezone" value="Europe/Zurich" /></span>
+                </div>
+              </div>
+              <p className="hint" data-testid="recruitment-next-run">
+                Next run: {formatInZone(recruitmentSchedule.nextRunAt, recruitmentSchedule.timezone)}. On unselected days no scheduled discovery, document generation or inference runs; manual requests still work.
+              </p>
+              <div><SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save recruitment schedule</SubmitButton></div>
+            </div>
+          </form>
+
+          <form action={saveReportScheduleAction} className="card schedule-card" data-testid="report-schedule-card">
+            <div className="card-head">
+              <div className="flex items-center gap-2.5">
+                <span className="schedule-icon"><Icon name="mail" size={17} /></span>
+                <div>
+                  <h3 className="text-[13.5px] font-semibold">Daily report</h3>
+                  <p className="card-sub">Choose when Chief should send your daily recruitment and agent activity report.</p>
+                </div>
+              </div>
+              <span className={`badge ${reportSchedule.enabled ? (reportSchedule.scheduledToday ? "badge-good" : "badge-neutral") : "badge-warn"}`}>
+                {reportSchedule.enabled ? (reportSchedule.scheduledToday ? "Due today" : "Not today") : "Disabled"}
+              </span>
+            </div>
+            <div className="card-body stack" style={{ gap: 12 }}>
+              <label className="schedule-toggle">
+                <input type="checkbox" name="enabled" defaultChecked={reportSchedule.enabled === 1} />
+                <span>Enable the daily report</span>
+              </label>
+              <div>
+                <span className="label">Days</span>
+                <div className="weekday-picker" role="group" aria-label="Daily report weekdays">
+                  {weekdayOptions.map((day) => (
+                    <label key={`report-${day}`} className={`weekday-chip ${reportSchedule.weekdaysList.includes(day) ? "is-on" : ""}`}>
+                      <input type="checkbox" name="weekdays" value={day} defaultChecked={reportSchedule.weekdaysList.includes(day)} />
+                      <span>{weekdayLabel(day).slice(0, 3)}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="schedule-time-row">
+                <div>
+                  <label className="label" htmlFor="report-time">Delivery time</label>
+                  <select id="report-time" name="time" className="select" defaultValue={reportSchedule.time}>
+                    {timeOptions.map((option) => <option key={`report-time-${option}`} value={option}>{option}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <span className="label">Timezone</span>
+                  <span className="schedule-timezone">Europe/Zurich<input type="hidden" name="timezone" value="Europe/Zurich" /></span>
+                </div>
+              </div>
+              <p className="hint" data-testid="report-next-run">
+                Next report: {formatInZone(reportSchedule.next_run_at, reportSchedule.timezone)}. The report uses recorded activity only and is never sent twice for the same occurrence.
+              </p>
+              <div><SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save report schedule</SubmitButton></div>
             </div>
           </form>
         </div>

@@ -4,6 +4,7 @@ import { activeRun, createRecruitmentRun, executeRun, recoverInterruptedRecruitm
 import { acquireRuntimeLock, heartbeatRuntimeWorker, releaseRuntimeLock, startRuntimeWorker, stopRuntimeWorker } from "./runtime-state";
 import {
   RECRUITMENT_SCHEDULE_KEY,
+  occurrenceAlreadyExecuted,
   recordScheduleRun,
   scheduleSnapshot,
   catchUpWindowHours,
@@ -18,10 +19,12 @@ import { tickExecutiveBriefSchedule } from "./executive-brief";
  * Schedule tick. Called by the process timer and by the cron-compatible API
  * route, so the same rules apply locally and in a future hosted deployment.
  *
- * - one run per local calendar day (unique run key),
+ * - the persisted weekday set decides whether today is an active day,
+ * - one scheduled run per local calendar day (unique run key),
  * - catch-up inside the configured window,
  * - an explicit "missed" record once that window has passed, never a silent skip,
- * - never two runs at once.
+ * - never two runs at once,
+ * - a rest day performs no discovery, no model call and no token spend.
  */
 
 type TickGlobal = typeof globalThis & { __atwRecruitmentTimer?: ReturnType<typeof setInterval> };
@@ -46,11 +49,10 @@ export type TickResult = {
 
 export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<TickResult> {
   // Liveness belongs to the process, not to whether this process won the tick
-  // lease. A paused schedule is still a running, healthy scheduler.
+  // lease. A paused or resting schedule is still a running, healthy scheduler.
   heartbeatRuntimeWorker("recruitment_scheduler");
-  // The consolidated executive brief is a separate durable schedule row. It is
-  // ticked even when the recruitment schedule is paused so a disabled pipeline
-  // cannot hide a missing daily report.
+  // The daily report is a separate durable schedule row. It is ticked even when
+  // recruitment rests, so a rest day cannot hide a due report.
   let executiveBrief: Awaited<ReturnType<typeof tickExecutiveBriefSchedule>> | undefined;
   try {
     executiveBrief = await tickExecutiveBriefSchedule(now);
@@ -63,7 +65,18 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
   }
   const initial = scheduleSnapshot(now);
   if (!initial.enabled) {
-    return { checkedAt: now.toISOString(), enabled: false, started: false, reason: "The daily schedule is disabled.", executiveBrief };
+    return { checkedAt: now.toISOString(), enabled: false, started: false, reason: "The recruitment schedule is disabled.", executiveBrief };
+  }
+  if (!initial.runsToday) {
+    // Rest day: no recovery, no discovery, no model call, no token spend.
+    return {
+      checkedAt: now.toISOString(),
+      enabled: true,
+      started: false,
+      nextRunAt: initial.nextRunAt,
+      reason: `Today is not a configured recruitment day (${initial.weekdayLabels.join(", ")}). No scheduled recruitment work or inference was started.`,
+      executiveBrief,
+    };
   }
   const lockKey = "recruitment:scheduler";
   if (!acquireRuntimeLock(lockKey, 300_000, undefined, { at: now.toISOString() })) {
@@ -90,13 +103,42 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
         executiveBrief,
       };
     }
-    // Persisted liveness, so the dashboard can distinguish "paused" from "the
-    // process is not running" without relying on in-memory state.
+    // Persisted liveness, so the dashboard can distinguish "resting", "paused"
+    // and "the process is not running" without relying on in-memory state.
     run("UPDATE schedule_jobs SET last_checked_at = ? WHERE key = ?", [now.toISOString(), RECRUITMENT_SCHEDULE_KEY]);
     const snapshot = scheduleSnapshot(now);
     if (!snapshot.due) {
-      return { checkedAt: now.toISOString(), enabled: true, started: false, nextRunAt: snapshot.nextRunAt, executiveBrief };
+      return {
+        checkedAt: now.toISOString(),
+        enabled: true,
+        started: false,
+        nextRunAt: snapshot.nextRunAt,
+        reason: snapshot.runsToday
+          ? "The next scheduled recruitment execution is not due yet."
+          : "Today is a configured rest day.",
+        executiveBrief,
+      };
     }
+
+    // Restart/duplicate protection: if this exact occurrence already executed,
+    // advance the schedule without running it again.
+    if (occurrenceAlreadyExecuted(RECRUITMENT_SCHEDULE_KEY, snapshot.nextRunAt)) {
+      recordScheduleRun({
+        runId: snapshot.lastRunId ?? `duplicate_${randomId().slice(0, 6)}`,
+        status: "duplicate_skipped",
+        error: "This scheduled occurrence already ran; it was not executed twice.",
+        now,
+        scheduledFor: snapshot.nextRunAt,
+      });
+      return {
+        checkedAt: now.toISOString(),
+        enabled: true,
+        started: false,
+        reason: "This scheduled occurrence already ran; it was not executed twice.",
+        executiveBrief,
+      };
+    }
+
     const running = activeRun();
     if (running) {
       return {
@@ -127,7 +169,7 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
           now.toISOString(),
         ],
       );
-      recordScheduleRun({ runId: missedId, status: "failed", error: reason, now });
+      recordScheduleRun({ runId: missedId, status: "failed", error: reason, now, scheduledFor: scheduledAt });
       notify({ kind: "recruitment_missed", subject: "A scheduled recruitment run was missed", body: reason });
       audit({ action: "recruitment.run_missed", entity: "recruitment_run", entityId: missedId, detail: reason });
       return { checkedAt: now.toISOString(), enabled: true, started: false, runId: missedId, reason, executiveBrief };
@@ -164,7 +206,7 @@ export function startRecruitmentScheduler(): void {
   if (process.env.RECRUITMENT_SCHEDULER === "false") return;
   const g = globalThis as TickGlobal;
   if (g.__atwRecruitmentTimer) return;
-  startRuntimeWorker("recruitment_scheduler", "Durable daily recruitment schedule ticker");
+  startRuntimeWorker("recruitment_scheduler", "Durable weekly recruitment schedule ticker");
   const tick = () => {
     lastTickAt = new Date().toISOString();
     void tickRecruitmentSchedule().catch(() => {
