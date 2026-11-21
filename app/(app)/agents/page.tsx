@@ -141,7 +141,7 @@ export default async function AgentsPage({
         Ollama fallback: {ollama?.configured ? (ollama.available ? "ready" : ollama.detail) : "disabled"}. Spending limit CHF 0.
       </div>
 
-      <section className="card mb-4">
+      <section className="card mb-4" data-visual-id="agent-roster">
         <div className="card-head">
           <div>
             <h2>Agent roster</h2>
@@ -265,7 +265,7 @@ export default async function AgentsPage({
       </section>
 
       <div className="split">
-        <section className="card" id="activity">
+        <section className="card" id="activity" data-visual-id="agent-activity">
           <div className="card-head">
             <div>
               <h2>Task activity</h2>

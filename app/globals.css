@@ -2148,3 +2148,146 @@ table.data tbody tr:last-child td { border-bottom: 1px solid var(--line); }
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* --- Visual Companion Mode -------------------------------------------------
+   Persistent walkthrough banner, grounded highlight and floating voice dock. */
+
+.vc-banner {
+  position: fixed;
+  top: 62px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 90;
+  width: min(880px, calc(100vw - 24px));
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel) 94%, transparent);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+.vc-banner-main { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.vc-banner-mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 9px;
+  color: var(--accent); background: var(--accent-soft); flex: none;
+}
+.vc-banner-copy { display: flex; flex-direction: column; min-width: 0; line-height: 1.35; }
+.vc-banner-copy strong { font-size: 12.5px; font-weight: 650; }
+.vc-banner-copy span { font-size: 11px; color: var(--muted); }
+.vc-banner-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vc-provider { font-size: 10px; }
+
+.vc-spotlight {
+  position: fixed;
+  z-index: 80;
+  border-radius: 10px;
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 0 9999px rgba(10, 12, 14, 0.28);
+  pointer-events: none;
+  transition: top 140ms ease, left 140ms ease, width 140ms ease, height 140ms ease;
+}
+
+.vc-highlight-card {
+  position: fixed;
+  z-index: 95;
+  width: min(320px, calc(100vw - 32px));
+  padding: 12px 13px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.vc-highlight-card strong { display: block; font-size: 13px; }
+.vc-highlight-card p { margin: 6px 0 10px; color: var(--ink-soft); }
+.vc-highlight-kicker {
+  font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--accent); font-weight: 700; margin-bottom: 4px;
+}
+.vc-highlight-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.vc-highlight-source { font-size: 10px; color: var(--muted); }
+
+.vc-share { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vc-share-video { display: none; }
+.vc-share-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vc-share-state { display: inline-flex; align-items: center; gap: 6px; font-size: 10.5px; color: var(--muted); }
+.vc-share-state i { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); display: inline-block; }
+.vc-share-state.is-live { color: var(--accent); }
+.vc-share-state.is-live i { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.vc-share-note, .vc-share-error { flex-basis: 100%; font-size: 10.5px; color: var(--muted); margin: 0; }
+.vc-share-error { color: var(--danger); }
+.vc-vision { flex-basis: 100%; display: flex; flex-direction: column; gap: 6px; }
+.vc-vision-answer {
+  font-size: 11.5px; white-space: pre-wrap; margin: 0;
+  padding: 8px 10px; border-radius: 8px; background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+
+.vc-float {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 1000;
+  width: min(360px, calc(100vw - 24px));
+  padding: 12px;
+  border-radius: 16px;
+  border: 1px solid var(--line-strong);
+  background: var(--panel);
+  box-shadow: 0 24px 60px -30px rgba(8, 10, 12, 0.6);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.vc-float-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.vc-float-orb { width: 40px; height: 40px; flex: none; border-radius: 50%; background: var(--accent-soft); display: grid; place-items: center; color: var(--accent); }
+.vc-float-id { min-width: 0; flex: 1; }
+.vc-float-id strong { display: block; font-size: 13px; }
+.vc-float-id span { font-size: 10.5px; color: var(--muted); }
+.vc-float-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vc-float-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.vc-float-actions .btn { flex: 1; min-width: 74px; }
+
+@media (max-width: 700px) {
+  .vc-banner { top: 54px; padding: 8px 10px; }
+  .vc-banner-copy span { display: none; }
+  .vc-highlight-card { left: 16px !important; right: 16px; width: auto; }
+  .vc-float { right: 10px; bottom: 10px; width: calc(100vw - 20px); }
+}
+
+/* Two-card automation schedule (settings) */
+.schedule-head { align-items: flex-start; gap: 25px; }
+.schedule-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.schedule-card { min-width: 0; display: flex; flex-direction: column; }
+.schedule-card .card-head { align-items: flex-start; gap: 10px; flex-wrap: wrap; }
+.schedule-icon {
+  width: 34px; height: 34px; border-radius: 10px; flex: none;
+  display: grid; place-items: center;
+  background: var(--accent-soft); color: var(--accent);
+}
+.schedule-toggle { display: flex; align-items: center; gap: 8px; font-size: 12.5px; }
+.weekday-picker { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 5px; }
+.weekday-chip {
+  position: relative; display: inline-flex; align-items: center; justify-content: center;
+  min-width: 42px; padding: 6px 7px; border: 1px solid var(--line-strong);
+  border-radius: 999px; font-size: 11px; color: var(--muted); cursor: pointer;
+  user-select: none; background: var(--panel);
+}
+.weekday-chip input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.weekday-chip.is-on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.weekday-chip:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.schedule-time-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; align-items: start; }
+.schedule-timezone { display: flex; align-items: center; min-height: 36px; font-size: 12px; color: var(--muted); }
+@media (max-width: 900px) {
+  .schedule-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 420px) {
+  .schedule-time-row { grid-template-columns: 1fr; }
+  .weekday-chip { min-width: 38px; }
+}

@@ -10,6 +10,7 @@ import { getSchedule, setScheduleEnabled } from "@/lib/recruitment-schedule";
 import {
   activateStandingAuthorisation,
   pauseStandingAuthorisation,
+  resumeStandingAuthorisation,
   saveRecruitmentPolicy,
 } from "@/lib/recruitment-policy";
 
@@ -77,7 +78,14 @@ export async function pauseStandingAuthorisationAction(): Promise<void> {
   const user = await requireUser();
   pauseStandingAuthorisation(user.id);
   revalidatePath("/recruitment");
-  redirect("/recruitment?ok=Standing+authorisation+paused.+Nothing+will+be+sent+until+you+reactivate+it.#standing-authorisation");
+  redirect("/recruitment?ok=Automatic+submission+paused.+Nothing+will+be+sent+until+you+resume+it.#standing-authorisation");
+}
+
+export async function resumeStandingAuthorisationAction(): Promise<void> {
+  const user = await requireUser();
+  resumeStandingAuthorisation(user.id);
+  revalidatePath("/recruitment");
+  redirect("/recruitment?ok=Automatic+submission+resumed.+Eligible+applications+will+be+submitted+without+per-application+approval.#standing-authorisation");
 }
 
 export async function toggleRecruitmentScheduleAction(): Promise<void> {

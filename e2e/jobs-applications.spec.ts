@@ -102,16 +102,16 @@ test("application creation, status update and in-app notification are persisted 
     createdNow = true;
   }
   const application = app!;
-  if (createdNow) expect(application.status).toBe("awaiting_approval");
-  else expect(["awaiting_approval", "interview_invited"]).toContain(application.status);
+  if (createdNow) expect(["documents_preparing", "quality_check", "ready_to_submit"]).toContain(application.status);
+  else expect(["documents_preparing", "quality_check", "ready_to_submit", "awaiting_approval", "interview_invited"]).toContain(application.status);
   expect(application.submitted_at).toBeNull();
   const jobStatus = one<{ status: string }>("SELECT status FROM jobs WHERE id = ?", job!.id)?.status;
   expect(jobStatus).toBe("documents");
 
   await page.goto(`/applications/${application.id}`, { waitUntil: "domcontentloaded" });
   await page.waitForURL(/\/applications\/app_/);
-  await expect(page.getByText(/not submitted/i).first()).toBeVisible();
-  await expect(page.getByText("Approve application package")).toBeVisible();
+  await expect(page.getByText(/automatic submission/i).first()).toBeVisible();
+  await expect(page.getByText("Approve application package")).toHaveCount(0);
 
   const statusForm = page.locator("form").filter({ has: page.getByRole("button", { name: "Save status" }) });
   await statusForm.locator("select[name=status]").selectOption("interview_invited");

@@ -52,7 +52,7 @@ export default defineConfig({
     {
       name: "desktop-chromium",
       dependencies: ["setup"],
-      testIgnore: [/auth\.setup\.ts/, /auth\.spec\.ts/, /mobile\.spec\.ts/, /voice.*\.spec\.ts/, /admin\.spec\.ts/, /integration\//],
+      testIgnore: [/auth\.setup\.ts/, /auth\.spec\.ts/, /mobile\.spec\.ts/, /voice.*\.spec\.ts/, /visual\.spec\.ts/, /schedules\.spec\.ts/, /admin\.spec\.ts/, /integration\//],
       use: {
         ...devices["Desktop Chrome"],
         baseURL,
@@ -94,6 +94,35 @@ export default defineConfig({
             "--autoplay-policy=no-user-gesture-required",
           ],
         },
+      },
+    },
+    {
+      name: "visual-chromium",
+      dependencies: ["setup"],
+      testMatch: /visual\.spec\.ts/,
+      testIgnore: /voice-visual\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL,
+        storageState: ownerState,
+        viewport: { width: 1440, height: 960 },
+        launchOptions: {
+          args: [
+            "--auto-select-desktop-capture-source=Entire screen",
+            "--use-fake-ui-for-media-stream",
+          ],
+        },
+      },
+    },
+    {
+      name: "schedules-chromium",
+      dependencies: ["setup"],
+      testMatch: /schedules\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        baseURL,
+        storageState: ownerState,
+        viewport: { width: 1440, height: 1000 },
       },
     },
     {

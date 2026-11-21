@@ -209,7 +209,7 @@ export default async function DocumentsPage({
         </section>
       </div>
 
-      <section className="card" id="tailored-documents">
+      <section className="card" id="tailored-documents" data-visual-id="document-library">
         <div className="card-head">
           <div>
             <h2>{kindFilter === "tailored_cv" ? "Tailored CVs" : kindFilter === "cover_letter" ? "Cover letters" : "Tailored documents"}</h2>

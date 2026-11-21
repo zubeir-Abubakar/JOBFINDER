@@ -73,8 +73,9 @@ A localhost endpoint works only while `npm run dev` or `npm run start` and Ollam
 
 ## Implementation status
 
-**Implemented and tested** — persistent 10:00 Europe/Zurich schedule with DST
-handling, catch-up window and missed-run records; the Chief Coordinator run with
+**Implemented and tested** — persistent, configurable recruitment schedule
+(default Monday–Friday at 09:00 Europe/Zurich) with DST handling, catch-up
+window and missed-run records; the Chief Coordinator run with
 its ten-section report and agent assignments; deterministic eligibility rules;
 the 85% floor; tailored CV and cover-letter generation; the ATS/quality gate;
 evidence-based submission states and duplicate blocking; discovery-only manual
@@ -88,7 +89,8 @@ public feeds are configured, and a live discovery run has stored real vacancies.
 
 **Requires additional configuration** — `RECRUITMENT_SUBMISSION_ENDPOINT` (without
 it, every package is queued for a human and nothing is sent); a running host or
-host cron at 10:00 Europe/Zurich; further board identifiers or career-page URLs
+host cron at the configured recruitment time (default 09:00 Europe/Zurich);
+further board identifiers or career-page URLs
 to widen coverage; Gmail credentials for inbox tracking.
 
 **Not implemented** — portal login/CAPTCHA/MFA automation and automatic email
@@ -100,7 +102,7 @@ application has been submitted to a real employer.
 
 - Gmail sending is never automatic: drafts require the explicit **Approve & send** action, and the Gmail account must be connected first. The configured redirect URI must be replaced with a real Google Cloud callback.
 - Job discovery uses public, key-free feeds: Arbeitnow, Ashby job boards, Greenhouse job boards, Lever sites and employer pages that publish schema.org `JobPosting` JSON-LD. Ashby boards, Greenhouse boards, Lever sites and career-page URLs must be configured; jobs.ch is not scraped (terms of use). No vacancy is invented.
-- The assistant can converse naturally, but it cannot invent workspace facts and does not claim an action succeeded without a backend result. Its workspace actions remain deterministic and approval gates are unchanged.
+- The assistant can converse naturally, but it cannot invent workspace facts and does not claim an action succeeded without a backend result. Its workspace actions remain deterministic. Eligible applications are submitted autonomously; only genuine blockers (CAPTCHA, MFA, unsupported portals, missing mandatory information, ambiguous declarations) enter the Human Intervention Queue. The owner-level pause switch remains available.
 - The daily run is started by an in-process scheduler while the application is running, and the same tick is exposed at `GET/POST /api/cron/recruitment` for a host cron. A switched-off machine cannot run it; a run outside the catch-up window is recorded as missed instead of being executed late. A restart marks interrupted workflow steps failed and pauses the run so it can be resumed.
 - API throttling is durable across processes sharing the SQLite file, but it is not a distributed limiter for horizontal scaling.
 - TOTP MFA is available per account but is not forced by policy. Enrol both the owner and administrator and store recovery codes offline before exposing the workspace.
@@ -130,11 +132,14 @@ lib/assistant.ts      coordinator command interpreter
 
 ## Autonomous recruitment (Phase 2)
 
-The Chief Coordinator owns a full daily recruitment run. It is started by a
-persistent schedule at **10:00 Europe/Zurich** (`schedule_jobs` in SQLite), not by
-a browser tab or an in-memory timer. The schedule, every run, every agent
-assignment, every vacancy decision and every submission attempt are stored, so a
-restart does not lose them.
+The Chief Coordinator owns a full recruitment run. It is started by a persistent,
+configurable schedule (`schedule_jobs` in SQLite), not by a browser tab or an
+in-memory timer. The default is **Monday–Friday at 09:00 Europe/Zurich**; the
+weekdays and local time can be changed in **Settings → Scheduling**. The schedule,
+every run, every agent assignment, every vacancy decision and every submission
+attempt are stored, so a restart does not lose them. Days that are not selected
+are true rest days: scheduled discovery, document generation and submission do
+not run and consume no scheduled inference tokens.
 
 ### What one run does
 
@@ -165,8 +170,9 @@ restart does not lose them.
   submission. Without it, packages are prepared and queued for a human; nothing
   is marked as submitted.
 - The scheduler runs inside this application. The Mac and the app/worker must be
-  running at 10:00 Europe/Zurich. The database keeps the schedule and records a
-  missed run instead of silently skipping it. For a future Vercel deployment the
+  running at a configured recruitment time (default 09:00 Europe/Zurich). The
+  database keeps the schedule and records a missed run instead of silently
+  skipping it. For a future Vercel deployment the
   same tick is available at `GET/POST /api/cron/recruitment` (send
   `Authorization: Bearer $CRON_SECRET` when `CRON_SECRET` is set).
 
@@ -192,9 +198,11 @@ use mocked HTTP boundaries; no test contacts a real employer.
 
 ### Daily executive brief
 
-The Chief Coordinator publishes one consolidated executive brief at **17:00
-Europe/Zurich**. It is a separate durable `schedule_jobs` row (`daily_executive_brief`),
-so a completed recruitment run does not send its own competing email. Routine
+The Chief Coordinator publishes one consolidated executive brief. The default is
+**Monday–Friday at 16:00 Europe/Zurich**, configurable independently in
+**Settings → Scheduling**. It is a separate durable `schedule_jobs` row
+(`daily_executive_brief`), so a completed recruitment run does not send its own
+competing email. Routine
 successes stay in-app; the brief carries the verified submission count, blocked
 exceptions, agent-by-agent reconciliation, Coordinator assessment and next
 priorities.

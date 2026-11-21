@@ -296,31 +296,35 @@ test("a missing dashboard URL omits the CTA but does not block the brief", async
   notifications.stopNotificationQueue();
 });
 
-test("the Europe/Zurich schedule advances one brief per day and handles DST", async () => {
+test("the Europe/Zurich weekly report schedule advances once per selected day and handles DST", async () => {
   const localMorning = new Date("2026-11-20T08:00:00+01:00");
   const row = brief.ensureExecutiveBriefSchedule(localMorning);
-  assert.equal(row.time, "17:00");
+  assert.equal(row.time, "16:00");
   assert.equal(row.timezone, "Europe/Zurich");
+  assert.deepEqual(schedule.parseWeekdays(row.weekdays), [1, 2, 3, 4, 5]);
   const first = brief.executiveBriefScheduleSnapshot(localMorning);
-  assert.equal(first.next_run_at, "2026-11-20T16:00:00.000Z");
+  assert.equal(first.next_run_at, "2026-11-20T15:00:00.000Z");
 
-  const tick = await brief.tickExecutiveBriefSchedule(new Date("2026-11-20T17:01:00+01:00"));
+  const tick = await brief.tickExecutiveBriefSchedule(new Date("2026-11-20T16:01:00+01:00"));
   assert.equal(tick.status, "duplicate", "the already queued 20 Nov brief is not sent twice");
-  assert.equal(tick.nextRunAt, "2026-11-21T16:00:00.000Z");
+  assert.equal(tick.nextRunAt, "2026-11-23T15:00:00.000Z", "Saturday and Sunday are not report days");
 
-  const nextDay = await brief.tickExecutiveBriefSchedule(new Date("2026-11-21T17:01:00+01:00"));
-  assert.equal(nextDay.status, "queued");
+  const saturday = await brief.tickExecutiveBriefSchedule(new Date("2026-11-21T16:01:00+01:00"));
+  assert.equal(saturday.status, "not_scheduled_today");
+
+  const monday = await brief.tickExecutiveBriefSchedule(new Date("2026-11-23T16:01:00+01:00"));
+  assert.equal(monday.status, "queued");
   notifications.stopNotificationQueue();
   await notifications.drainNotificationQueue({
     send: async () => ({ messageId: "brief-schedule-id", threadId: "brief-schedule-thread" }),
   });
   notifications.stopNotificationQueue();
 
-  const dst = schedule.nextDailyRun(new Date("2026-10-24T16:00:00Z"), {
-    time: "17:00",
+  const dst = schedule.nextScheduledRun(new Date("2026-10-24T16:00:00Z"), {
+    time: "16:00",
     timeZone: "Europe/Zurich",
   });
-  assert.equal(dst.toISOString(), "2026-10-25T16:00:00.000Z");
+  assert.equal(dst.toISOString(), "2026-10-25T15:00:00.000Z");
 });
 
 test("a failed brief delivery is retried through the durable outbox", async () => {

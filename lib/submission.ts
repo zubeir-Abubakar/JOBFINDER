@@ -110,7 +110,7 @@ export function submissionEnabled(): boolean {
  * network call, even when an operator accidentally reactivates the policy.
  */
 export function submissionDryRun(): boolean {
-  return process.env.RECRUITMENT_DRY_RUN === "true" || getSetting<boolean>("recruitment_dry_run", true) === true;
+  return process.env.RECRUITMENT_DRY_RUN === "true" || getSetting<boolean>("recruitment_dry_run", false) === true;
 }
 
 /** Candidate-facing forms are on unless explicitly disabled. Activation is enforced separately. */

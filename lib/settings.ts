@@ -33,9 +33,11 @@ export function setSetting(key: string, value: unknown): void {
 }
 
 export function isApprovalMode(): boolean {
-  return getSetting<boolean>("approval_mode", true);
+  // Per-application approval is retired. Automatic submission is controlled by
+  // the owner-level autonomous_submission switch instead.
+  return false;
 }
 
 export function isAutonomousAllowed(): boolean {
-  return getSetting<boolean>("autonomous_submission", false) && !isApprovalMode();
+  return getSetting<boolean>("autonomous_submission", true) !== false;
 }

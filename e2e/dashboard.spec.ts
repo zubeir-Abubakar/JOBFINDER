@@ -32,7 +32,7 @@ test("dashboard figures match the isolated database and identities are present",
   await expect(page.locator(".kpi-value")).toHaveCount(4);
   await expect(page.locator(".kpi-value").first()).toHaveText(String(jobCount));
   await expect(page.getByText("Recruitment pipeline")).toBeVisible();
-  await expect(page.getByText("Awaiting approval", { exact: false }).first()).toBeVisible();
+  await expect(page.getByText("Needs attention", { exact: false }).first()).toBeVisible();
 
   const body = await page.locator("body").innerText();
   for (const identity of AGENT_IDENTITIES) {

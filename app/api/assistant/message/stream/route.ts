@@ -17,9 +17,10 @@ function publicError(error: unknown): string {
 export async function POST(request: Request) {
   const user = await currentUser();
   if (!user) return Response.json({ error: "Unauthorised" }, { status: 401 });
-  const body = (await request.json().catch(() => null)) as { message?: unknown } | null;
+  const body = (await request.json().catch(() => null)) as { message?: unknown; view?: unknown } | null;
   const message = typeof body?.message === "string" ? body.message.trim().slice(0, 2000) : "";
   if (!message) return Response.json({ error: "Message is empty." }, { status: 400 });
+  const view = typeof body?.view === "string" ? body.view.slice(0, 40) : null;
 
   run("INSERT INTO chat_messages (user_id, role, content, created_at) VALUES (?, 'user', ?, ?)", [user.id, message, nowIso()]);
   const acceptedAt = performance.now();
@@ -37,6 +38,7 @@ export async function POST(request: Request) {
       };
       try {
         const result = await routeAssistantMessage(user.id, message, {
+          view,
           onDelta: (delta) => {
             if (firstTokenAt === null) firstTokenAt = performance.now();
             send({ type: "delta", delta });
@@ -52,6 +54,7 @@ export async function POST(request: Request) {
             sessionId: result.sessionId,
             handover: result.handover ?? null,
             pendingAction: result.pendingAction ?? null,
+            visual: result.visual ?? null,
           }),
           nowIso(),
         ]);
@@ -63,6 +66,7 @@ export async function POST(request: Request) {
           agentKeys: result.agentKeys ?? [],
           handover: result.handover ?? null,
           taskIds: result.taskIds,
+          visual: result.visual ?? null,
           timings: {
             acceptedMs: 0,
             routeMs: Math.round((firstTokenAt ?? completedAt) - acceptedAt),

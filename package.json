@@ -6,7 +6,7 @@
     "test": "tsx --test tests/*.test.ts",
     "test:unit": "tsx --test tests/*.test.ts",
     "test:integration": "npm run e2e:prepare && playwright test --project=integration",
-    "test:e2e": "npm run e2e:prepare && playwright test --project=desktop-chromium --project=mobile-chromium --project=auth-chromium --project=admin-chromium --project=setup",
+    "test:e2e": "npm run e2e:prepare && playwright test --project=desktop-chromium --project=mobile-chromium --project=auth-chromium --project=admin-chromium --project=schedules-chromium --project=visual-chromium --project=voice-chromium --project=setup",
     "test:voice": "npm run e2e:prepare && playwright test --project=voice-chromium",
     "test:regression": "npm run test:unit && npm run typecheck && npm run build && playwright test",
     "e2e:prepare": "npm run build",

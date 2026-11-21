@@ -58,7 +58,7 @@ export default async function DocumentPreviewPage({ params }: { params: Promise<
           </>
         }
       />
-      <section className="card">
+      <section className="card" data-visual-id="document-preview">
         <DocumentPreview id={doc.id} name={doc.file_name} mime={doc.mime} />
       </section>
       {quality ? (

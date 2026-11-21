@@ -49,7 +49,8 @@ test("all eight agents have distinct, supported Gemini Live voices", () => {
     assert.ok(voices.isLiveVoiceId(profile.voiceId));
   }
   assert.equal(voices.voiceProfileForAgent("coordinator").voiceId, "Charon");
-  assert.equal(voices.voiceProfileForAgent("research").voiceId, "Orus");
+  assert.equal(voices.voiceProfileForAgent("research").voiceId, "Leda");
+  assert.equal(voices.voiceProfileForAgent("application").voiceId, "Orus");
   assert.equal(voices.voiceProfileForAgent("email").voiceId, "Zephyr");
   assert.equal(voices.voiceProfileForAgent("not-an-agent").agentKey, "coordinator");
 });
@@ -211,7 +212,7 @@ test("the live operational snapshot answers without inventing provider or token 
   const focused = operations.answerFromOperations("What is your current status, provider, model and voice?", snapshot, "research") ?? "";
   assert.match(focused, /Saffa/);
   assert.match(focused, /Job Research Agent \/ Discovery/);
-  assert.match(focused, /Orus/);
+  assert.match(focused, /Leda/);
   assert.match(focused, /provider/i);
   const mostTokens = operations.answerFromOperations("Which agent uses the most tokens?", snapshot) ?? "";
   assert.match(mostTokens, /By agent:/);

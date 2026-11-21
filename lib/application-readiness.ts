@@ -326,17 +326,14 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
     const policyOk =
       policy.active &&
       policy.autonomousSubmission &&
-      !policy.approvalRequired &&
       (policy.dailyRemaining === null || policy.dailyRemaining > 0);
     const detail = !policy.active
-      ? "Standing authorisation is not active."
+      ? "Automatic submission is paused."
       : !policy.autonomousSubmission
         ? "Autonomous submission is disabled."
-        : policy.approvalRequired
-          ? "Per-application approval is required before submission."
-          : policy.dailyRemaining !== null && policy.dailyRemaining <= 0
-            ? "Today's submission limit has been reached."
-            : "Standing authorisation, approval mode and daily limit are satisfied.";
+        : policy.dailyRemaining !== null && policy.dailyRemaining <= 0
+          ? "Today's submission limit has been reached."
+          : "Automatic submission and the daily limit are satisfied; no per-application approval is required.";
     items.push(item("submission_policy", "Submission policy is satisfied", policyOk, detail));
   }
 

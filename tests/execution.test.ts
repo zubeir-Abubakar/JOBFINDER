@@ -48,13 +48,15 @@ test("a completed agent task never implies a submitted application", () => {
   assert.equal(isApplicationSubmitted({ status: "submitted", submitted_at: "2026-11-17T16:00:00.000Z", confirmation: null }), false);
 });
 
-test("submission stays blocked without approval or an employer reference", () => {
-  assert.match(
-    submissionBlockedReason({ found: true, approvalMode: true, approvedAt: null, confirmation: "REF", status: "awaiting_approval" }) ?? "",
-    /Approve the package/,
+test("submission needs an employer reference but never a per-application approval", () => {
+  // Approval is retired: the same record is no longer blocked merely because
+  // approvedAt is null. An employer reference is still mandatory evidence.
+  assert.equal(
+    submissionBlockedReason({ found: true, approvalMode: true, approvedAt: null, confirmation: "REF", status: "ready_to_submit" }),
+    null,
   );
   assert.match(
-    submissionBlockedReason({ found: true, approvalMode: true, approvedAt: "2026-11-17T16:00:00.000Z", confirmation: "", status: "awaiting_approval" }) ?? "",
+    submissionBlockedReason({ found: true, approvalMode: true, approvedAt: null, confirmation: "", status: "ready_to_submit" }) ?? "",
     /confirmation reference/,
   );
   assert.match(
@@ -66,7 +68,7 @@ test("submission stays blocked without approval or an employer reference", () =>
     /already recorded/,
   );
   assert.equal(
-    submissionBlockedReason({ found: true, approvalMode: true, approvedAt: "2026-11-17T16:00:00.000Z", confirmation: "REF", status: "awaiting_approval" }),
+    submissionBlockedReason({ found: true, approvalMode: true, approvedAt: "2026-11-17T16:00:00.000Z", confirmation: "REF", status: "ready_to_submit" }),
     null,
   );
   assert.match(

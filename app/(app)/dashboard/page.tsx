@@ -54,7 +54,7 @@ export default async function DashboardPage({
   };
   const appTotals = {
     submitted: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('submitted','acknowledged','interview_invited','interview_completed','offer_received')")?.c ?? 0,
-    awaiting: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'awaiting_approval'")?.c ?? 0,
+    awaiting: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'human_intervention_required'")?.c ?? 0,
     rejected: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'rejected'")?.c ?? 0,
     interviews: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('interview_invited','interview_completed')")?.c ?? 0,
     pending: one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status IN ('submitted','acknowledged')")?.c ?? 0,
@@ -125,7 +125,7 @@ export default async function DashboardPage({
         }
       />
 
-      <section className="kpi-hero" aria-label="Primary recruitment metrics">
+      <section className="kpi-hero" aria-label="Primary recruitment metrics" data-visual-id="dashboard-metrics">
         <HeroStat
           href="/jobs#vacancies"
           label="Jobs discovered"
@@ -151,10 +151,10 @@ export default async function DashboardPage({
           tone="violet"
         />
         <HeroStat
-          href="/applications?status=awaiting_approval#applications"
-          label="Awaiting approval"
+          href="/applications?status=human_intervention_required#applications"
+          label="Needs attention"
           value={appTotals.awaiting}
-          note={appTotals.awaiting ? "Review before anything is sent" : "Nothing needs your review"}
+          note={appTotals.awaiting ? "Only legitimate human blockers wait" : "Nothing needs your review"}
           icon="shield"
           tone="amber"
         />
@@ -178,7 +178,7 @@ export default async function DashboardPage({
         </div>
       ) : null}
 
-      <section className="card mb-4">
+      <section className="card mb-4" data-visual-id="recruitment-pipeline">
         <div className="card-head">
           <div>
             <h2>Recruitment pipeline</h2>
@@ -193,7 +193,7 @@ export default async function DashboardPage({
               ["Under analysis", pipeline.analysing],
               ["Strong matches", jobTotals.strong],
               ["Documents prepared", pipeline.documents],
-              ["Awaiting approval", pipeline.awaiting],
+              ["Needs attention", appTotals.awaiting],
               ["Submitted", pipeline.submitted],
               ["Interview stage", pipeline.interview],
               ["Rejected", pipeline.rejected],
@@ -207,9 +207,11 @@ export default async function DashboardPage({
         </div>
       </section>
 
-      <WorkflowFlow />
+      <div data-visual-id="workflow-timeline">
+        <WorkflowFlow />
+      </div>
 
-      <details className="card system-details mb-4" id="system-health">
+      <details className="card system-details mb-4" id="system-health" data-visual-id="system-health">
         <summary className="system-details-summary">
           <span className="system-details-mark"><Icon name="settings" size={16} /></span>
           <span className="system-details-copy">
@@ -463,9 +465,9 @@ export default async function DashboardPage({
             <Link href="/analytics#reports" className="btn justify-start"><Icon name="analytics" /> Generate daily report</Link>
             <div className="between card-quiet p-3">
               <div>
-                <div className="text-[12.5px] font-semibold">Approval mode</div>
+                <div className="text-[12.5px] font-semibold">Automatic submission</div>
                 <div className="text-[11px]" style={{ color: "var(--muted)" }}>
-                  {getSetting<boolean>("approval_mode", true) ? "Each application needs your approval" : "Submissions may proceed without review"}
+                  {getSetting<boolean>("autonomous_submission", true) ? "Eligible applications submit without per-application approval" : "Paused by you — packages are prepared only"}
                 </div>
               </div>
               <Link href="/settings#automation" className="btn btn-sm">Change</Link>

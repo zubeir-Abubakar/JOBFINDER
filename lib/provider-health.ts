@@ -20,10 +20,17 @@ export type ProviderFailureKind =
   | "timeout"
   | "authentication"
   | "model_unavailable"
+  | "model_policy"
   | "configuration"
   | "unknown";
 
-export type ProviderHealthStatus = "healthy" | "cooling" | "authentication_failed" | "unavailable" | "unknown";
+export type ProviderHealthStatus =
+  | "healthy"
+  | "cooling"
+  | "authentication_failed"
+  | "configuration_error"
+  | "unavailable"
+  | "unknown";
 
 export type ProviderHealthRow = {
   provider: string;
@@ -56,12 +63,19 @@ const TIMEOUT = /timed? ?out|timeout|aborted|etimedout/i;
 const UNAVAILABLE = /fetch failed|econnrefused|econnreset|enotfound|eai_again|network|socket|http 5\d\d|\b50[024]\b/i;
 const AUTH = /unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication|permission denied|401|403|invalid_grant|revoked/i;
 const MODEL = /model.*(?:not found|not installed|unavailable|does not exist)|no such model|404/i;
-const CONFIG = /invalid request|bad request|malformed|configuration|missing .*configuration|400|422/i;
+// Model-policy refusals are produced locally by the zero-cost gate. They are a
+// configuration defect, not a provider outage, so they must never be hidden by
+// switching to a local model.
+const MODEL_POLICY =
+  /not listed in FREELLMAPI_ALLOWED_MODELS|\brefused\b|model policy|not permitted|allowlist|declared alias|pinned id|routing aliases/i;
+const CONFIG =
+  /invalid request|bad request|malformed|configuration|missing .*configuration|\b400\b|\b422\b/i;
 
 /** Deterministic classification. The most actionable cause wins. */
 export function classifyProviderFailure(message: string, status: number | null = null): ProviderFailureKind {
   const text = `${message}${status ? ` HTTP ${status}` : ""}`;
   if (AUTH.test(text)) return "authentication";
+  if (MODEL_POLICY.test(text)) return "model_policy";
   if (QUOTA.test(text)) return "quota_exhausted";
   if (RATE.test(text)) return "rate_limited";
   if (COOLDOWN.test(text)) return "cooldown";
@@ -88,6 +102,15 @@ export function isRouteFailure(kind: ProviderFailureKind): boolean {
     kind === "timeout" ||
     kind === "model_unavailable"
   );
+}
+
+/**
+ * Defects in the request, credentials or model policy are terminal for this
+ * call. They must never be answered by a different model, because that would
+ * hide a real configuration fault behind a successful-looking response.
+ */
+export function isFailClosedFailure(kind: ProviderFailureKind): boolean {
+  return kind === "authentication" || kind === "model_policy" || kind === "configuration";
 }
 
 function boundedRetryAfter(retryAfterMs: number | null | undefined): number | null {
@@ -150,7 +173,13 @@ export function recordProviderFailure(input: {
   const cooldownMs = failureCooldownMs(input.kind, input.retryAfterMs ?? null, attempt);
   const until = cooldownMs > 0 ? new Date(Date.now() + cooldownMs).toISOString() : null;
   const status: ProviderHealthStatus =
-    input.kind === "authentication" ? "authentication_failed" : cooldownMs > 0 ? "cooling" : "unavailable";
+    input.kind === "authentication"
+      ? "authentication_failed"
+      : input.kind === "model_policy" || input.kind === "configuration"
+        ? "configuration_error"
+        : cooldownMs > 0
+          ? "cooling"
+          : "unavailable";
   const at = nowIso();
   run(
     `INSERT INTO provider_health
@@ -190,7 +219,7 @@ export function providerCooldown(provider: string, model: string, now = Date.now
   if (!row) return null;
   const until = row.cooldown_until ? Date.parse(row.cooldown_until) : 0;
   const remaining = Number.isFinite(until) ? Math.max(0, until - now) : 0;
-  if (remaining <= 0 && !["authentication_failed", "unavailable"].includes(row.status)) return null;
+  if (remaining <= 0 && !["authentication_failed", "configuration_error", "unavailable"].includes(row.status)) return null;
   return {
     provider,
     model,

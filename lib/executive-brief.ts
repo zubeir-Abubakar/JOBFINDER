@@ -23,7 +23,9 @@ import {
   catchUpWindowHours,
   formatInZone,
   localDateKey,
-  nextDailyRun,
+  localWeekday,
+  nextScheduledRun,
+  parseWeekdays,
   RECRUITMENT_TIMEZONE,
   zonedParts,
   zonedTimeToUtc,
@@ -47,7 +49,8 @@ import { agentIdentity, agentSignature } from "./agent-identity";
 
 export const EXECUTIVE_BRIEF_KIND = "daily_executive_brief";
 export const EXECUTIVE_BRIEF_SCHEDULE_KEY = "daily_executive_brief";
-export const EXECUTIVE_BRIEF_TIME = "17:00";
+export const EXECUTIVE_BRIEF_TIME = "16:00";
+export const EXECUTIVE_BRIEF_WEEKDAYS = [1, 2, 3, 4, 5];
 export const EXECUTIVE_BRIEF_DASHBOARD_PATH = "/dashboard";
 
 type Count = { n: number };
@@ -1150,6 +1153,7 @@ export type ExecutiveBriefSchedule = {
   time: string;
   timezone: string;
   enabled: number;
+  weekdays: string | null;
   next_run_at: string | null;
   last_run_at: string | null;
   last_status: string | null;
@@ -1158,41 +1162,48 @@ export type ExecutiveBriefSchedule = {
 
 export function ensureExecutiveBriefSchedule(now: Date = new Date()): ExecutiveBriefSchedule {
   const existing = one<ExecutiveBriefSchedule>(
-    "SELECT key, label, time, timezone, enabled, next_run_at, last_run_at, last_status, last_error FROM schedule_jobs WHERE key = ?",
+    "SELECT key, label, time, timezone, enabled, weekdays, next_run_at, last_run_at, last_status, last_error FROM schedule_jobs WHERE key = ?",
     [EXECUTIVE_BRIEF_SCHEDULE_KEY],
   );
-  if (existing) return existing;
+  if (existing) return { ...existing, weekdays: existing.weekdays ?? JSON.stringify(EXECUTIVE_BRIEF_WEEKDAYS) };
   run(
-    "INSERT OR IGNORE INTO schedule_jobs (key, label, time, timezone, enabled, next_run_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+    "INSERT OR IGNORE INTO schedule_jobs (key, label, time, timezone, enabled, weekdays, next_run_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
     [
       EXECUTIVE_BRIEF_SCHEDULE_KEY,
-      "Daily executive brief",
+      "Daily recruitment report",
       EXECUTIVE_BRIEF_TIME,
       RECRUITMENT_TIMEZONE,
-      nextDailyRun(now, { time: EXECUTIVE_BRIEF_TIME }).toISOString(),
+      JSON.stringify(EXECUTIVE_BRIEF_WEEKDAYS),
+      nextScheduledRun(now, { time: EXECUTIVE_BRIEF_TIME, weekdays: EXECUTIVE_BRIEF_WEEKDAYS }).toISOString(),
       nowIso(),
     ],
   );
   const created = one<ExecutiveBriefSchedule>(
-    "SELECT key, label, time, timezone, enabled, next_run_at, last_run_at, last_status, last_error FROM schedule_jobs WHERE key = ?",
+    "SELECT key, label, time, timezone, enabled, weekdays, next_run_at, last_run_at, last_status, last_error FROM schedule_jobs WHERE key = ?",
     [EXECUTIVE_BRIEF_SCHEDULE_KEY],
   );
   if (!created) throw new Error("The executive brief schedule could not be created.");
-  return created;
+  return { ...created, weekdays: created.weekdays ?? JSON.stringify(EXECUTIVE_BRIEF_WEEKDAYS) };
 }
 
 export function executiveBriefScheduleSnapshot(now: Date = new Date()): ExecutiveBriefSchedule & {
   due: boolean;
   missed: boolean;
+  weekdaysList: number[];
+  scheduledToday: boolean;
   requiresRunningHost: true;
 } {
   const row = ensureExecutiveBriefSchedule(now);
+  const weekdaysList = parseWeekdays(row.weekdays);
   const next = row.next_run_at ? Date.parse(row.next_run_at) : NaN;
-  const overdue = row.enabled === 1 && Number.isFinite(next) ? now.getTime() - next : 0;
+  const scheduledToday = row.enabled === 1 && weekdaysList.includes(localWeekday(now, row.timezone));
+  const overdue = scheduledToday && Number.isFinite(next) ? now.getTime() - next : 0;
   return {
     ...row,
-    due: row.enabled === 1 && Number.isFinite(next) && overdue >= 0,
-    missed: row.enabled === 1 && Number.isFinite(next) && overdue > catchUpWindowHours() * 3600_000,
+    weekdaysList,
+    scheduledToday,
+    due: scheduledToday && Number.isFinite(next) && overdue >= 0,
+    missed: scheduledToday && Number.isFinite(next) && overdue > catchUpWindowHours() * 3600_000,
     requiresRunningHost: true,
   };
 }
@@ -1221,7 +1232,7 @@ function markBriefSchedule(input: {
  * this function only decides whether the one daily brief is due.
  */
 export async function tickExecutiveBriefSchedule(now: Date = new Date()): Promise<{
-  status: "not_due" | "disabled" | "missed" | ExecutiveBriefSendStatus | "failed";
+  status: "not_due" | "not_scheduled_today" | "disabled" | "missed" | ExecutiveBriefSendStatus | "failed";
   nextRunAt: string | null;
   detail: string;
 }> {
@@ -1229,11 +1240,18 @@ export async function tickExecutiveBriefSchedule(now: Date = new Date()): Promis
   if (schedule.enabled !== 1) {
     return { status: "disabled", nextRunAt: schedule.next_run_at, detail: "The executive brief schedule is disabled." };
   }
+  if (!schedule.scheduledToday) {
+    return {
+      status: "not_scheduled_today",
+      nextRunAt: schedule.next_run_at,
+      detail: `Today is not a configured report day. The next report is due ${schedule.next_run_at ?? "at the next selected weekday"}.`,
+    };
+  }
   if (!schedule.due) {
     return { status: "not_due", nextRunAt: schedule.next_run_at, detail: "The next executive brief is not due." };
   }
   if (schedule.missed) {
-    const next = nextDailyRun(now, { time: schedule.time, timeZone: schedule.timezone }).toISOString();
+    const next = nextScheduledRun(now, { time: schedule.time, timeZone: schedule.timezone, weekdays: schedule.weekdaysList }).toISOString();
     markBriefSchedule({
       now,
       status: "missed",
@@ -1248,7 +1266,7 @@ export async function tickExecutiveBriefSchedule(now: Date = new Date()): Promis
   }
   try {
     const result = await sendDailyExecutiveBrief({ now });
-    const next = nextDailyRun(now, { time: schedule.time, timeZone: schedule.timezone }).toISOString();
+    const next = nextScheduledRun(now, { time: schedule.time, timeZone: schedule.timezone, weekdays: schedule.weekdaysList }).toISOString();
     markBriefSchedule({
       now,
       status: result.status,

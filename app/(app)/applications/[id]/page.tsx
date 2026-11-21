@@ -5,7 +5,8 @@ import { all, one } from "@/lib/db";
 import { PageHead, Empty, Flash } from "@/components/ui";
 import { formatDate, formatDateTime, param } from "@/lib/format";
 import { statusLabel, statusClass, APPLICATION_STATUSES, isApplicationSubmitted } from "@/lib/application-status";
-import { answerInterventionAction, approveApplicationAction, requestDocumentChangesAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
+import { answerInterventionAction, requestDocumentChangesAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
+import { handoffForApplication } from "@/lib/handoff";
 import { SubmissionForm } from "@/components/SubmissionForm";
 import { SubmitButton } from "@/components/SubmitButton";
 import { getSetting } from "@/lib/settings";
@@ -22,7 +23,7 @@ export default async function ApplicationDetailPage({
   params: Promise<{ id: string }>;
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
-  await requireUser();
+  const user = await requireUser();
   const { id } = await params;
   const sp = await searchParams;
   const app = one<{
@@ -78,7 +79,7 @@ export default async function ApplicationDetailPage({
     "SELECT id, field, question, reason, kind FROM application_interventions WHERE application_id = ? AND status = 'open' ORDER BY created_at",
     [id],
   );
-  const approvalMode = getSetting<boolean>("approval_mode", true);
+  const handoff = handoffForApplication(user.id, id);
   const reviewDocs = siblings
     .filter((doc) => doc.id === app.cv_document_id || doc.id === app.cover_letter_id)
     .sort((a, b) => (a.id === app.cv_document_id ? -1 : b.id === app.cv_document_id ? 1 : 0))
@@ -142,9 +143,9 @@ export default async function ApplicationDetailPage({
                 <div>
                   <h2>Submission</h2>
                   <p className="card-sub">
-                    {agentIdentity("application").name} — {agentIdentity("application").title} · {app.submitted_at
+                    {agentIdentity("application").name} — {agentIdentity("application").title} ·                    {app.submitted_at
                       ? `recorded ${formatDateTime(app.submitted_at)} via ${(app.method ?? "").replace(/_/g, " ")}`
-                      : `not submitted${approvalMode ? " — approval mode is on" : ""}`}
+                      : "automatic submission after every eligibility, document and safety check"}
                   </p>
                 </div>
               </div>
@@ -178,16 +179,49 @@ export default async function ApplicationDetailPage({
                   ) : null}
                   {app.status === "quality_review_required" ? (
                     <div className="alert alert-warn" style={{ padding: "8px 10px", fontSize: 12 }}>
-                      Quality review is required before this package can be approved. Regenerate the documents after correcting the findings above.
+                      Quality review is required before this package can be sent. Regenerate the documents after correcting the findings above.
                     </div>
-                  ) : !app.approved_at ? (
-                    <form action={approveApplicationAction}>
-                      <input type="hidden" name="id" value={app.id} />
-                      <SubmitButton className="btn btn-primary" pendingLabel="Approving…">Approve application package</SubmitButton>
-                    </form>
+                  ) : app.status === "human_intervention_required" || app.status === "submission_unverified" ? (
+                    <div className="alert alert-warn" style={{ padding: "8px 10px", fontSize: 12 }}>
+                      Automatic submission stopped at a legitimate human step. The handoff package below contains the employer link, documents, prepared answers and remaining steps. There is no approval flag to clear.
+                    </div>
+                  ) : app.status === "ready_to_submit" ? (
+                    <div className="alert alert-ok">Ready for automatic submission. No per-application approval is required; the next eligible run will send it, or you can complete the employer form yourself.</div>
                   ) : (
-                    <div className="alert alert-ok">Approved {formatDateTime(app.approved_at)}. Submit through the employer channel, then record the confirmation.</div>
+                    <div className="alert alert-info" style={{ padding: "8px 10px", fontSize: 12 }}>
+                      This package is prepared for automatic submission. It does not wait for your approval; it waits for the independent readiness check and a supported employer channel.
+                    </div>
                   )}
+
+                  {handoff ? (
+                    <div className="card-quiet p-3 stack" id="handoff" style={{ gap: 8 }}>
+                      <div className="label" style={{ marginBottom: 0 }}>Human intervention package</div>
+                      <div className="text-[12px]">{handoff.stopExplanation}</div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {handoff.applicationUrl ? <a href={handoff.applicationUrl} target="_blank" rel="noreferrer" className="btn btn-sm btn-primary">Employer application page</a> : <span className="badge badge-warn">No application URL recorded</span>}
+                        {handoff.postingUrl && handoff.postingUrl !== handoff.applicationUrl ? <a href={handoff.postingUrl} target="_blank" rel="noreferrer" className="btn btn-sm">Original posting</a> : null}
+                        {handoff.cv ? <Link href={handoff.cv.previewHref} className="btn btn-sm">CV · {handoff.cv.name}</Link> : null}
+                        {handoff.coverLetter ? <Link href={handoff.coverLetter.previewHref} className="btn btn-sm">Cover letter · {handoff.coverLetter.name}</Link> : null}
+                      </div>
+                      <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                        Blocker: {handoff.blocker.kind.replace(/_/g, " ")} · Disovered {handoff.discoveredAt ? formatDate(handoff.discoveredAt) : "unknown"} · Prepared {handoff.preparedAt ? formatDate(handoff.preparedAt) : "not yet"} · Match {handoff.matchScore ?? "—"}%.
+                      </div>
+                      <div className="text-[11px]" style={{ color: "var(--muted)" }}>{handoff.matchExplanation}</div>
+                      {handoff.preparedAnswers.length > 0 ? (
+                        <div className="stack" style={{ gap: 4 }}>
+                          <div className="text-[11px] font-medium">Prepared answers</div>
+                          {handoff.preparedAnswers.map((answer) => (
+                            <div key={`${answer.question}-${answer.answeredAt}`} className="text-[11px]" style={{ color: "var(--muted)" }}>
+                              {answer.question}: {answer.answer}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                      <ol className="text-[11.5px] pl-4" style={{ color: "var(--muted)", listStyle: "decimal" }}>
+                        {handoff.remainingSteps.map((step) => <li key={step}>{step}</li>)}
+                      </ol>
+                    </div>
+                  ) : null}
                   <div className="decision-row">
                     <form action={updateApplicationStatusAction}>
                       <input type="hidden" name="id" value={app.id} />
@@ -206,7 +240,7 @@ export default async function ApplicationDetailPage({
 
                   <div className="card-quiet p-3">
                     <div className="label" style={{ marginBottom: 6 }}>Record a confirmed submission</div>
-                    <SubmissionForm applicationId={app.id} approved={Boolean(app.approved_at)} />
+                    <SubmissionForm applicationId={app.id} approved />
                   </div>
                   <p className="text-[11px] leading-relaxed" style={{ color: "var(--muted)" }}>
                     Automated portal submission is not configured in this deployment. Employer portals commonly require logins, CAPTCHAs or MFA; this platform
@@ -332,8 +366,7 @@ export default async function ApplicationDetailPage({
               <div className="between"><span style={{ color: "var(--muted)" }}>Created</span><span>{formatDate(app.created_at)}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Last update</span><span>{formatDateTime(app.last_update)}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Match score</span><span>{app.match_score ?? "—"}%</span></div>
-              <div className="between"><span style={{ color: "var(--muted)" }}>Approved</span><span>{app.approved_at ? "Yes" : "No"}</span></div>
-              <div className="between"><span style={{ color: "var(--muted)" }}>Submitted</span><span>{app.submitted_at ? "Yes" : "No"}</span></div>
+              <div className="between"><span style={{ color: "var(--muted)" }}>Submission</span><span>{app.submitted_at ? "Employer-confirmed" : "Not yet verified"}</span></div>
             </div>
           </section>
         </div>

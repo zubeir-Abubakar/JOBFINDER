@@ -21,12 +21,13 @@ export async function GET() {
 export async function POST(request: Request) {
   const user = await currentUser();
   if (!user) return Response.json({ error: "Unauthorised" }, { status: 401 });
-  const body = (await request.json().catch(() => null)) as { message?: unknown } | null;
+  const body = (await request.json().catch(() => null)) as { message?: unknown; view?: unknown } | null;
   const message = typeof body?.message === "string" ? body.message.trim().slice(0, 2000) : "";
   if (!message) return Response.json({ error: "Message is empty." }, { status: 400 });
+  const view = typeof body?.view === "string" ? body.view.slice(0, 40) : null;
 
   run("INSERT INTO chat_messages (user_id, role, content, created_at) VALUES (?, 'user', ?, ?)", [user.id, message, nowIso()]);
-  const result = await routeAssistantMessage(user.id, message);
+  const result = await routeAssistantMessage(user.id, message, { view });
   run("INSERT INTO chat_messages (user_id, role, content, meta, created_at) VALUES (?, 'assistant', ?, ?, ?)", [
     user.id,
     result.reply,
@@ -37,6 +38,7 @@ export async function POST(request: Request) {
       sessionId: result.sessionId,
       handover: result.handover ?? null,
       pendingAction: result.pendingAction ?? null,
+      visual: result.visual ?? null,
     }),
     nowIso(),
   ]);
@@ -50,5 +52,6 @@ export async function POST(request: Request) {
     handover: result.handover ?? null,
     taskIds: result.taskIds,
     pendingAction: result.pendingAction ?? null,
+    visual: result.visual ?? null,
   });
 }

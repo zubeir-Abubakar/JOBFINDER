@@ -51,7 +51,7 @@ function bridge(result: {
  * Deterministic text routing. Handover is resolved before any model call; only
  * an actual request, question or command reaches a provider.
  */
-export type RouteOptions = { onDelta?: (delta: string) => void };
+export type RouteOptions = { onDelta?: (delta: string) => void; view?: string | null };
 
 export async function routeAssistantMessage(
   userId: string,
@@ -97,7 +97,7 @@ export async function routeAssistantMessage(
     if (target === current.agentKey) {
       if (!request) return bridge({ ok: true, session: current }, current.agentKey, target, false);
       const result = target === "coordinator"
-        ? await handleAssistantMessage(userId, request, { sessionId: current.id, onDelta: options.onDelta })
+        ? await handleAssistantMessage(userId, request, { sessionId: current.id, view: options.view ?? null, onDelta: options.onDelta })
         : await handleSpecialistMessage(userId, target, request, current.id, { onDelta: options.onDelta });
       return { ...result, agentKey: target, sessionId: current.id };
     }
@@ -106,7 +106,7 @@ export async function routeAssistantMessage(
     if (!activated.ok) return bridge(activated, current.agentKey, target, false);
     if (request) {
       const result = target === "coordinator"
-        ? await handleAssistantMessage(userId, request, { sessionId: activated.session.id, onDelta: options.onDelta })
+        ? await handleAssistantMessage(userId, request, { sessionId: activated.session.id, view: options.view ?? null, onDelta: options.onDelta })
         : await handleSpecialistMessage(userId, target, request, activated.session.id, { onDelta: options.onDelta });
       return {
         ...result,
@@ -136,7 +136,7 @@ export async function routeAssistantMessage(
         };
       }
       const result = target === "coordinator"
-        ? await handleAssistantMessage(userId, remainder, { sessionId: current.id, onDelta: options.onDelta })
+        ? await handleAssistantMessage(userId, remainder, { sessionId: current.id, view: options.view ?? null, onDelta: options.onDelta })
         : await handleSpecialistMessage(userId, target, remainder, current.id, { onDelta: options.onDelta });
       return { ...result, agentKey: target, sessionId: current.id };
     }
@@ -145,7 +145,7 @@ export async function routeAssistantMessage(
     if (!activated.ok) return bridge(activated, current.agentKey, target, false);
     if (remainder) {
       const result = target === "coordinator"
-        ? await handleAssistantMessage(userId, remainder, { sessionId: activated.session.id, onDelta: options.onDelta })
+        ? await handleAssistantMessage(userId, remainder, { sessionId: activated.session.id, view: options.view ?? null, onDelta: options.onDelta })
         : await handleSpecialistMessage(userId, target, remainder, activated.session.id, { onDelta: options.onDelta });
       return {
         ...result,
@@ -166,7 +166,7 @@ export async function routeAssistantMessage(
   if (briefCommand && current.agentKey !== "coordinator") {
     const context = recentConversationSummary(userId, 8);
     const activated = activateAgentSession(userId, "coordinator", context);
-    const result = await handleAssistantMessage(userId, message, { sessionId: activated.session.id, onDelta: options.onDelta });
+    const result = await handleAssistantMessage(userId, message, { sessionId: activated.session.id, view: options.view ?? null, onDelta: options.onDelta });
     return {
       ...result,
       agentKey: "coordinator",
@@ -176,7 +176,7 @@ export async function routeAssistantMessage(
   }
 
   if (current.agentKey === "coordinator") {
-    const result = await handleAssistantMessage(userId, message, { sessionId: current.id, onDelta: options.onDelta });
+    const result = await handleAssistantMessage(userId, message, { sessionId: current.id, view: options.view ?? null, onDelta: options.onDelta });
     return { ...result, agentKey: "coordinator", sessionId: current.id };
   }
 

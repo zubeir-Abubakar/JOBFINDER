@@ -9,6 +9,7 @@ import { AgentAvatar } from "./AgentAvatar";
 import { UserAvatar } from "./UserAvatar";
 import { logoutAction } from "@/lib/actions/session";
 import { CoordinatorLiveVoice } from "./CoordinatorLiveVoice";
+import { VisualCompanionHost } from "./visual/VisualCompanionHost";
 import type { AgentKey } from "@/lib/agent-definitions";
 
 const ownerNav = [
@@ -207,6 +208,7 @@ export function AppShell({
         </header>
         <div className="page">{children}</div>
       </div>
+      {variant === "app" ? <VisualCompanionHost /> : null}
     </div>
   );
 }
