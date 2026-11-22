@@ -42,7 +42,7 @@ test.afterAll(() => {
   }
 });
 
-test("the two cards show the saved Monday–Friday defaults and change independently", async ({ page, diagnostics }) => {
+test("the two cards show the saved Monday–Saturday 10:00 default and change independently", async ({ page, diagnostics }) => {
   await gotoReady(page, "/settings#scheduling");
   const recruitment = page.getByTestId("recruitment-schedule-card");
   const report = page.getByTestId("report-schedule-card");
@@ -51,14 +51,13 @@ test("the two cards show the saved Monday–Friday defaults and change independe
 
   await expect(recruitment.getByRole("checkbox", { name: "Mon", exact: true })).toBeChecked();
   await expect(recruitment.getByRole("checkbox", { name: "Fri", exact: true })).toBeChecked();
-  await expect(recruitment.getByRole("checkbox", { name: "Sat", exact: true })).not.toBeChecked();
+  await expect(recruitment.getByRole("checkbox", { name: "Sat", exact: true })).toBeChecked();
   await expect(recruitment.getByRole("checkbox", { name: "Sun", exact: true })).not.toBeChecked();
-  await expect(recruitment.locator("select[name='time']")).toHaveValue("09:00");
+  await expect(recruitment.locator("select[name='time']")).toHaveValue("10:00");
   await expect(report.locator("select[name='time']")).toHaveValue("16:00");
 
-  // Change recruitment only: remove Monday, add Saturday, start at 07:30.
+  // Change recruitment only: remove Monday, keep Saturday, start at 07:30.
   await recruitment.getByRole("checkbox", { name: "Mon", exact: true }).uncheck();
-  await recruitment.getByRole("checkbox", { name: "Sat", exact: true }).check();
   await recruitment.locator("select[name='time']").selectOption("07:30");
   await recruitment.getByRole("button", { name: /Save recruitment schedule/i }).click();
   await page.waitForURL(/\/settings\?saved=1/, { timeout: 30_000 });

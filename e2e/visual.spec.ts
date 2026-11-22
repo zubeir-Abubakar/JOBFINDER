@@ -22,7 +22,7 @@ test("a natural-language command opens the dashboard and highlights a real eleme
   await sendCommand(page, "Show me the recruitment pipeline.");
   const banner = page.getByTestId("visual-companion-banner");
   await expect(banner).toBeVisible();
-  await page.waitForURL("**/dashboard");
+  await page.waitForURL("**/applications");
   await expect(banner).toContainText(/Visual companion/i);
 
   const card = page.getByTestId("visual-highlight");

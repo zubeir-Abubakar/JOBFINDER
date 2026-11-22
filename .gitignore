@@ -2,6 +2,7 @@ node_modules/
 .next/
 out/
 data/
+reset-backups/
 .e2e-runtime/
 playwright-report/
 test-results/

@@ -174,3 +174,34 @@ test("regenerating a vacancy adds a version and preserves the earlier documents"
   );
   assert.ok(db.one("SELECT id FROM documents WHERE id = 'doc_master_phase2' AND deleted_at IS NULL"), "the original CV remains untouched");
 });
+
+test("cover-only recovery reuses the validated CV and records its dependency chain", async () => {
+  const before = db.all<{ id: string }>(
+    "SELECT id FROM documents WHERE job_id = 'job_phase2_one' AND kind = 'tailored_cv' AND mime = 'application/pdf' ORDER BY created_at",
+  );
+  assert.ok(before.length >= 2);
+  const latest = before.at(-1)!;
+  const result = await agents.generateApplicationPackage("system", "job_phase2_one", {
+    workflowId,
+    resumeStage: "cover_only",
+  });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.cvDocumentId, latest.id, "the validated CV is reused, not replaced");
+  const after = db.all<{ id: string }>(
+    "SELECT id FROM documents WHERE job_id = 'job_phase2_one' AND kind = 'tailored_cv' AND mime = 'application/pdf'",
+  );
+  assert.equal(after.length, before.length, "cover-only recovery does not generate another CV");
+  const verify = db.one<{ id: string; status: string; output_refs: string | null }>(
+    "SELECT id, status, output_refs FROM tasks WHERE workflow_id = ? AND title = 'Verify reused CV' ORDER BY created_at DESC LIMIT 1",
+    [workflowId],
+  );
+  assert.equal(verify?.status, "completed");
+  assert.match(verify?.output_refs ?? "", /"reused":true/);
+  const cover = db.one<{ depends_on: string | null }>(
+    "SELECT depends_on FROM tasks WHERE workflow_id = ? AND title = 'Generate cover letter' ORDER BY created_at DESC LIMIT 1",
+    [workflowId],
+  );
+  assert.deepEqual(JSON.parse(cover?.depends_on ?? "[]"), [verify?.id]);
+  const app = db.one<{ cv_document_id: string }>("SELECT cv_document_id FROM applications WHERE job_id = 'job_phase2_one'");
+  assert.equal(app?.cv_document_id, latest.id);
+});

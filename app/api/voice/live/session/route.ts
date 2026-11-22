@@ -5,7 +5,7 @@ import {
   liveVoiceConfig,
   safeSessionId,
 } from "@/lib/live-voice";
-import { voiceProfileForAgent } from "@/lib/agent-voices";
+import { effectiveVoiceProfileForAgent } from "@/lib/agent-voice-settings";
 import { randomId } from "@/lib/security";
 
 export const dynamic = "force-dynamic";
@@ -41,7 +41,7 @@ export async function POST(request: Request) {
   const sessionId = safeSessionId(body?.sessionId);
   // The agent assignment is the only source of truth for the voice. A client
   // cannot choose a different voice, which keeps identity and audio aligned.
-  const profile = voiceProfileForAgent(agentKey);
+  const profile = effectiveVoiceProfileForAgent(agentKey);
   const greet = body?.greet !== false;
 
   // Prevent a single page from minting tokens in a tight loop. A reconnect
@@ -83,9 +83,9 @@ export async function GET() {
       configured: config.configured,
       missing: config.missing,
       model: config.model,
-      voice: voiceProfileForAgent("coordinator").voiceName,
+      voice: effectiveVoiceProfileForAgent("coordinator").voiceName,
       voices: ["coordinator", "research", "analysis", "cv", "ats", "cover", "application", "email"].map((key) => {
-        const profile = voiceProfileForAgent(key);
+        const profile = effectiveVoiceProfileForAgent(key);
         return { agentKey: key, voiceId: profile.voiceId, voiceName: profile.voiceName };
       }),
       sessionPrefix: `voice_${randomId().slice(0, 6)}`,

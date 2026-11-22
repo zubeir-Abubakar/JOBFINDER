@@ -8,7 +8,7 @@ import { AssistantChat } from "@/components/AssistantChat";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
 import { AGENT_IDENTITY_KEYS, agentIdentity } from "@/lib/agent-identity";
 import { activeAgentSession } from "@/lib/agent-sessions";
-import { voiceProfileForAgent } from "@/lib/agent-voices";
+import { effectiveVoiceProfileForAgent } from "@/lib/agent-voice-settings";
 import { getOperationalSnapshot } from "@/lib/operations";
 
 export const dynamic = "force-dynamic";
@@ -25,7 +25,7 @@ export default async function AssistantPage({
   const activeIdentity = agentIdentity(active.agentKey);
   const snapshot = await getOperationalSnapshot();
   const runtime = snapshot.agents.find((agent) => agent.key === active.agentKey);
-  const activeVoice = voiceProfileForAgent(active.agentKey);
+  const activeVoice = effectiveVoiceProfileForAgent(active.agentKey);
   const direct = active.agentKey !== "coordinator";
 
   return (

@@ -58,15 +58,15 @@ export const VISUAL_VIEWS: Record<VisualViewKey, { href: string; label: string; 
   dashboard: {
     href: "/dashboard",
     label: "Application dashboard",
-    description: "Primary recruitment metrics, pipeline, workflow and system health.",
+    description: "Four owner metrics and the actionable items that need attention.",
   },
   agents: {
     href: "/agents",
     label: "Agent workspace",
-    description: "The eight agents, their configured and actual providers, and their latest outcomes.",
+    description: "The live Central Command Hub, with the existing agent list one toggle away.",
   },
   agent_activity: {
-    href: "/agents#activity",
+    href: "/agents/list#activity",
     label: "Agent activity",
     description: "Recent workflow runs and the recorded status of every agent.",
   },
@@ -76,9 +76,9 @@ export const VISUAL_VIEWS: Record<VisualViewKey, { href: string; label: string; 
     description: "Stored vacancies with their real match scores and analysis evidence.",
   },
   applications: {
-    href: "/applications#applications",
-    label: "Application tracking",
-    description: "Every application record and its current status.",
+    href: "/applications#board",
+    label: "Application board",
+    description: "Every application record in four Kanban columns.",
   },
   documents: {
     href: "/documents#tailored-documents",
@@ -116,9 +116,9 @@ export const VISUAL_VIEWS: Record<VisualViewKey, { href: string; label: string; 
     description: "Administrator-only provider, model and policy view.",
   },
   workflow: {
-    href: "/dashboard",
+    href: "/agents/list#activity",
     label: "Recruitment workflow",
-    description: "The recorded stages of the latest recruitment workflow.",
+    description: "Agent availability and the recorded stages of the latest workflow.",
   },
 };
 
@@ -126,22 +126,22 @@ export const HIGHLIGHT_TARGETS: Record<HighlightTarget, { label: string; path: s
   "dashboard-metrics": {
     label: "Primary recruitment metrics",
     path: "/dashboard",
-    description: "Jobs discovered, strong matches, interviews and applications awaiting approval, counted from stored records.",
+    description: "Active opportunities, employer-confirmed submissions, interviews and items needing attention, counted from stored records.",
   },
   "recruitment-pipeline": {
-    label: "Recruitment pipeline",
-    path: "/dashboard",
-    description: "Vacancies and applications grouped by their recorded stage.",
+    label: "Applications board",
+    path: "/applications",
+    description: "Applications grouped into Considering, To be applied, Applied and Needs attention.",
   },
   "workflow-timeline": {
-    label: "Workflow stages",
-    path: "/dashboard",
-    description: "The stage timeline for the latest recorded recruitment run. Historical stages are labelled as historical.",
+    label: "Agent roster",
+    path: "/agents/list",
+    description: "Agent availability, current task and the latest recorded workflow history.",
   },
   "system-health": {
-    label: "System health",
-    path: "/dashboard",
-    description: "Provider route, queue and model-policy detail. Collapsed by default.",
+    label: "System status",
+    path: "/agents/list",
+    description: "Actionable agent and workflow status in the owner workspace. Technical diagnostics live in Admin.",
   },
   "job-results": {
     label: "Stored vacancies",
@@ -151,7 +151,7 @@ export const HIGHLIGHT_TARGETS: Record<HighlightTarget, { label: string; path: s
   "application-tracker": {
     label: "Application records",
     path: "/applications",
-    description: "Applications and their current statuses.",
+    description: "Applications grouped into the four owner Kanban columns.",
   },
   "document-library": {
     label: "Document library",
@@ -165,12 +165,12 @@ export const HIGHLIGHT_TARGETS: Record<HighlightTarget, { label: string; path: s
   },
   "agent-roster": {
     label: "Agent roster",
-    path: "/agents",
-    description: "The eight agents with configured and actual provider/model information.",
+    path: "/agents/list",
+    description: "The eight agents with availability, responsibility and current task.",
   },
   "agent-activity": {
     label: "Agent activity",
-    path: "/agents",
+    path: "/agents/list",
     description: "Recent runs and the recorded current task of each agent.",
   },
   "provider-usage": {

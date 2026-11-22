@@ -14,8 +14,9 @@ import { nowIso, one, run } from "./db";
  */
 
 export const RECRUITMENT_TIMEZONE = "Europe/Zurich";
-export const RECRUITMENT_TIME = "09:00";
-export const RECRUITMENT_WEEKDAYS = [1, 2, 3, 4, 5];
+export const RECRUITMENT_TIME = "10:00";
+export const RECRUITMENT_WEEKDAYS = [1, 2, 3, 4, 5, 6];
+export const INCREMENTAL_DISCOVERY_OFFSET_HOURS = [2, 4, 6, 8, 10] as const;
 export const RECRUITMENT_SCHEDULE_KEY = "daily_recruitment";
 export const REPORT_TIME = "16:00";
 export const REPORT_WEEKDAYS = [1, 2, 3, 4, 5];
@@ -29,6 +30,14 @@ export type ZonedParts = {
   hour: number;
   minute: number;
   second: number;
+};
+
+export type RecruitmentRunMode = "full" | "incremental";
+
+export type RecruitmentOccurrence = {
+  scheduledFor: string;
+  time: string;
+  mode: RecruitmentRunMode;
 };
 
 export type ScheduleRow = {
@@ -256,6 +265,52 @@ export function nextDailyRun(now: Date, options: { time?: string; timeZone?: str
   return nextScheduledRun(now, options);
 }
 
+/**
+ * The main discovery is the configured start time. Five incremental
+ * discoveries follow at +2h, +4h, +6h, +8h and +10h. With the required 10:00
+ * start this is exactly 12:00, 14:00, 16:00, 18:00 and 20:00. Times that would
+ * cross local midnight are omitted rather than silently moving to another day.
+ */
+export function recruitmentRunTimes(mainTime = RECRUITMENT_TIME): Array<{ time: string; mode: RecruitmentRunMode }> {
+  const main = parseClockTime(mainTime);
+  const slots: Array<{ time: string; mode: RecruitmentRunMode }> = [];
+  for (const [index, offset] of [0, ...INCREMENTAL_DISCOVERY_OFFSET_HOURS].entries()) {
+    const totalMinutes = main.hour * 60 + main.minute + offset * 60;
+    if (totalMinutes >= 24 * 60) continue;
+    const time = `${String(Math.floor(totalMinutes / 60)).padStart(2, "0")}:${String(totalMinutes % 60).padStart(2, "0")}`;
+    slots.push({ time, mode: index === 0 ? "full" : "incremental" });
+  }
+  return slots;
+}
+
+/** Next main or incremental occurrence, strictly after `now`. */
+export function nextRecruitmentOccurrence(
+  now: Date,
+  options: { time?: string; timeZone?: string; weekdays?: number[] } = {},
+): RecruitmentOccurrence {
+  const timeZone = options.timeZone ?? RECRUITMENT_TIMEZONE;
+  const weekdays = options.weekdays && options.weekdays.length > 0 ? parseWeekdays(options.weekdays) : RECRUITMENT_WEEKDAYS;
+  const slots = recruitmentRunTimes(options.time ?? RECRUITMENT_TIME);
+  let best: RecruitmentOccurrence | null = null;
+  for (const slot of slots) {
+    const candidate = nextScheduledRun(now, { time: slot.time, timeZone, weekdays });
+    if (!best || candidate.getTime() < Date.parse(best.scheduledFor)) {
+      best = { scheduledFor: candidate.toISOString(), time: slot.time, mode: slot.mode };
+    }
+  }
+  // recruitmentRunTimes always contains at least the main slot.
+  return best!;
+}
+
+/** HH:MM in the schedule timezone, used to identify an occurrence. */
+export function localClockTime(value: string | null, timeZone = RECRUITMENT_TIMEZONE): string | null {
+  if (!value) return null;
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return null;
+  const parts = partsOf(date, timeZone);
+  return `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
+}
+
 /** Local calendar date in the schedule timezone, e.g. 2026-11-18. */
 export function localDateKey(date: Date = new Date(), timeZone = RECRUITMENT_TIMEZONE): string {
   const parts = partsOf(date, timeZone);
@@ -276,10 +331,18 @@ function readRow(key: string): ScheduleRow | null {
   return row ? normaliseRow(row) : null;
 }
 
+function nextRunFor(row: Pick<ScheduleRow, "time" | "timezone" | "weekdays">, now: Date, key: string): string {
+  const weekdays = parseWeekdays(row.weekdays);
+  if (key === RECRUITMENT_SCHEDULE_KEY) {
+    return nextRecruitmentOccurrence(now, { time: row.time, timeZone: row.timezone, weekdays }).scheduledFor;
+  }
+  return nextScheduledRun(now, { time: row.time, timeZone: row.timezone, weekdays }).toISOString();
+}
+
 export function ensureSchedule(now: Date = new Date()): ScheduleRow {
   const existing = readRow(RECRUITMENT_SCHEDULE_KEY);
   if (existing) return existing;
-  const next = nextScheduledRun(now, { time: RECRUITMENT_TIME, weekdays: RECRUITMENT_WEEKDAYS });
+  const next = nextRecruitmentOccurrence(now, { time: RECRUITMENT_TIME, weekdays: RECRUITMENT_WEEKDAYS });
   run(
     "INSERT OR IGNORE INTO schedule_jobs (key, label, time, timezone, enabled, weekdays, next_run_at, updated_at) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
     [
@@ -288,7 +351,7 @@ export function ensureSchedule(now: Date = new Date()): ScheduleRow {
       RECRUITMENT_TIME,
       RECRUITMENT_TIMEZONE,
       JSON.stringify(RECRUITMENT_WEEKDAYS),
-      next.toISOString(),
+      next.scheduledFor,
       nowIso(),
     ],
   );
@@ -310,12 +373,11 @@ export function getScheduleRow(key: string, now: Date = new Date()): ScheduleRow
 
 export function setScheduleEnabled(enabled: boolean, now: Date = new Date(), key = RECRUITMENT_SCHEDULE_KEY): ScheduleRow {
   const row = getScheduleRow(key, now);
-  const weekdays = parseWeekdays(row.weekdays);
   run(
     "UPDATE schedule_jobs SET enabled = ?, next_run_at = ?, last_error = NULL, updated_at = ? WHERE key = ?",
     [
       enabled ? 1 : 0,
-      enabled ? nextScheduledRun(now, { time: row.time, timeZone: row.timezone, weekdays }).toISOString() : null,
+      enabled ? nextRunFor({ ...row, weekdays: row.weekdays }, now, key) : null,
       nowIso(),
       key,
     ],
@@ -325,10 +387,9 @@ export function setScheduleEnabled(enabled: boolean, now: Date = new Date(), key
 
 export function setScheduleClock(time: string, timeZone: string, now: Date = new Date(), key = RECRUITMENT_SCHEDULE_KEY): ScheduleRow {
   const row = getScheduleRow(key, now);
-  const weekdays = parseWeekdays(row.weekdays);
   run(
     "UPDATE schedule_jobs SET time = ?, timezone = ?, next_run_at = ?, updated_at = ? WHERE key = ?",
-    [time, timeZone, nextScheduledRun(now, { time, timeZone, weekdays }).toISOString(), nowIso(), key],
+    [time, timeZone, nextRunFor({ time, timezone: timeZone, weekdays: row.weekdays }, now, key), nowIso(), key],
   );
   return getScheduleRow(key, now);
 }
@@ -341,7 +402,7 @@ export function setScheduleWeekdays(weekdays: number[], now: Date = new Date(), 
     [
       JSON.stringify(parseWeekdays(weekdays)),
       row.enabled === 1
-        ? nextScheduledRun(now, { time: row.time, timeZone: row.timezone, weekdays }).toISOString()
+        ? nextRunFor({ ...row, weekdays: JSON.stringify(parseWeekdays(weekdays)) }, now, key)
         : null,
       nowIso(),
       key,
@@ -381,7 +442,7 @@ export function saveScheduleConfiguration(
   }
   const row = getScheduleRow(key, now);
   const next = input.enabled
-    ? nextScheduledRun(now, { time: input.time, timeZone: input.timezone, weekdays }).toISOString()
+    ? nextRunFor({ time: String(input.time), timezone: String(input.timezone), weekdays: JSON.stringify(weekdays) }, now, key)
     : null;
   run(
     `UPDATE schedule_jobs SET enabled = ?, weekdays = ?, time = ?, timezone = ?, next_run_at = ?, updated_at = ?
@@ -404,11 +465,9 @@ export function recordScheduleRun(input: {
   const now = input.now ?? new Date();
   const key = input.key ?? RECRUITMENT_SCHEDULE_KEY;
   const row = getScheduleRow(key, now);
-  const next = nextScheduledRun(now, {
-    time: row.time,
-    timeZone: row.timezone,
-    weekdays: parseWeekdays(row.weekdays),
-  });
+  const next = key === RECRUITMENT_SCHEDULE_KEY
+    ? new Date(nextRecruitmentOccurrence(now, { time: row.time, timeZone: row.timezone, weekdays: parseWeekdays(row.weekdays) }).scheduledFor)
+    : nextScheduledRun(now, { time: row.time, timeZone: row.timezone, weekdays: parseWeekdays(row.weekdays) });
   run(
     `UPDATE schedule_jobs SET last_run_at = ?, last_run_id = ?, last_status = ?, last_error = ?, next_run_at = ?,
        last_scheduled_for = COALESCE(?, last_scheduled_for), updated_at = ? WHERE key = ?`,
@@ -435,7 +494,12 @@ export type ScheduleSnapshot = {
   weekdays: number[];
   weekdayLabels: string[];
   runsToday: boolean;
+  /** Main run followed by the persisted incremental slots. */
+  slotTimes: string[];
+  incrementalTimes: string[];
   nextRunAt: string | null;
+  nextRunMode: RecruitmentRunMode | null;
+  nextRunTime: string | null;
   due: boolean;
   overdueMs: number;
   missed: boolean;
@@ -459,6 +523,9 @@ export function scheduleSnapshot(now: Date = new Date(), key = RECRUITMENT_SCHED
   const overdueMs = enabled && Number.isFinite(next) ? now.getTime() - next : 0;
   const due = runsToday && Number.isFinite(next) && overdueMs >= 0;
   const windowMs = catchUpWindowHours() * 3600_000;
+  const slots = key === RECRUITMENT_SCHEDULE_KEY ? recruitmentRunTimes(row.time) : [];
+  const nextClock = localClockTime(row.next_run_at, row.timezone);
+  const nextSlot = slots.find((slot) => slot.time === nextClock) ?? null;
   return {
     key: row.key,
     label: row.label,
@@ -468,7 +535,11 @@ export function scheduleSnapshot(now: Date = new Date(), key = RECRUITMENT_SCHED
     weekdays,
     weekdayLabels: weekdays.map(weekdayLabel),
     runsToday,
+    slotTimes: slots.map((slot) => slot.time),
+    incrementalTimes: slots.filter((slot) => slot.mode === "incremental").map((slot) => slot.time),
     nextRunAt: row.next_run_at,
+    nextRunMode: nextSlot?.mode ?? null,
+    nextRunTime: nextSlot?.time ?? null,
     due,
     overdueMs: Math.max(0, overdueMs),
     // A missed run stays recoverable inside the catch-up window. Beyond it the

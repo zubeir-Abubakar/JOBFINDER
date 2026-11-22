@@ -12,6 +12,12 @@ import { voiceProfileForAgent, type LiveVoiceId } from "@/lib/agent-voices";
 import { isIntentionalBargeIn, mergeTranscript, reconnectDelay } from "@/lib/voice-stream";
 import { dispatchVisualCommand, exitVisualMode, startVisualWalkthrough, useVisualSession } from "@/lib/visual-session";
 import { visualViewForPath, type VisualCommand } from "@/lib/visual-types";
+import {
+  LEGACY_LIVE_VOICE_SESSION_KEY,
+  LIVE_VOICE_SESSION_KEY,
+  resumableCoordinatorSession,
+  serializeVoiceSession,
+} from "@/lib/voice-session";
 import { ProviderStatusPill } from "./visual/ProviderStatusPill";
 
 const CosmicOrb = dynamic(() => import("./CosmicOrb"), {
@@ -76,8 +82,6 @@ const STATUS: Record<LiveState, { label: string; hint: string; tone: string }> =
   error: { label: "Unavailable", hint: "Live voice could not start.", tone: "bad" },
 };
 
-const SESSION_KEY = "atw.live.session.v1";
-
 type VoiceDiagnosticDetail = Record<string, string | number | boolean | null>;
 type VoiceDiagnosticEvent = { event: string; at: string; detail?: VoiceDiagnosticDetail };
 
@@ -119,9 +123,12 @@ function base64ToInt16(base64: string): Int16Array {
 export function CoordinatorLiveVoice({
   initialMessages,
   initialAgentKey = "coordinator",
+  voiceProfiles,
 }: {
   initialMessages: Msg[];
   initialAgentKey?: AgentKey;
+  /** Admin-selected voice overrides, resolved on the server. */
+  voiceProfiles?: Partial<Record<string, { voiceId: string; voiceName: string }>>;
 }) {
   const [open, setOpen] = useState(false);
   const [state, setState] = useState<LiveState>("idle");
@@ -222,8 +229,13 @@ export function CoordinatorLiveVoice({
 
   useEffect(() => {
     try {
-      const savedSession = window.sessionStorage.getItem(SESSION_KEY);
-      if (savedSession && /^voice_[A-Za-z0-9_-]{6,80}$/.test(savedSession)) sessionIdRef.current = savedSession;
+      const raw = window.sessionStorage.getItem(LIVE_VOICE_SESSION_KEY);
+      const resumable = resumableCoordinatorSession(raw);
+      if (resumable) sessionIdRef.current = resumable;
+      else if (raw) window.sessionStorage.removeItem(LIVE_VOICE_SESSION_KEY);
+      // The legacy value was a bare id with no agent identity, so it cannot be
+      // verified and is never resumed as Coordinator history.
+      window.sessionStorage.removeItem(LEGACY_LIVE_VOICE_SESSION_KEY);
     } catch {
       // Private mode: the session still works without persistence.
     }
@@ -978,7 +990,10 @@ export function CoordinatorLiveVoice({
       sessionIdRef.current = payload.sessionId;
       setModel(payload.model || "Gemini Live");
       try {
-        window.sessionStorage.setItem(SESSION_KEY, payload.sessionId);
+        window.sessionStorage.setItem(
+          LIVE_VOICE_SESSION_KEY,
+          serializeVoiceSession(payload.sessionId, payload.agentKey),
+        );
       } catch {
         // Ignore private-mode storage failures.
       }
@@ -1032,7 +1047,7 @@ export function CoordinatorLiveVoice({
       reportedUsage.current = { prompt: 0, response: 0, total: 0 };
       resumptionHandle.current = "";
       try {
-        window.sessionStorage.setItem(SESSION_KEY, sessionIdRef.current);
+        window.sessionStorage.setItem(LIVE_VOICE_SESSION_KEY, serializeVoiceSession(sessionIdRef.current, agentKey));
       } catch {
         // Ignore.
       }
@@ -1197,6 +1212,13 @@ export function CoordinatorLiveVoice({
       return;
     }
     setLegacyOpen(false);
+    // The persistent launcher is always a fresh Coordinator conversation. A
+    // specialist can only be reached through an explicit handoff or the direct
+    // text conversation; a previous handoff never becomes the global default.
+    if (!live) {
+      setActiveAgent("coordinator");
+      activeAgentRef.current = "coordinator";
+    }
     setOpen(true);
     if (!window.isSecureContext) {
       setError("Live voice requires a secure HTTPS origin. Open the app over HTTPS and try again; the browser does not grant microphone access on plain HTTP.");
@@ -1204,7 +1226,7 @@ export function CoordinatorLiveVoice({
       return;
     }
     if (state === "idle" || state === "disconnected" || state === "error") {
-      void startLive(activeAgentRef.current, { greet: true, fresh: true, preserveMessages: false });
+      void startLive("coordinator", { greet: true, fresh: true, preserveMessages: false });
     }
   }
 
@@ -1247,7 +1269,7 @@ export function CoordinatorLiveVoice({
   const micActive = state === "listening" || state === "speaking" || state === "processing" || state === "interrupted";
   const connected = micActive;
   const badgeTone = state === "error" ? "badge-bad" : state === "speaking" || state === "listening" ? "badge-good" : "badge-info";
-  const activeProfile = voiceProfileForAgent(activeAgent);
+  const activeProfile = { ...voiceProfileForAgent(activeAgent), ...(voiceProfiles?.[activeAgent] ?? {}) };
   const activeIdentity = agentIdentity(activeAgent);
   const activeRole = activeIdentity.title;
   const orbState: OrbState = state === "idle" ? "IDLE"

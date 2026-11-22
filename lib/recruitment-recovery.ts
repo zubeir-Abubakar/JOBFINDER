@@ -105,6 +105,18 @@ export function enqueueDocumentRecovery(input: {
   return { queued: true, id };
 }
 
+function hasValidatedCv(jobId: string): boolean {
+  return Boolean(
+    one<{ id: string }>(
+      `SELECT id FROM documents
+       WHERE job_id = ? AND kind = 'tailored_cv' AND mime = 'application/pdf'
+         AND deleted_at IS NULL AND quality_status = 'passed'
+       ORDER BY created_at DESC LIMIT 1`,
+      [jobId],
+    ),
+  );
+}
+
 function documentsPassed(jobId: string): boolean {
   const rows = all<{ kind: string; quality_status: string | null }>(
     "SELECT kind, quality_status FROM documents WHERE job_id = ? AND deleted_at IS NULL AND kind IN ('tailored_cv','cover_letter')",
@@ -150,7 +162,7 @@ function completeRecovery(row: RecoveryRow, pkg: PackageOutcome): void {
  * production uses the real document generator.
  */
 export async function processRecoveryQueue(options: {
-  prepare?: (jobId: string, workflowId: string | null) => Promise<PackageOutcome>;
+  prepare?: (jobId: string, workflowId: string | null, resumeStage?: "cover_only") => Promise<PackageOutcome>;
   now?: Date;
   limit?: number;
 } = {}): Promise<{ attempted: number; completed: number; retryScheduled: number; waitingIntervention: number }> {
@@ -161,7 +173,8 @@ export async function processRecoveryQueue(options: {
   const now = options.now ?? new Date();
   const prepare =
     options.prepare ??
-    (async (jobId: string, workflowId: string | null) => generateApplicationPackage(ownerId(), jobId, { workflowId: workflowId ?? undefined }));
+    (async (jobId: string, workflowId: string | null, resumeStage?: "cover_only") =>
+      generateApplicationPackage(ownerId(), jobId, { workflowId: workflowId ?? undefined, resumeStage }));
   let attempted = 0;
   let completed = 0;
   let retryScheduled = 0;
@@ -193,7 +206,11 @@ export async function processRecoveryQueue(options: {
         continue;
       }
       try {
-        const pkg = await prepare(row.job_id, runRow.workflow_id);
+        // Stage-aware recovery: when the CV already passed its gate, retry only
+        // the cover-letter stage and its readiness projection. A validated CV is
+        // never regenerated merely because a downstream task failed.
+        const resumeStage = hasValidatedCv(row.job_id) ? "cover_only" : undefined;
+        const pkg = await prepare(row.job_id, runRow.workflow_id, resumeStage);
         if (!pkg.ok) throw new Error(pkg.message);
         completeRecovery(row, pkg);
         completed += 1;

@@ -73,9 +73,10 @@ A localhost endpoint works only while `npm run dev` or `npm run start` and Ollam
 
 ## Implementation status
 
-**Implemented and tested** — persistent, configurable recruitment schedule
-(default Monday–Friday at 09:00 Europe/Zurich) with DST handling, catch-up
-window and missed-run records; the Chief Coordinator run with
+**Implemented and tested** — persistent recruitment schedule (Monday–Saturday;
+main discovery at 10:00 Europe/Zurich and incremental discovery at 12:00, 14:00,
+16:00, 18:00 and 20:00) with DST handling, catch-up window and missed-run records;
+the Chief Coordinator run with
 its ten-section report and agent assignments; deterministic eligibility rules;
 the 85% floor; tailored CV and cover-letter generation; the ATS/quality gate;
 evidence-based submission states and duplicate blocking; discovery-only manual
@@ -89,7 +90,8 @@ public feeds are configured, and a live discovery run has stored real vacancies.
 
 **Requires additional configuration** — `RECRUITMENT_SUBMISSION_ENDPOINT` (without
 it, every package is queued for a human and nothing is sent); a running host or
-host cron at the configured recruitment time (default 09:00 Europe/Zurich);
+host cron at each configured recruitment time (default 10:00, 12:00, 14:00,
+16:00, 18:00 and 20:00 Europe/Zurich, Monday–Saturday);
 further board identifiers or career-page URLs
 to widen coverage; Gmail credentials for inbox tracking.
 
@@ -134,8 +136,9 @@ lib/assistant.ts      coordinator command interpreter
 
 The Chief Coordinator owns a full recruitment run. It is started by a persistent,
 configurable schedule (`schedule_jobs` in SQLite), not by a browser tab or an
-in-memory timer. The default is **Monday–Friday at 09:00 Europe/Zurich**; the
-weekdays and local time can be changed in **Settings → Scheduling**. The schedule,
+in-memory timer. The default is **Monday–Saturday, main discovery at 10:00
+Europe/Zurich with incremental runs at 12:00, 14:00, 16:00, 18:00 and 20:00**; the
+main time and weekdays can be changed in **Settings → Scheduling**. The schedule,
 every run, every agent assignment, every vacancy decision and every submission
 attempt are stored, so a restart does not lose them. Days that are not selected
 are true rest days: scheduled discovery, document generation and submission do
@@ -170,9 +173,10 @@ not run and consume no scheduled inference tokens.
   submission. Without it, packages are prepared and queued for a human; nothing
   is marked as submitted.
 - The scheduler runs inside this application. The Mac and the app/worker must be
-  running at a configured recruitment time (default 09:00 Europe/Zurich). The
-  database keeps the schedule and records a missed run instead of silently
-  skipping it. For a future Vercel deployment the
+  running at each configured recruitment time (default 10:00, 12:00, 14:00,
+  16:00, 18:00 and 20:00 Europe/Zurich, Monday–Saturday). The database keeps the
+  schedule and records a missed run instead of silently skipping it. For a future
+  Vercel deployment the
   same tick is available at `GET/POST /api/cron/recruitment` (send
   `Authorization: Bearer $CRON_SECRET` when `CRON_SECRET` is set).
 

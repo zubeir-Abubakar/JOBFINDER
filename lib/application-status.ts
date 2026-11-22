@@ -128,11 +128,115 @@ export function submissionBlockedReason(input: {
   return null;
 }
 
+/**
+ * Statuses that describe what happens after an employer has received the
+ * application. None of them may be entered from a bare status change: the
+ * record must already carry verified employer evidence.
+ */
+export const POST_SUBMISSION_STATUSES = [
+  "submitted",
+  "acknowledged",
+  "interview",
+  "interview_invited",
+  "interview_completed",
+  "offer_received",
+] as const;
+
+export function statusRequiresVerifiedSubmission(status: string): boolean {
+  return (POST_SUBMISSION_STATUSES as readonly string[]).includes(status);
+}
+
+/** Verified submission evidence is a stored timestamp plus an employer reference. */
+export function hasVerifiedSubmissionEvidence(input: {
+  submitted_at: string | null;
+  confirmation: string | null;
+}): boolean {
+  return Boolean(input.submitted_at) && Boolean(input.confirmation);
+}
+
+export type SubmissionEvidenceState = "verified" | "partial" | "none";
+
+/**
+ * `partial` means an attempt left a timestamp or a reference behind, but not the
+ * pair required for confirmation. It never counts as employer-confirmed.
+ */
+export function submissionEvidenceState(input: {
+  submitted_at: string | null;
+  confirmation: string | null;
+}): SubmissionEvidenceState {
+  if (hasVerifiedSubmissionEvidence(input)) return "verified";
+  if (input.submitted_at || input.confirmation) return "partial";
+  return "none";
+}
+
+/** Owner-facing label. Never infers confirmation from a status or portal name. */
+export function submissionEvidenceLabel(input: {
+  submitted_at: string | null;
+  confirmation: string | null;
+}): string {
+  const state = submissionEvidenceState(input);
+  if (state === "verified") return "Employer-confirmed";
+  if (state === "partial") return "Attempted — not verified";
+  return "No verified submission evidence";
+}
+
 /** Verified submission: submitted status, timestamp and employer reference all present. */
 export function isApplicationSubmitted(input: {
   status: string;
   submitted_at: string | null;
   confirmation: string | null;
 }): boolean {
-  return input.status === "submitted" && Boolean(input.submitted_at) && Boolean(input.confirmation);
+  return input.status === "submitted" && hasVerifiedSubmissionEvidence(input);
+}
+
+export type StatusTransitionDecision =
+  | { allowed: true }
+  | { allowed: false; reason: string };
+
+/**
+ * The single authoritative lifecycle rule. Every status pathway (the detail
+ * dropdown, the Kanban drop target and any future caller) must use this.
+ *
+ * Evidence is read from the persisted record, never from the requested status,
+ * a document, a note or a browser action. A failed decision leaves the stored
+ * status untouched.
+ */
+export function validateApplicationStatusTransition(input: {
+  currentStatus: string;
+  nextStatus: string;
+  submitted_at: string | null;
+  confirmation: string | null;
+  readiness?: string | null;
+}): StatusTransitionDecision {
+  if (!(APPLICATION_STATUSES as readonly string[]).includes(input.nextStatus)) {
+    return { allowed: false, reason: "That is not a recognised application status." };
+  }
+  // Evidence is checked before the no-op case: a legacy `submitted` row without
+  // evidence is still not allowed to be presented as an Applied record.
+  if (input.nextStatus === "submitted" && !hasVerifiedSubmissionEvidence(input)) {
+    return {
+      allowed: false,
+      reason:
+        "Applied requires a verified employer confirmation. Record the employer's confirmation reference with the submission form; a status change alone cannot mark an application as submitted.",
+    };
+  }
+
+  if (statusRequiresVerifiedSubmission(input.nextStatus) && !hasVerifiedSubmissionEvidence(input)) {
+    return {
+      allowed: false,
+      reason: `${statusLabel(input.nextStatus)} requires verified employer confirmation (a stored submission time and reference). This application has none, so it stays ${statusLabel(input.currentStatus)}. Record the confirmation first or correct the record.`,
+    };
+  }
+
+  if (input.nextStatus === input.currentStatus) return { allowed: true };
+
+  if (input.nextStatus === "ready_to_submit" && !readinessAllowsSubmission(input.readiness)) {
+    return {
+      allowed: false,
+      reason:
+        "The readiness checklist has not passed. Re-run the quality check before marking this application ready to send.",
+    };
+  }
+
+  return { allowed: true };
 }

@@ -20,6 +20,7 @@ import { emitWorkflowEvent } from "./events";
 import { workflowAccessibleTo, type WorkflowActor } from "./workflow-view";
 import { agentIdentity } from "./agent-identity";
 import { workflowOrderLabel } from "./workflow-stages";
+import { recoverStalledTasks } from "./task-recovery";
 
 /**
  * Sequential workflow runner. One recruitment workflow executes at a time so an
@@ -33,7 +34,6 @@ type QueueItem = { workflowId: string; job: () => Promise<void> };
 type WorkflowGlobal = typeof globalThis & {
   __atwQueue?: QueueItem[];
   __atwDraining?: boolean;
-  __atwRecovered?: boolean;
 };
 
 const g = globalThis as WorkflowGlobal;
@@ -64,12 +64,8 @@ async function drain() {
   }
 }
 
-export function recoverInterruptedRuns(): void {
-  if (g.__atwRecovered) return;
-  g.__atwRecovered = true;
-  const ts = nowIso();
-  run("UPDATE tasks SET status = 'failed', error = COALESCE(error, 'Interrupted by a server restart'), finished_at = ? WHERE status IN ('running','working')", [ts]);
-  run("UPDATE workflows SET status = 'paused', error = 'Interrupted by a server restart. Resume or retry.', finished_at = ? WHERE status IN ('running','queued')", [ts]);
+export function recoverInterruptedRuns(now: Date = new Date()) {
+  return recoverStalledTasks(now);
 }
 
 function control(workflowId: string) {

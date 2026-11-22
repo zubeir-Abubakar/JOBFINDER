@@ -1,0 +1,89 @@
+{
+  "checks": [
+    {
+      "name": "More group is present (case-insensitive rendered text)",
+      "ok": true,
+      "detail": [
+        {
+          "text": "Workspace",
+          "transform": "uppercase"
+        },
+        {
+          "text": "More",
+          "transform": "uppercase"
+        }
+      ]
+    },
+    {
+      "name": "Application record total agrees with displayed matching records",
+      "ok": false,
+      "error": "13 application records. Showing 14 matching records."
+    },
+    {
+      "name": "Applied header count equals rendered Applied cards",
+      "ok": false,
+      "error": "header 3, cards 4"
+    },
+    {
+      "name": "Unverified submission is not labelled Employer-confirmed",
+      "ok": false,
+      "error": "Record summary says Employer-confirmed for submission_unverified"
+    },
+    {
+      "name": "Mobile Needs-attention table does not require hidden horizontal scrolling",
+      "ok": false,
+      "error": "table hides nullpx inside a horizontal scroller: {\"tableWidth\":484.4375,\"lastHeaderRight\":431.0625,\"viewport\":390,\"overflow\":null}"
+    },
+    {
+      "name": "Floating voice launcher does not overlap agent card actions at 390px",
+      "ok": false,
+      "error": "launcher {\"x\":318,\"y\":772,\"width\":56,\"height\":56} overlaps Details {\"x\":226.015625,\"y\":770.6875,\"width\":113.984375,\"height\":44}"
+    },
+    {
+      "name": "Cover-letter filter returns only cover-letter rows",
+      "ok": true,
+      "detail": [
+        "Cover letter",
+        "Cover letter",
+        "Cover letter",
+        "Cover letter",
+        "Cover letter"
+      ]
+    },
+    {
+      "name": "Audit Kora agent filter matches stored agent events",
+      "ok": true,
+      "detail": {
+        "uiRows": 4,
+        "expected": 4
+      }
+    }
+  ],
+  "failures": [
+    {
+      "name": "Application record total agrees with displayed matching records",
+      "ok": false,
+      "error": "13 application records. Showing 14 matching records."
+    },
+    {
+      "name": "Applied header count equals rendered Applied cards",
+      "ok": false,
+      "error": "header 3, cards 4"
+    },
+    {
+      "name": "Unverified submission is not labelled Employer-confirmed",
+      "ok": false,
+      "error": "Record summary says Employer-confirmed for submission_unverified"
+    },
+    {
+      "name": "Mobile Needs-attention table does not require hidden horizontal scrolling",
+      "ok": false,
+      "error": "table hides nullpx inside a horizontal scroller: {\"tableWidth\":484.4375,\"lastHeaderRight\":431.0625,\"viewport\":390,\"overflow\":null}"
+    },
+    {
+      "name": "Floating voice launcher does not overlap agent card actions at 390px",
+      "ok": false,
+      "error": "launcher {\"x\":318,\"y\":772,\"width\":56,\"height\":56} overlaps Details {\"x\":226.015625,\"y\":770.6875,\"width\":113.984375,\"height\":44}"
+    }
+  ]
+}

@@ -6,6 +6,13 @@ import {
   unsupportedTechClaims,
   workAuthorisationRequired,
 } from "./claim-validation";
+import {
+  coverLetterLengthIssues,
+  letterBodyFromRenderedText,
+  measureCoverLetterText,
+  resolveCoverLetterRequirements,
+  type CoverLetterRequirements,
+} from "./cover-letter-requirements";
 
 /**
  * Evidence-based application readiness.
@@ -62,6 +69,7 @@ export type ReadinessInput = {
     eligibilityNotes: string | null;
     matchScore: number | null;
     analysis: JobAnalysis | null;
+    coverLetterRequirements?: CoverLetterRequirements;
   };
   application: {
     id: string;
@@ -261,6 +269,34 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
       "Cover letter passed its document-quality gate",
       coverQualityOk,
       qualityDetail(input.cover, "Cover letter"),
+    ),
+  );
+
+  const coverRequirements =
+    job.coverLetterRequirements ?? resolveCoverLetterRequirements({ description: job.description });
+  const coverMeasurement = measureCoverLetterText(letterBodyFromRenderedText(coverText));
+  // The document-quality gate owns the internal 180–320 professional default.
+  // Readiness re-checks only an explicit employer instruction, so a historical
+  // document that already passed its quality gate is not retroactively failed
+  // by an internal preference that was never a recruiter requirement.
+  const coverLengthProblems =
+    coverRequirements.source === "recruiter"
+      ? coverLetterLengthIssues(coverMeasurement, coverRequirements)
+      : [];
+  items.push(
+    item(
+      "cover_length",
+      coverRequirements.source === "recruiter"
+        ? "Cover letter follows the recruiter's length instruction"
+        : "No recruiter cover-letter length limit was stated",
+      coverLengthProblems.length === 0,
+      coverLengthProblems.length > 0
+        ? coverLengthProblems.map((problem) => problem.message).join(" ")
+        : coverRequirements.source === "recruiter"
+          ? `${coverMeasurement.words} words / ${coverMeasurement.characters} characters verified against the explicit recruiter instruction${
+              coverRequirements.evidence.length ? ` (${coverRequirements.evidence[0]})` : ""
+            }.`
+          : "The internal 180–320 word professional default is enforced by the document-quality gate and is not represented as a recruiter requirement.",
     ),
   );
 

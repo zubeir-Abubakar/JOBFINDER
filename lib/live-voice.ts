@@ -15,7 +15,8 @@ import { agentDefinition, type AgentKey } from "./agent-definitions";
 import { agentIdentity, agentKeyForName, agentRoster } from "./agent-identity";
 import { handleAssistantMessage } from "./assistant";
 import { pauseRunningWorkflow, resumeLatestWorkflow, stopRunningWorkflow, workflowActor } from "./workflow";
-import { LIVE_VOICE_IDS, voiceProfileForAgent, type LiveVoiceId } from "./agent-voices";
+import { LIVE_VOICE_IDS, type LiveVoiceId } from "./agent-voices";
+import { effectiveVoiceProfileForAgent } from "./agent-voice-settings";
 import { activateAgentSession, recentConversationSummary } from "./agent-sessions";
 import { getOperationalSnapshot, operationsBrief } from "./operations";
 import { latestWorkflowSnapshotForUser } from "./workflow-view";
@@ -165,7 +166,7 @@ function personaInstruction(userId: string, agentKey: AgentKey, sessionId: strin
   const name = ownerName(userId);
   const history = recentVoiceHistory(userId, sessionId);
   const isCoordinator = agentKey === "coordinator";
-  const voiceProfile = voiceProfileForAgent(agentKey);
+  const voiceProfile = effectiveVoiceProfileForAgent(agentKey);
   const common = [
     `You are ${identity.name}, ${identity.title}, speaking live by voice inside AT AI Workforce.`,
     `Your assigned voice is ${voiceProfile.voiceName} (${voiceProfile.voiceId}). Never claim a different voice; the server fixes the voice per agent.`,
@@ -472,7 +473,7 @@ export async function createLiveSession(input: {
   }
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new LiveVoiceError("Live voice is not configured.");
-  const profile = voiceProfileForAgent(input.agentKey);
+  const profile = effectiveVoiceProfileForAgent(input.agentKey);
 
   const connectConfig = liveConfig(input.userId, input.agentKey, input.sessionId, profile.voiceId);
   const now = Date.now();
@@ -652,7 +653,7 @@ export async function executeLiveTool(input: {
     if (target === agentKey) return { response: { ok: false, error: "You are already speaking with that specialist." } };
     const activation = activateAgentSession(userId, target, recentConversationSummary(userId, 8));
     if (!activation.ok) return { response: { ok: false, error: activation.reason } };
-    const profile = voiceProfileForAgent(target);
+    const profile = effectiveVoiceProfileForAgent(target);
     return {
       response: {
         ok: true,
@@ -670,7 +671,7 @@ export async function executeLiveTool(input: {
     if (agentKey === "coordinator") return { response: { ok: false, error: `You are already speaking with ${agentIdentity("coordinator").name}, the ${agentIdentity("coordinator").title}.` } };
     const activation = activateAgentSession(userId, "coordinator", recentConversationSummary(userId, 8));
     if (!activation.ok) return { response: { ok: false, error: activation.reason } };
-    const profile = voiceProfileForAgent("coordinator");
+    const profile = effectiveVoiceProfileForAgent("coordinator");
     return {
       response: { ok: true, agentKey: "coordinator", agent: agentIdentity("coordinator").name, voice: profile.voiceName, message: `Returning to ${agentIdentity("coordinator").name}, ${agentIdentity("coordinator").title}, with voice ${profile.voiceName}.` },
       handoff: { agentKey: "coordinator" },

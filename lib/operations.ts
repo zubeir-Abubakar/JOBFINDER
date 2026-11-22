@@ -8,7 +8,7 @@ import { formatInZone, scheduleSnapshot } from "./recruitment-schedule";
 import { sourceHealth } from "./recruitment-discovery";
 import { accountStatus, gmailMissing } from "./gmail";
 import { getSetting } from "./settings";
-import { voiceProfileForAgent } from "./agent-voices";
+import { effectiveVoiceProfileForAgent } from "./agent-voice-settings";
 import { capabilitiesForAgent, permissionBrief, type AgentCapability } from "./agent-capabilities";
 import { notificationQueueSnapshot } from "./notify";
 import { recoverySnapshot } from "./recruitment-recovery";
@@ -62,7 +62,7 @@ export type OperationalAgent = {
   aiFailureCount: number;
   tokenUsageToday: number;
   tools: string[];
-  voice: ReturnType<typeof voiceProfileForAgent>;
+  voice: ReturnType<typeof effectiveVoiceProfileForAgent>;
   availability: { available: boolean; dependency: string | null; reason: string | null };
   capabilities: AgentCapability[];
   usageSource: string | null;
@@ -411,7 +411,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
       aiFailureCount: Number(row.ai_failure_count),
       tokenUsageToday: Number(usageRow?.tokens ?? 0),
       tools: definition?.tools ?? [],
-      voice: voiceProfileForAgent(row.key),
+      voice: effectiveVoiceProfileForAgent(row.key),
       availability: {
         available: availability.available,
         dependency: availability.dependency,

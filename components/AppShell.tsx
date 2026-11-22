@@ -5,24 +5,21 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { Brand, Icon } from "./icons";
 import { ThemeToggle } from "./ThemeToggle";
-import { AgentAvatar } from "./AgentAvatar";
 import { UserAvatar } from "./UserAvatar";
 import { logoutAction } from "@/lib/actions/session";
 import { CoordinatorLiveVoice } from "./CoordinatorLiveVoice";
 import { VisualCompanionHost } from "./visual/VisualCompanionHost";
-import type { AgentKey } from "@/lib/agent-definitions";
 
 const ownerNav = [
-  { group: "Recruitment" },
-  { href: "/dashboard", label: "Dashboard", icon: "dashboard" },
-  { href: "/recruitment", label: "Autonomous recruitment", icon: "agents" },
-  { href: "/jobs", label: "Job discovery", icon: "jobs" },
-  { href: "/applications", label: "Applications", icon: "applications" },
   { group: "Workspace" },
-  { href: "/documents", label: "CV & documents", icon: "docs" },
-  { href: "/profile", label: "Professional profile", icon: "users" },
-  { group: "Intelligence" },
-  { href: "/agents", label: "AI agents", icon: "agents" },
+  { href: "/dashboard", label: "Overview", icon: "dashboard" },
+  { href: "/applications", label: "Applications", icon: "applications" },
+  { href: "/jobs", label: "Job discovery", icon: "jobs" },
+  { href: "/documents", label: "Documents", icon: "docs" },
+  { href: "/agents", label: "Agents", icon: "agents" },
+  { href: "/profile", label: "My profile", icon: "users" },
+  { group: "More" },
+  { href: "/recruitment", label: "Recruitment runs", icon: "agents" },
   { href: "/analytics", label: "Analytics", icon: "analytics" },
   { href: "/settings", label: "Settings", icon: "settings" },
 ];
@@ -30,14 +27,15 @@ const ownerNav = [
 const adminNav = [
   { group: "Administration" },
   { href: "/admin", label: "System overview", icon: "admin" },
-  { href: "/admin/users", label: "User accounts", icon: "users" },
-  { href: "/admin/agents", label: "Agent management", icon: "agents" },
-  { href: "/admin/ai", label: "AI & API config", icon: "settings" },
-  { href: "/admin/email", label: "Email & reports", icon: "mail" },
+  { href: "/admin/agents", label: "Agents & voice", icon: "agents" },
+  { href: "/admin/ai", label: "AI models & providers", icon: "settings" },
+  { href: "/admin/diagnostics", label: "Diagnostics", icon: "analytics" },
   { href: "/admin/integrations", label: "Integrations", icon: "settings" },
+  { href: "/admin/email", label: "Email & delivery", icon: "mail" },
   { href: "/admin/storage", label: "Storage & retention", icon: "database" },
   { href: "/admin/security", label: "Security", icon: "shield" },
-  { href: "/admin/audit", label: "Audit logs", icon: "logs" },
+  { href: "/admin/audit", label: "Audit explorer", icon: "logs" },
+  { href: "/admin/users", label: "User accounts", icon: "users" },
 ];
 
 export function AppShell({
@@ -46,14 +44,14 @@ export function AppShell({
   variant = "app",
   unreadCount = 0,
   assistantMessages = [],
-  activeAgentKey = "coordinator",
+  voiceProfiles,
 }: {
   children: React.ReactNode;
   user: { name: string; email: string; role: string; avatarUrl?: string | null };
   variant?: "app" | "admin";
   unreadCount?: number;
   assistantMessages?: Array<{ id: number; role: string; content: string; created_at: string }>;
-  activeAgentKey?: AgentKey;
+  voiceProfiles?: Partial<Record<string, { voiceId: string; voiceName: string }>>;
 }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
@@ -167,16 +165,16 @@ export function AppShell({
             </span>
           </div>
           <div className="header-actions">
-            {variant === "app" ? <CoordinatorLiveVoice initialMessages={assistantMessages} initialAgentKey={activeAgentKey} /> : null}
-            {variant === "admin" ? (
+            {variant === "app" ? (
+              <CoordinatorLiveVoice
+                initialMessages={assistantMessages}
+                voiceProfiles={voiceProfiles}
+              />
+            ) : (
               <Link href="/dashboard" className="btn btn-ghost btn-sm header-role-link">
                 Owner workspace
               </Link>
-            ) : user.role === "admin" ? (
-              <Link href="/admin" className="btn btn-ghost btn-sm header-admin-link">
-                Admin console
-              </Link>
-            ) : null}
+            )}
             <span className="topbar-utility">
               <ThemeToggle />
             </span>
@@ -196,11 +194,6 @@ export function AppShell({
                   <span className="header-cta-label header-label-desktop">Inbox</span>
                   <span className="header-cta-label header-label-mobile">Inbox</span>
                   {unreadCount > 0 ? <span className="header-unread" aria-hidden>{unreadCount > 9 ? "9+" : unreadCount}</span> : null}
-                </Link>
-                <Link href="/assistant" className={`header-cta header-ai ${pathname === "/assistant" ? "active" : ""}`} aria-label="AI messages" aria-current={pathname === "/assistant" ? "page" : undefined}>
-                  <AgentAvatar agentKey="coordinator" status="idle" size={26} />
-                  <span className="header-cta-label header-label-desktop">AI Assistance</span>
-                  <span className="header-cta-label header-label-mobile">AI Message</span>
                 </Link>
               </>
             ) : null}

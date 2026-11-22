@@ -1,0 +1,513 @@
+{
+  "generatedAt": "2026-11-22T08:57:14.915Z",
+  "fixture": {
+    "apps": 14,
+    "columns": {
+      "considering": 3,
+      "to_apply": 3,
+      "applied": 4,
+      "needs_attention": 3,
+      "closed": 1
+    },
+    "auditTotal": 135,
+    "documents": 13,
+    "generatedDocuments": 12,
+    "savedVoiceOverride": null,
+    "voiceProbe": {
+      "configured": true,
+      "missing": [],
+      "model": "gemini-3.8-live",
+      "voice": "Charon — informative, calm",
+      "voices": [
+        {
+          "agentKey": "coordinator",
+          "voiceId": "Charon",
+          "voiceName": "Charon — informative, calm"
+        },
+        {
+          "agentKey": "research",
+          "voiceId": "Leda",
+          "voiceName": "Leda — youthful, clear"
+        },
+        {
+          "agentKey": "analysis",
+          "voiceId": "Fenrir",
+          "voiceName": "Fenrir — energetic, direct"
+        },
+        {
+          "agentKey": "cv",
+          "voiceId": "Kore",
+          "voiceName": "Kore — firm, clear"
+        },
+        {
+          "agentKey": "ats",
+          "voiceId": "Puck",
+          "voiceName": "Puck — upbeat, brisk"
+        },
+        {
+          "agentKey": "cover",
+          "voiceId": "Aoede",
+          "voiceName": "Aoede — breezy, warm"
+        },
+        {
+          "agentKey": "application",
+          "voiceId": "Orus",
+          "voiceName": "Orus — firm, composed"
+        },
+        {
+          "agentKey": "email",
+          "voiceId": "Zephyr",
+          "voiceName": "Zephyr — bright, lively"
+        }
+      ],
+      "sessionPrefix": "voice_54079e"
+    }
+  },
+  "checks": [
+    {
+      "name": "Overview has exactly four KPIs and no duplicated pipeline",
+      "ok": true,
+      "detail": {
+        "labels": [
+          "8 | Active opportunities | Suitable vacancies not yet applied to",
+          "3 | Applications submitted | Employer-confirmed only",
+          "2 | Interviews | Invited or completed",
+          "2 | Needs attention | Blocked or unverified"
+        ]
+      }
+    },
+    {
+      "name": "Owner has no duplicate Admin navigation",
+      "ok": true,
+      "detail": "none"
+    },
+    {
+      "name": "Owner has exactly one assistant launcher and no old header entry",
+      "ok": true,
+      "detail": "one launcher"
+    },
+    {
+      "name": "Primary and More navigation entries are present",
+      "ok": false,
+      "error": "More group missing"
+    },
+    {
+      "name": "Kanban columns contain exactly the records mapped from existing statuses",
+      "ok": true,
+      "detail": {
+        "considering": [
+          "QA Engineer, Digital Health",
+          "Senior QA Automation Engineer",
+          "Test Automation Lead"
+        ],
+        "to_apply": [
+          "Platform QA Engineer",
+          "Senior SDET",
+          "Staff Quality Engineer"
+        ],
+        "applied": [
+          "Lead QA Automation Engineer",
+          "QA Automation Architect",
+          "QA Automation Specialist",
+          "Test Engineer"
+        ],
+        "needs_attention": [
+          "Automation QA Engineer",
+          "Senior QA Engineer",
+          "Senior Test Automation Engineer"
+        ]
+      }
+    },
+    {
+      "name": "Populated cards show title, employer, status and match score",
+      "ok": true,
+      "detail": "13 cards"
+    },
+    {
+      "name": "Applied contains only evidence-backed submissions",
+      "ok": false,
+      "error": "interview_invited with no submitted_at/confirmation appears in Applied"
+    },
+    {
+      "name": "Bare submitted row is routed to Needs attention and excluded from Applied",
+      "ok": true,
+      "detail": "correct"
+    },
+    {
+      "name": "Detail shows the correct original JD and source URL",
+      "ok": true,
+      "detail": {
+        "heading": "Lead QA Automation Engineer — Helvetia Synthetic AG",
+        "source": "https://careers.helvetia-synthetic-ag.example/jobs/07"
+      }
+    },
+    {
+      "name": "The correct CV and cover versions are associated with the employer/vacancy",
+      "ok": true,
+      "detail": "correct"
+    },
+    {
+      "name": "Previous version is still available from the vacancy",
+      "ok": true,
+      "detail": "v1.0 and v2.0 listed; no separate version-history control exists"
+    },
+    {
+      "name": "Document download is authenticated and returns a PDF",
+      "ok": true,
+      "detail": {
+        "status": 200,
+        "type": "application/pdf"
+      }
+    },
+    {
+      "name": "Document preview renders",
+      "ok": true,
+      "detail": "Tailored CV · Audit Owner"
+    },
+    {
+      "name": "Needs-attention detail explains the exact blocker",
+      "ok": true,
+      "detail": "visible"
+    },
+    {
+      "name": "Each document appears once with no duplicate links",
+      "ok": true,
+      "detail": {
+        "rows": 12,
+        "unique": 13,
+        "docCount": 13
+      }
+    },
+    {
+      "name": "Employer, vacancy, type and version labels are present",
+      "ok": true,
+      "detail": "all labels present"
+    },
+    {
+      "name": "Search filters by employer without cross-application leakage",
+      "ok": true,
+      "detail": "Alpine only"
+    },
+    {
+      "name": "Type filter returns cover letters only",
+      "ok": false,
+      "error": "Cover letter,Staff Quality Engineer,Cover letter,Senior SDET,Cover letter,QA Automation Specialist,Cover letter,Senior QA Engineer,Cover letter,Lead QA Automation Engineer"
+    },
+    {
+      "name": "Job discovery renders synthetic vacancies and filters",
+      "ok": true,
+      "detail": "visible"
+    },
+    {
+      "name": "All eight agents are shown",
+      "ok": true,
+      "detail": [
+        "Chief",
+        "Saffa",
+        "Ali",
+        "Kora",
+        "Kali",
+        "Amira",
+        "Noor",
+        "Rayna"
+      ]
+    },
+    {
+      "name": "Owner agent cards exclude provider/model/upstream metadata",
+      "ok": true,
+      "detail": "clean"
+    },
+    {
+      "name": "Effective voice map is distinct for all eight agents",
+      "ok": true,
+      "detail": [
+        {
+          "agentKey": "coordinator",
+          "voiceId": "Charon",
+          "voiceName": "Charon — informative, calm"
+        },
+        {
+          "agentKey": "research",
+          "voiceId": "Leda",
+          "voiceName": "Leda — youthful, clear"
+        },
+        {
+          "agentKey": "analysis",
+          "voiceId": "Fenrir",
+          "voiceName": "Fenrir — energetic, direct"
+        },
+        {
+          "agentKey": "cv",
+          "voiceId": "Kore",
+          "voiceName": "Kore — firm, clear"
+        },
+        {
+          "agentKey": "ats",
+          "voiceId": "Puck",
+          "voiceName": "Puck — upbeat, brisk"
+        },
+        {
+          "agentKey": "cover",
+          "voiceId": "Aoede",
+          "voiceName": "Aoede — breezy, warm"
+        },
+        {
+          "agentKey": "application",
+          "voiceId": "Orus",
+          "voiceName": "Orus — firm, composed"
+        },
+        {
+          "agentKey": "email",
+          "voiceId": "Zephyr",
+          "voiceName": "Zephyr — bright, lively"
+        }
+      ]
+    },
+    {
+      "name": "Talk opens Kora's conversation and persisted history",
+      "ok": true,
+      "detail": "http://127.0.0.1:3313/assistant?ok=Connected%20to%20cv.#chat"
+    },
+    {
+      "name": "No horizontal overflow at 390px: /dashboard",
+      "ok": true,
+      "detail": 1527
+    },
+    {
+      "name": "No horizontal overflow at 390px: /applications",
+      "ok": true,
+      "detail": 2407
+    },
+    {
+      "name": "No horizontal overflow at 390px: /documents",
+      "ok": true,
+      "detail": 7353
+    },
+    {
+      "name": "No horizontal overflow at 390px: /agents",
+      "ok": true,
+      "detail": 3591
+    },
+    {
+      "name": "Admin sidebar has all ten sections",
+      "ok": true,
+      "detail": [
+        "System overview",
+        "Agents & voice",
+        "AI models & providers",
+        "Diagnostics",
+        "Integrations",
+        "Email & delivery",
+        "Storage & retention",
+        "Security",
+        "Audit explorer",
+        "User accounts"
+      ]
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin",
+      "ok": true,
+      "detail": {
+        "h1": "System overview",
+        "scrollHeight": 1643
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/agents",
+      "ok": true,
+      "detail": {
+        "h1": "Agents & voice",
+        "scrollHeight": 1993
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/ai",
+      "ok": true,
+      "detail": {
+        "h1": "AI provider health",
+        "scrollHeight": 2748
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/diagnostics",
+      "ok": true,
+      "detail": {
+        "h1": "Diagnostics",
+        "scrollHeight": 2098
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/integrations",
+      "ok": true,
+      "detail": {
+        "h1": "Integrations",
+        "scrollHeight": 1842
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/email",
+      "ok": true,
+      "detail": {
+        "h1": "Email & reports",
+        "scrollHeight": 1086
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/storage",
+      "ok": true,
+      "detail": {
+        "h1": "Storage & retention",
+        "scrollHeight": 960
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/security",
+      "ok": true,
+      "detail": {
+        "h1": "Security",
+        "scrollHeight": 960
+      }
+    },
+    {
+      "name": "Admin page renders without horizontal overflow: /admin/users",
+      "ok": true,
+      "detail": {
+        "h1": "User accounts",
+        "scrollHeight": 960
+      }
+    },
+    {
+      "name": "Configured secrets are absent from Admin pages",
+      "ok": true,
+      "detail": "none rendered"
+    },
+    {
+      "name": "Voice selector has eight independent defaults and no override",
+      "ok": true,
+      "detail": "8 defaults"
+    },
+    {
+      "name": "Diagnostics consolidates all required areas",
+      "ok": true,
+      "detail": "all sections"
+    },
+    {
+      "name": "Audit initial view is bounded and paginated",
+      "ok": true,
+      "detail": {
+        "auditTotal": 135,
+        "rows": 40
+      }
+    },
+    {
+      "name": "Audit event expands to full details",
+      "ok": true,
+      "detail": "expanded"
+    },
+    {
+      "name": "Audit search filter matches stored rows",
+      "ok": true,
+      "detail": {
+        "rows": 1,
+        "expected": 1,
+        "url": "http://127.0.0.1:3313/admin/audit?q=AUDIT-EVENT-001&category=&severity=&agent=&from=&to="
+      }
+    },
+    {
+      "name": "Audit category filter matches stored rows",
+      "ok": true,
+      "detail": {
+        "rows": 40,
+        "expected": 45,
+        "url": "http://127.0.0.1:3313/admin/audit?q=&category=application&severity=&agent=&from=&to="
+      }
+    },
+    {
+      "name": "Audit severity filter matches stored rows",
+      "ok": true,
+      "detail": {
+        "rows": 28,
+        "expected": 28,
+        "url": "http://127.0.0.1:3313/admin/audit?q=&category=&severity=error&agent=&from=&to="
+      }
+    },
+    {
+      "name": "Audit agent filter matches stored rows",
+      "ok": false,
+      "error": "rows 4 expected 17 (http://127.0.0.1:3313/admin/audit?q=&category=&severity=&agent=cv&from=&to=)"
+    },
+    {
+      "name": "Audit date range filter matches stored rows",
+      "ok": true,
+      "detail": {
+        "rows": 38,
+        "expected": 38,
+        "url": "http://127.0.0.1:3313/admin/audit?q=&category=&severity=&agent=&from=2026-10-01&to=2026-10-31"
+      }
+    },
+    {
+      "name": "Audit pagination retains filter and changes rows",
+      "ok": true,
+      "detail": {
+        "page1": 40,
+        "page2": 40
+      }
+    },
+    {
+      "name": "Clear filters restores full historical count",
+      "ok": true,
+      "detail": 135
+    },
+    {
+      "name": "Owner cannot open Admin diagnostics by URL",
+      "ok": true,
+      "detail": "http://127.0.0.1:3313/dashboard?denied=admin"
+    },
+    {
+      "name": "Authenticated session cookie is HttpOnly",
+      "ok": true,
+      "detail": {
+        "name": "atw_session",
+        "sameSite": "Lax",
+        "secure": true
+      }
+    },
+    {
+      "name": "Admin diagnostics has no horizontal overflow at 390px",
+      "ok": true,
+      "detail": 3698
+    }
+  ],
+  "failures": [
+    {
+      "name": "Primary and More navigation entries are present",
+      "ok": false,
+      "error": "More group missing"
+    },
+    {
+      "name": "Applied contains only evidence-backed submissions",
+      "ok": false,
+      "error": "interview_invited with no submitted_at/confirmation appears in Applied"
+    },
+    {
+      "name": "Type filter returns cover letters only",
+      "ok": false,
+      "error": "Cover letter,Staff Quality Engineer,Cover letter,Senior SDET,Cover letter,QA Automation Specialist,Cover letter,Senior QA Engineer,Cover letter,Lead QA Automation Engineer"
+    },
+    {
+      "name": "Audit agent filter matches stored rows",
+      "ok": false,
+      "error": "rows 4 expected 17 (http://127.0.0.1:3313/admin/audit?q=&category=&severity=&agent=cv&from=&to=)"
+    }
+  ],
+  "diagnostics": [
+    {
+      "label": "owner",
+      "errors": []
+    },
+    {
+      "label": "admin",
+      "errors": []
+    }
+  ]
+}

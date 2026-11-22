@@ -2,6 +2,14 @@ import type { CoverLetterContent, TailoredCv } from "./document-ai";
 import type { MasterCv } from "./master-cv";
 import type { JobAnalysis } from "./scoring";
 import {
+  coverLetterBody,
+  coverLetterLengthIssues,
+  letterBodyFromRenderedText,
+  measureCoverLetterText,
+  resolveCoverLetterRequirements,
+  type CoverLetterRequirements,
+} from "./cover-letter-requirements";
+import {
   claimsNoSponsorship,
   claimsRequiresSponsorship,
   hasGenericCoverLanguage,
@@ -39,6 +47,13 @@ export type DocumentQuality = {
     outputWords: number;
     pages: number;
   };
+  /** Persisted with the cover-letter quality report for audit and readiness. */
+  coverLetter?: {
+    requirements: CoverLetterRequirements;
+    actualWords: number;
+    actualCharacters: number;
+    renderedBodyVerified: boolean;
+  };
   checkedAt: string;
 };
 
@@ -72,12 +87,17 @@ function issue(severity: QualitySeverity, code: string, message: string): Qualit
   return { severity, code, message };
 }
 
-function finalise(checks: QualityCheck[], issues: QualityIssue[], metrics: DocumentQuality["metrics"]): DocumentQuality {
+function finalise(
+  checks: QualityCheck[],
+  issues: QualityIssue[],
+  metrics: DocumentQuality["metrics"],
+  coverLetter?: DocumentQuality["coverLetter"],
+): DocumentQuality {
   const errors = issues.filter((item) => item.severity === "error").length;
   const warnings = issues.filter((item) => item.severity === "warning").length;
   const score = Math.max(0, Math.min(100, 100 - errors * 20 - warnings * 5));
   const status: DocumentQuality["status"] = errors > 0 || score < 70 ? "failed" : warnings > 0 || score < 90 ? "warning" : "passed";
-  return { status, score, checks, issues, metrics, checkedAt: new Date().toISOString() };
+  return { status, score, checks, issues, metrics, coverLetter, checkedAt: new Date().toISOString() };
 }
 
 /**
@@ -227,13 +247,46 @@ export function validateCoverQuality(
   output: CoverLetterContent,
   extractedText: string,
   pages: number,
-  job: { title: string; company: string; description?: string; analysis?: JobAnalysis | null },
+  job: {
+    title: string;
+    company: string;
+    description?: string;
+    analysis?: JobAnalysis | null;
+    coverLetterRequirements?: CoverLetterRequirements;
+  },
 ): DocumentQuality {
   const text = normalise(extractedText);
   const letter = output.paragraphs.join(" ");
   const checks: QualityCheck[] = [];
   const issues: QualityIssue[] = [];
-  const outputWords = words(letter);
+  const requirements =
+    job.coverLetterRequirements ?? resolveCoverLetterRequirements({ description: job.description });
+  const expectedBodySegments = [output.salutation, ...output.paragraphs, output.closing]
+    .map((segment) => normalise(segment))
+    .filter(Boolean);
+  const missingBodySegments = expectedBodySegments.filter((segment) => !text.includes(segment));
+  const renderedBodyVerified = missingBodySegments.length === 0;
+  const renderedBody = letterBodyFromRenderedText(extractedText);
+  const measurement = measureCoverLetterText(renderedBodyVerified ? renderedBody : coverLetterBody(output));
+  const outputWords = measurement.words;
+  checks.push(
+    check(
+      "Rendered letter body is complete",
+      renderedBodyVerified,
+      renderedBodyVerified
+        ? "Salutation, every paragraph and the closing are extractable from the rendered document"
+        : `${missingBodySegments.length} letter segment(s) are missing or clipped in the rendered document`,
+    ),
+  );
+  if (!renderedBodyVerified) {
+    issues.push(
+      issue(
+        "error",
+        "rendered_body_incomplete",
+        "The rendered cover letter is missing or clipping part of its salutation, body or closing.",
+      ),
+    );
+  }
 
   const hasName = text.includes(normalise(master.name));
   const roleTokens = normalise(job.title)
@@ -250,9 +303,30 @@ export function validateCoverQuality(
   checks.push(check("Dated letter", hasDate, hasDate ? "A four-digit year is present" : "No letter date is extractable"));
   if (!hasDate) issues.push(issue("warning", "missing_date", "The cover letter has no extractable date."));
 
-  checks.push(check("Letter length", outputWords >= 180 && outputWords <= 320, `${outputWords} words; target 180–320`));
-  if (outputWords < 180) issues.push(issue("error", "too_short", `The cover letter is too short (${outputWords} words); the evidence-led target is 180–320.`));
-  if (outputWords > 320) issues.push(issue("error", "too_long", `The cover letter is too long (${outputWords} words); keep it within 180–320.`));
+  const lengthIssues = coverLetterLengthIssues(measurement, requirements);
+  const lengthLabel = requirements.source === "recruiter"
+    ? "Letter length matches the recruiter requirement"
+    : "Letter length matches the professional default";
+  const limitParts = [
+    requirements.minWords !== null ? `min ${requirements.minWords} words` : "",
+    requirements.maxWords !== null ? `max ${requirements.maxWords} words` : "",
+    requirements.minCharacters !== null ? `min ${requirements.minCharacters} characters` : "",
+    requirements.maxCharacters !== null ? `max ${requirements.maxCharacters} characters` : "",
+  ].filter(Boolean);
+  checks.push(
+    check(
+      lengthLabel,
+      lengthIssues.length === 0,
+      `${outputWords} words / ${measurement.characters} characters; ${limitParts.join(", ") || "no limit"}; ${
+        requirements.source === "recruiter"
+          ? `explicit recruiter instruction${requirements.evidence.length ? `: ${requirements.evidence[0]}` : ""}`
+          : "internal professional default — not a recruiter requirement"
+      }`,
+    ),
+  );
+  for (const lengthIssue of lengthIssues) {
+    issues.push(issue("error", lengthIssue.code, lengthIssue.message));
+  }
 
   const genericOpening = hasGenericCoverLanguage(output.paragraphs[0] ?? "");
   checks.push(check("No generic opening", !genericOpening, genericOpening ? "Generic opening detected" : "Opens with a role-specific argument"));
@@ -331,9 +405,33 @@ export function validateCoverQuality(
   checks.push(check("Contact identity matches CV", contactMissing.length === 0, contactMissing.length ? "Email missing" : "Email matches the CV header"));
   if (contactMissing.length > 0) issues.push(issue("error", "missing_contact", "The cover letter header is missing the CV email."));
 
-  checks.push(check("Cover letter fits its page budget", pages >= 1 && pages <= 2, `${pages} page(s)`));
+  const explicitPageLimit = requirements.maxPages;
+  const pageLimitPassed = pages >= 1 && (explicitPageLimit === null ? pages <= 2 : pages <= explicitPageLimit);
+  checks.push(
+    check(
+      explicitPageLimit === null ? "Cover letter fits its page budget" : "Cover letter meets the recruiter page limit",
+      pageLimitPassed,
+      explicitPageLimit === null ? `${pages} page(s)` : `${pages} page(s) against an explicit maximum of ${explicitPageLimit}`,
+    ),
+  );
   if (pages === 0) issues.push(issue("error", "empty_pdf", "No rendered page was produced."));
-  if (pages > 2) issues.push(issue("warning", "cover_too_long", "The cover letter exceeds two pages."));
+  if (explicitPageLimit !== null && pages > explicitPageLimit) {
+    issues.push(issue("error", "page_limit_exceeded", `The recruiter allows at most ${explicitPageLimit} page(s); the rendered letter has ${pages}.`));
+  } else if (explicitPageLimit === null && pages > 2) {
+    issues.push(issue("warning", "cover_too_long", "The cover letter exceeds two pages."));
+  }
+  if (requirements.supportingDocuments.length > 0) {
+    issues.push(
+      issue(
+        "error",
+        "missing_supporting_documents",
+        `The recruiter requests supporting document(s) that this package does not create: ${requirements.supportingDocuments.join(", ")}. A human must verify and attach them before any submission.`,
+      ),
+    );
+  }
+  if (requirements.uncertain.length > 0) {
+    issues.push(issue("warning", "uncertain_requirements", `Recruiter instructions need verification: ${requirements.uncertain.join(" ")}`));
+  }
 
   if (!output.tailoredWithAi) {
     issues.push(issue("info", "deterministic_cover", "AI cover-letter revision was unavailable or rejected; the deterministic evidence-led letter was used. Provenance is recorded without lowering factual quality."));
@@ -342,14 +440,24 @@ export function validateCoverQuality(
     for (const warning of output.warnings) issues.push(issue("info", "ai_provenance", warning));
   }
 
-  return finalise(checks, issues, {
-    originalRoles: master.roles.length,
-    outputRoles: master.roles.length,
-    originalBullets: master.roles.reduce((sum, role) => sum + role.bullets.length, 0),
-    outputBullets: master.roles.reduce((sum, role) => sum + role.bullets.length, 0),
-    outputWords,
-    pages,
-  });
+  return finalise(
+    checks,
+    issues,
+    {
+      originalRoles: master.roles.length,
+      outputRoles: master.roles.length,
+      originalBullets: master.roles.reduce((sum, role) => sum + role.bullets.length, 0),
+      outputBullets: master.roles.reduce((sum, role) => sum + role.bullets.length, 0),
+      outputWords,
+      pages,
+    },
+    {
+      requirements,
+      actualWords: measurement.words,
+      actualCharacters: measurement.characters,
+      renderedBodyVerified,
+    },
+  );
 }
 
 export function combinePackageQuality(cv: DocumentQuality, cover: DocumentQuality): DocumentQuality {

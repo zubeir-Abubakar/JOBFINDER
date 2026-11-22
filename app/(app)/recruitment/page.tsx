@@ -225,24 +225,24 @@ export default async function RecruitmentPage({
         <section className="card">
           <div className="card-head">
             <div>
-              <h2>Weekly schedule</h2>
+              <h2>Recruitment schedule</h2>
               <p className="card-sub">Persisted in the database, so a restart cannot forget it. Change the two schedules in Settings.</p>
             </div>
             <span className={`badge ${schedulerHealth === "Running" ? "badge-good" : schedulerHealth === "Missed" ? "badge-bad" : schedulerHealth === "Paused" ? "badge-neutral" : "badge-warn"}`}>{schedulerHealth}</span>
           </div>
           <div className="card-body stack text-[12.5px]" style={{ gap: 8 }}>
             <div className="between"><span style={{ color: "var(--muted)" }}>Days</span><span>{schedule.weekdayLabels.join(", ")}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Recruitment time</span><span className="num">{schedule.time} · {schedule.timezone}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Main / incremental</span><span className="num">{schedule.slotTimes.join(" · ")} · {schedule.timezone}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Daily report</span><span className="num">{reportSchedule.weekdaysList.map((day) => ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day]).join(", ")} · {reportSchedule.time}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Next report</span><span>{formatInZone(reportSchedule.next_run_at, reportSchedule.timezone)}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Next execution</span><span>{formatInZone(schedule.nextRunAt)}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Next execution</span><span>{formatInZone(schedule.nextRunAt)}{schedule.nextRunMode ? ` · ${schedule.nextRunMode}` : ""}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Last execution</span><span>{formatInZone(schedule.lastRunAt)}{schedule.lastStatus ? ` · ${schedule.lastStatus.replace(/_/g, " ")}` : ""}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Scheduler process</span><span>{schedulerLive ? "Ticker running" : "Ticker not detected"}{schedule.lastCheckedAt ? ` · checked ${formatInZone(schedule.lastCheckedAt)}` : ""}</span></div>
             {schedule.missed ? <p className="hint">The scheduled execution is outside the catch-up window; the missed run is recorded rather than executed late.</p> : null}
             <div className="between"><span style={{ color: "var(--muted)" }}>Minimum match</span><span>{qualifyingThreshold()}% (cannot be lowered automatically)</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Applications per day</span><span>{policy.maxSubmissionsPerDay} · {usage.remaining} remaining today</span></div>
             <p className="hint">
-              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at {schedule.time} {schedule.timezone} for the run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
+              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at each scheduled time ({schedule.slotTimes.join(", ")} {schedule.timezone}) for the run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
             </p>
           </div>
         </section>
@@ -261,7 +261,7 @@ export default async function RecruitmentPage({
                 <div className="between"><span style={{ color: "var(--muted)" }}>Status</span><span className={`badge ${latest.status === "completed" ? "badge-good" : latest.status === "failed" ? "badge-bad" : "badge-warn"}`}>{latest.status.replace(/_/g, " ")}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Discovery state</span><span>{latest.discovery_state?.replace(/_/g, " ") ?? "not recorded"}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Sources checked / ok / partial / failed</span><span>{latest.sources_checked ?? 0} / {latest.sources_succeeded ?? 0} / {latest.sources_partial ?? 0} / {latest.sources_failed ?? 0}</span></div>
-                <div className="between"><span style={{ color: "var(--muted)" }}>New / relevant / duplicates / filtered</span><span>{latest.jobs_discovered} / {latestManifest?.counts.relevant ?? 0} / {latest.jobs_duplicates ?? 0} / {latest.jobs_filtered ?? 0}</span></div>
+                <div className="between"><span style={{ color: "var(--muted)" }}>New / updated / relevant / duplicates / filtered</span><span>{latest.jobs_discovered} / {latest.jobs_updated ?? 0} / {latestManifest?.counts.relevant ?? 0} / {latest.jobs_duplicates ?? 0} / {latest.jobs_filtered ?? 0}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Agents succeeded / expected</span><span>{latestManifest?.succeededAgents ?? 0} / {latestManifest?.expectedAgents ?? 8} · {latestManifest?.notExecutedAgents ?? 0} not executed · {latestManifest?.skippedAgents ?? 0} skipped</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Eligible / qualified / rejected</span><span>{latest.jobs_eligible} / {latest.jobs_qualified} / {rejectedTotal}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Prepared</span><span>{latest.packages_prepared}</span></div>
@@ -314,6 +314,7 @@ export default async function RecruitmentPage({
                   <th>Fresh</th>
                   <th>Relevant</th>
                   <th>Duplicates</th>
+                  <th>Updated</th>
                   <th>New</th>
                   <th>Eligible</th>
                   <th>Qualified</th>
@@ -332,6 +333,7 @@ export default async function RecruitmentPage({
                     <td className="num">{metric.fresh}</td>
                     <td className="num">{metric.relevant}</td>
                     <td className="num">{metric.duplicates}</td>
+                    <td className="num">{metric.updated ?? 0}</td>
                     <td className="num">{metric.inserted}</td>
                     <td className="num">{metric.eligible}</td>
                     <td className="num">{metric.qualified}</td>

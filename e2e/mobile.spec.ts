@@ -3,14 +3,21 @@ import { AGENT_IDENTITIES } from "./support/constants";
 
 test("mobile dashboard and agent roster render without horizontal overflow", async ({ page, diagnostics }) => {
   await gotoReady(page, "/dashboard");
-  await expect(page.getByText("Recruitment pipeline")).toBeVisible();
+  await expect(page.getByText("Active opportunities")).toBeVisible();
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
   expect(overflow, "page must not overflow horizontally at 390px").toBeLessThanOrEqual(1);
 
   await page.getByRole("button", { name: "Open navigation" }).click();
   await expect(page.getByRole("navigation", { name: "Primary navigation" })).toBeVisible();
-  await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "AI agents" }).click();
+  await page.getByRole("navigation", { name: "Primary navigation" }).getByRole("link", { name: "Agents", exact: true }).click();
   await page.waitForURL("**/agents");
+  await expect(page.getByTestId("agent-topology")).toBeVisible();
+  const topologyOverflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+  expect(topologyOverflow, "topology must not overflow horizontally at 390px").toBeLessThanOrEqual(1);
+
+  const views = page.getByRole("navigation", { name: "Agents views" });
+  await views.getByRole("link", { name: "List view" }).click();
+  await page.waitForURL("**/agents/list");
   await expect(page.locator(".agent-card")).toHaveCount(8);
   for (const identity of AGENT_IDENTITIES) {
     await expect(page.getByText(identity.name, { exact: true }).first()).toBeVisible();

@@ -9,5 +9,5 @@ export async function login(page: Page, email: string, password: string): Promis
 
 export async function expectDashboard(page: Page): Promise<void> {
   await page.waitForURL("**/dashboard", { timeout: 45_000 });
-  await expect(page.getByText("Recruitment pipeline")).toBeVisible();
+  await expect(page.getByText("Active opportunities")).toBeVisible();
 }

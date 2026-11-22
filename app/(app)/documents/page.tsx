@@ -12,6 +12,7 @@ import { applyExtractionAction, discardExtractionAction } from "@/lib/actions/do
 import { Icon } from "@/components/icons";
 import { DocumentDeleteButton } from "@/components/DocumentDeleteButton";
 import { DocumentsBulkTable } from "@/components/DocumentsBulkTable";
+import { filterLibraryDocuments, groupLibraryDocuments } from "@/lib/document-library";
 import { agentIdentity } from "@/lib/agent-identity";
 
 export const dynamic = "force-dynamic";
@@ -61,8 +62,14 @@ export default async function DocumentsPage({
   ).map((doc) => ({ ...doc }));
   const kindParam = param(sp.kind);
   const kindFilter = kindParam === "tailored_cv" || kindParam === "cover_letter" ? kindParam : null;
+  const q = param(sp.q).trim();
+  const oldestFirst = param(sp.sort) === "oldest";
   const originals = documents.filter((d) => d.kind === "original_cv");
-  const generated = documents.filter((d) => d.kind !== "original_cv" && (!kindFilter || d.kind === kindFilter));
+  const generated = filterLibraryDocuments(
+    documents.filter((d) => d.kind !== "original_cv"),
+    { q, kind: kindFilter },
+  ).sort((a, b) => (oldestFirst ? a.created_at.localeCompare(b.created_at) : b.created_at.localeCompare(a.created_at)));
+  const groups = groupLibraryDocuments(generated);
   const stats = storageStats();
   const retention = getSetting<number>("retention_days", 30);
   const autoDelete = getSetting<boolean>("auto_delete_expired", true);
@@ -209,27 +216,76 @@ export default async function DocumentsPage({
         </section>
       </div>
 
-      <section className="card" id="tailored-documents" data-visual-id="document-library">
+      <section className="card filter-shell mb-4" id="tailored-documents" data-visual-id="document-library">
         <div className="card-head">
           <div>
-            <h2>{kindFilter === "tailored_cv" ? "Tailored CVs" : kindFilter === "cover_letter" ? "Cover letters" : "Tailored documents"}</h2>
-            <p className="card-sub">Each file is tied to the vacancy it was written for. CV ATS compatibility applies to CVs only; cover letters are assessed by their document-quality gate. Both are internal self-assessments, separate from candidate-to-job suitability.</p>
+            <h2>{kindFilter === "tailored_cv" ? "Tailored CVs" : kindFilter === "cover_letter" ? "Cover letters" : "Document library"}</h2>
+            <p className="card-sub">Grouped by application and labelled with the employer and vacancy. Each file appears once, whether opened here or from the application.</p>
           </div>
-          <div className="row">
-            {kindFilter ? <Link href="/documents#tailored-documents" className="btn btn-sm">Show all documents</Link> : null}
-            <Link href="/jobs" className="btn btn-sm"><Icon name="jobs" /> Find a vacancy</Link>
-          </div>
+          <Link href="/jobs" className="btn btn-sm"><Icon name="jobs" /> Find a vacancy</Link>
         </div>
-        {generated.length === 0 ? (
-          <Empty title={kindFilter ? `No ${kindFilter === "tailored_cv" ? "tailored CVs" : "cover letters"} yet` : "No tailored documents yet"}>
-            Open a vacancy and generate a package. {agentIdentity("cv").name} will only use facts from your master profile.
-          </Empty>
-        ) : (
-          <div className="card-body documents-table-body">
-            <DocumentsBulkTable documents={generated} />
+        <form method="get" className="filter-panel">
+          <div className="filter-grid filter-grid-compact">
+            <div className="filter-grow">
+              <label className="label" htmlFor="doc-q">Search</label>
+              <input id="doc-q" name="q" className="input" defaultValue={q} placeholder="Employer, role or document name" />
+            </div>
+            <div>
+              <label className="label" htmlFor="doc-kind">Type</label>
+              <select id="doc-kind" name="kind" className="select" defaultValue={kindFilter ?? ""}>
+                <option value="">All generated documents</option>
+                <option value="tailored_cv">Tailored CVs</option>
+                <option value="cover_letter">Cover letters</option>
+              </select>
+            </div>
+            <div>
+              <label className="label" htmlFor="doc-sort">Sort</label>
+              <select id="doc-sort" name="sort" className="select" defaultValue={oldestFirst ? "oldest" : "newest"}>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+              </select>
+            </div>
+            <div className="filter-actions">
+              <button type="submit" className="btn btn-primary">Apply</button>
+              <Link href="/documents#tailored-documents" className="btn">Clear</Link>
+            </div>
           </div>
-        )}
+        </form>
       </section>
+
+      <div className="between mb-2">
+        <p className="text-[11.5px]" style={{ color: "var(--muted)" }}>
+          {generated.length} generated file{generated.length === 1 ? "" : "s"} across {groups.length} application{groups.length === 1 ? "" : "s"}.
+        </p>
+      </div>
+
+      {generated.length === 0 ? (
+        <section className="card">
+          <Empty title={q || kindFilter ? "No documents match" : "No tailored documents yet"}>
+            {q || kindFilter
+              ? "Clear the filters to see every generated file."
+              : `Open a vacancy and generate a package. ${agentIdentity("cv").name} will only use facts from your master profile.`}
+          </Empty>
+        </section>
+      ) : (
+        groups.map((group, index) => (
+          <section key={group.key} className="card mb-3">
+            <div className="card-head">
+              <div>
+                <h3 style={{ fontSize: 13.5, fontWeight: 650 }}>{group.company ?? "Unlinked documents"}{group.title ? ` — ${group.title}` : ""}</h3>
+                <p className="card-sub">
+                  {group.documents.length} file{group.documents.length === 1 ? "" : "s"}
+                  {group.jobId ? " · application documents" : " · not linked to a vacancy"}
+                </p>
+              </div>
+              {group.jobId ? <Link href={`/jobs/${group.jobId}`} className="btn btn-sm">View vacancy</Link> : null}
+            </div>
+            <div className="card-body documents-table-body">
+              <DocumentsBulkTable documents={group.documents} showToolbar={index === 0} />
+            </div>
+          </section>
+        ))
+      )}
     </>
   );
 }

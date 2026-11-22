@@ -28,13 +28,14 @@ import {
 import { notify } from "./notify";
 import { enqueueDocumentRecovery } from "./recruitment-recovery";
 import { audit } from "./audit";
-import { catchUpWindowHours, localDateKey, nextScheduledRun, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, RECRUITMENT_WEEKDAYS, formatInZone } from "./recruitment-schedule";
+import { catchUpWindowHours, localClockTime, localDateKey, nextRecruitmentOccurrence, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIMEZONE, RECRUITMENT_WEEKDAYS, formatInZone } from "./recruitment-schedule";
 import { acquireRuntimeLock, refreshRuntimeLock, releaseRuntimeLock, runtimeLockActive } from "./runtime-state";
 import { recordApplicationEvent } from "./application-events";
 import { generateText, providerConfigured, scrubProviderError } from "./providers";
 import { buildExecutionManifest } from "./execution-manifest";
 import { verifyAndPersistVacancy, type VacancyVerification } from "./vacancy-verification";
 import { agentIdentity } from "./agent-identity";
+import { resolveCoverLetterRequirements } from "./cover-letter-requirements";
 
 /**
  * Chief Coordinator for the autonomous daily recruitment run.
@@ -80,6 +81,9 @@ export type RunRow = {
   jobs_discovered: number;
   jobs_duplicates: number;
   jobs_filtered: number;
+  jobs_updated: number;
+  discovery_scope: string | null;
+  discovery_since: string | null;
   jobs_eligible: number;
   jobs_qualified: number;
   sources_checked: number;
@@ -440,11 +444,13 @@ type JobRowLite = {
   external_id: string | null;
   company_domain: string | null;
   expiry_at: string | null;
+  requirements: string | null;
 };
 
 function jobLite(id: string): JobRowLite | null {
   return one<JobRowLite>(     `SELECT id, title, company, location, remote, url, application_url, description, employment_type, published_at,
-            match_score, analysis, eligibility, eligibility_notes, run_id, qualified, source, external_id, company_domain, expiry_at
+            match_score, analysis, eligibility, eligibility_notes, run_id, qualified, source, external_id, company_domain, expiry_at,
+            requirements
      FROM jobs WHERE id = ?`,
     [id],
   );
@@ -466,6 +472,7 @@ export function createRecruitmentRun(input: {
   userId?: string;
   now?: Date;
   scheduledFor?: string | null;
+  discoveryScope?: "full" | "incremental";
   /** Discovery + eligibility + scoring only: no documents, no submissions. */
   discoveryOnly?: boolean;
 }): { run: RunRow; created: boolean; message: string } {
@@ -485,25 +492,32 @@ export function createRecruitmentRun(input: {
     }
   }
 
-  const dateKey = localDateKey(now);
-  const runKey =
-    input.trigger === "manual" ? `${dateKey}#manual-${randomId().slice(0, 8)}` : `${dateKey}#scheduled`;
-  const existing = one<RunRow>("SELECT * FROM recruitment_runs WHERE run_key = ?", [runKey]);
-  if (existing) {
-    return { run: existing, created: false, message: `The run for ${dateKey} already exists; it will not be duplicated.` };
-  }
-
-  const id = `run_${randomId()}`;
+  const scope = input.discoveryScope === "incremental" ? "incremental" : "full";
   const scheduledFor =
     input.scheduledFor ??
     (input.trigger === "manual"
       ? now.toISOString()
-      : nextScheduledRun(now, { time: RECRUITMENT_TIME, weekdays: RECRUITMENT_WEEKDAYS }).toISOString());
+      : nextRecruitmentOccurrence(now, { weekdays: RECRUITMENT_WEEKDAYS }).scheduledFor);
+  const scheduledDate = new Date(scheduledFor);
+  const dateKey = localDateKey(scheduledDate);
+  // Each durable occurrence has its own key. The old once-per-day key would
+  // collapse the 10:00 and every incremental run into a single record.
+  const slotClock = (localClockTime(scheduledFor) ?? "scheduled").replace(":", "");
+  const runKey =
+    input.trigger === "manual"
+      ? `${localDateKey(now)}#manual-${randomId().slice(0, 8)}`
+      : `${dateKey}#${scope}-${slotClock}`;
+  const existing = one<RunRow>("SELECT * FROM recruitment_runs WHERE run_key = ?", [runKey]);
+  if (existing) {
+    return { run: existing, created: false, message: `The ${scope} run for ${dateKey} at ${slotClock} already exists; it will not be duplicated.` };
+  }
+
+  const id = `run_${randomId()}`;
   try {
     run(
       `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, jobs_discovered, jobs_eligible, jobs_qualified,
-        packages_prepared, applications_submitted, applications_unverified, applications_intervention, applications_simulated, failures, warnings, mode, created_at)
-       VALUES (?, ?, ?, ?, 'scheduled', ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)`,
+        packages_prepared, applications_submitted, applications_unverified, applications_intervention, applications_simulated, failures, warnings, mode, discovery_scope, created_at)
+       VALUES (?, ?, ?, ?, 'scheduled', ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?, ?)`,
       [
         id,
         runKey,
@@ -511,6 +525,7 @@ export function createRecruitmentRun(input: {
         input.trigger,
         JSON.stringify([{ state: "scheduled", at: now.toISOString() }]),
         input.discoveryOnly ? "discovery" : "full",
+        scope,
         now.toISOString(),
       ],
     );
@@ -521,7 +536,7 @@ export function createRecruitmentRun(input: {
   }
   const created = runById(id);
   if (!created) throw new Error("The recruitment run was inserted but could not be read back.");
-  return { run: created, created: true, message: `Recruitment run ${dateKey} created.` };
+  return { run: created, created: true, message: `Recruitment ${scope} run ${dateKey} ${slotClock} created.` };
 }
 
 export async function startDailyRun(input: {
@@ -529,18 +544,24 @@ export async function startDailyRun(input: {
   userId?: string;
   now?: Date;
   scheduledFor?: string | null;
+  discoveryScope?: "full" | "incremental";
   discoveryOnly?: boolean;
 }): Promise<{ ok: boolean; runId?: string; message: string }> {
   const created = createRecruitmentRun(input);
   if (!created.created) {
     return { ok: created.run.status === "completed" || created.run.status === "completed_with_warnings", runId: created.run.id, message: created.message };
   }
-  void executeRun(created.run.id, { userId: input.userId, now: input.now, discoveryOnly: input.discoveryOnly }).catch((error) => {
+  void executeRun(created.run.id, {
+    userId: input.userId,
+    now: input.now,
+    discoveryOnly: input.discoveryOnly,
+    discoveryScope: input.discoveryScope,
+  }).catch((error) => {
     const message = error instanceof Error ? error.message : "The recruitment run crashed.";
     run("UPDATE recruitment_runs SET status = 'failed', error = ?, finished_at = ? WHERE id = ?", [message, nowIso(), created.run.id]);
-    recordScheduleRun({ runId: created.run.id, status: "failed", error: message });
+    recordScheduleRun({ runId: created.run.id, status: "failed", error: message, scheduledFor: created.run.scheduled_for });
   });
-  return { ok: true, runId: created.run.id, message: "Daily recruitment run started." };
+  return { ok: true, runId: created.run.id, message: "Recruitment run started." };
 }
 
 /* ------------------------------ submission QA ----------------------------- */
@@ -626,6 +647,11 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
       eligibilityNotes: job.eligibility_notes,
       matchScore: job.match_score,
       analysis: parseAnalysis(job.analysis),
+      coverLetterRequirements: resolveCoverLetterRequirements({
+        description: job.description,
+        requirementsJson: job.requirements,
+        sourceUrl: job.application_url ?? job.url,
+      }),
     },
     application: { id: app.id, status: app.status, submittedAt: app.submitted_at },
     profile: {
@@ -675,6 +701,17 @@ function generationPreflight(jobId: string): { ok: boolean; reasons: string[] } 
     reasons.push(`Match score ${job.match_score ?? "unknown"}% is below ${qualifyingThreshold()}%.`);
   }
   if (!job.application_url && !job.url) reasons.push("No application URL is recorded.");
+  const coverLetter = resolveCoverLetterRequirements({
+    description: job.description,
+    requirementsJson: job.requirements,
+    sourceUrl: job.application_url ?? job.url,
+  });
+  if (coverLetter.conflicts.length > 0) {
+    reasons.push(`Cover-letter instructions conflict: ${coverLetter.conflicts.join(" ")}`);
+  }
+  if (coverLetter.supportingDocuments.length > 0) {
+    reasons.push(`The vacancy requests supporting document(s) that the package does not create: ${coverLetter.supportingDocuments.join(", ")}.`);
+  }
   if (!job.published_at) reasons.push("The publication date is missing, so freshness cannot be verified.");
   else if (Date.now() - Date.parse(job.published_at) > 7 * 86_400_000) reasons.push("The vacancy is older than seven days.");
   const profile = getProfileData();
@@ -689,7 +726,7 @@ function generationPreflight(jobId: string): { ok: boolean; reasons: string[] } 
 /* -------------------------------- execution ------------------------------- */
 
 export type RunDeps = {
-  discover?: (context: { runId: string; pages: number }) => Promise<DiscoveryResult>;
+  discover?: (context: { runId: string; pages: number; scope: "full" | "incremental" }) => Promise<DiscoveryResult>;
   prepare?: (jobId: string, workflowId: string) => Promise<PackageOutcome>;
   submit?: (input: SubmissionInput) => Promise<SubmissionOutcome>;
   analyse?: (jobId: string) => JobAnalysis | null;
@@ -715,7 +752,7 @@ export type RunOutcome = {
 };
 
 function updateCounts(runId: string, counts: Partial<Record<
-  "jobs_discovered" | "jobs_duplicates" | "jobs_filtered" | "jobs_eligible" | "jobs_qualified" |
+  "jobs_discovered" | "jobs_duplicates" | "jobs_filtered" | "jobs_updated" | "jobs_eligible" | "jobs_qualified" |
   "sources_checked" | "sources_succeeded" | "sources_failed" | "sources_partial" |
   "packages_prepared" | "applications_submitted" |
   "applications_unverified" | "applications_intervention" | "applications_simulated" | "failures" | "warnings", number>>): void {
@@ -733,6 +770,8 @@ export async function executeRun(
     maxApplications?: number;
     now?: Date;
     deps?: RunDeps;
+    /** A caller may force the discovery scope; persisted run scope wins otherwise. */
+    discoveryScope?: "full" | "incremental";
     /** Scoring and reporting only; documents and submissions are skipped. */
     discoveryOnly?: boolean;
   } = {},
@@ -782,6 +821,8 @@ export async function executeRun(
   memoryRunning = runId;
 
   const discoveryOnly = options.discoveryOnly === true || runRow.mode === "discovery";
+  const discoveryScope =
+    options.discoveryScope ?? (runRow.discovery_scope === "incremental" ? "incremental" : "full");
   const deps = options.deps ?? {};
   const now = deps.now ?? options.deps?.now ?? new Date();
   // Recover abandoned `submitting` leases before this run reads any readiness or
@@ -837,8 +878,8 @@ export async function executeRun(
     let discovery: DiscoveryResult;
     try {
       discovery = deps.discover
-        ? await deps.discover({ runId, pages })
-        : await discoverJobSources({ runId, pages });
+        ? await deps.discover({ runId, pages, scope: discoveryScope })
+        : await discoverJobSources({ runId, pages, scope: discoveryScope });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Discovery failed.";
       allSourcesFailed = true;
@@ -851,28 +892,32 @@ export async function executeRun(
         discovered: 0,
         inserted: 0,
         duplicates: 0,
+        updated: 0,
         filtered: 0,
         jobIds: [],
         sources: [],
         warnings: [`Discovery unavailable: ${message}`],
+        scope: discoveryScope,
+        since: null,
       };
     }
     for (const warning of discovery.warnings) warnings.push(warning);
+    run("UPDATE recruitment_runs SET discovery_since = ? WHERE id = ?", [discovery.since ?? null, runId]);
     const sourceSummary = discovery.sources
-      .map((source) => `${source.label}: ${source.fetched} fetched / ${source.inserted} new${source.error ? ` (${source.error})` : ""}`)
+      .map((source) => `${source.label}: ${source.fetched} fetched / ${source.inserted} new / ${source.updated ?? 0} updated${source.error ? ` (${source.error})` : ""}`)
       .join("; ");
     logAgent({
       runId,
       agentKey: "research",
       assignment: "Discover QA vacancies across all configured sources",
       status: "completed",
-      output: `${discovery.inserted} new, ${discovery.duplicates} duplicates, ${discovery.filtered} rejected. ${sourceSummary}`,
+      output: `${discovery.inserted} new, ${discovery.updated} updated, ${discovery.duplicates} duplicates, ${discovery.filtered} rejected. ${sourceSummary}`,
       finishedAt: nowIso(),
     });
     safeComplete(
       researchTask.taskId,
       "research",
-      `${discovery.inserted} new vacancies; ${discovery.duplicates} duplicate listing(s) blocked; ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
+      `${discovery.inserted} new vacancies; ${discovery.updated} updated; ${discovery.duplicates} duplicate listing(s) blocked; ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
     );
     const checkedSources = discovery.sources.filter((source) => (source.requests ?? 0) > 0);
     const succeededSources = checkedSources.filter((source) => (source.responses ?? 0) > 0);
@@ -900,6 +945,7 @@ export async function executeRun(
       jobs_discovered: discovery.inserted,
       jobs_duplicates: discovery.duplicates,
       jobs_filtered: discovery.filtered,
+      jobs_updated: discovery.updated,
       sources_checked: checkedSources.length,
       sources_succeeded: succeededSources.length,
       sources_failed: failedSources.length,
@@ -911,7 +957,7 @@ export async function executeRun(
       kind: "job_discovery_completed",
       dedupeKey: `discovery:${runId}`,
       subject: `Job discovery completed: ${discovery.inserted} new`,
-      body: `${discovery.inserted} new vacancy(ies) stored, ${discovery.duplicates} duplicate listing(s) blocked, ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
+      body: `${discovery.inserted} new vacancy(ies) stored, ${discovery.updated} previously known vacancy(ies) updated, ${discovery.duplicates} duplicate listing(s) blocked, ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
       email: false,
     });
 
@@ -1034,6 +1080,7 @@ export async function executeRun(
         relevant: source.relevant,
         duplicates: source.duplicates,
         inserted: source.inserted,
+        updated: source.updated ?? 0,
         errors: source.error ? 1 : 0,
         eligible: 0,
         qualified: 0,
@@ -1934,7 +1981,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
         );
       }
       return (
-        `${fetched.toLocaleString("en-GB")} posting(s) were screened, ${fresh.toLocaleString("en-GB")} were fresh and ${relevant} passed the QA relevance rule. ${runRow.jobs_duplicates ?? 0} listing(s) were already known and ${runRow.jobs_discovered} new vacancy(ies) were stored.` +
+        `${fetched.toLocaleString("en-GB")} posting(s) were screened, ${fresh.toLocaleString("en-GB")} were fresh and ${relevant} passed the QA relevance rule. ${runRow.jobs_duplicates ?? 0} listing(s) were already known, ${runRow.jobs_updated ?? 0} were updated and ${runRow.jobs_discovered} new vacancy(ies) were stored.` +
         (failedSources.length > 0
           ? ` ${failedSources.length} source endpoint(s) failed: ${failedSources.map((check) => `${check.source_key} (${check.error ?? "unknown error"})`).join("; ")}.`
           : " No configured source failed.") +
@@ -1956,7 +2003,11 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   const screenedTotal = sourceMetrics.reduce((sum, metric) => sum + metric.postings, 0);
   const relevantTotal = sourceMetrics.reduce((sum, metric) => sum + metric.relevant, 0);
   lines.push(
-    `${screenedTotal.toLocaleString("en-GB")} postings screened, ${relevantTotal} relevant, ${runRow.jobs_discovered} new vacancies stored, ${runRow.jobs_duplicates ?? 0} duplicate listing(s), ${runRow.jobs_filtered ?? 0} rejected during discovery, ${runRow.jobs_eligible} eligible, ${runRow.jobs_qualified} qualified at ${qualifyingThreshold()}% or higher, ${runRow.packages_prepared} package(s) prepared, ${runRow.applications_submitted} submitted and verified, ${runRow.applications_unverified} unverified, ${runRow.applications_simulated} simulated, ${runRow.applications_intervention} needing your attention. Run status: ${runRow.status.replace(/_/g, " ")}.`,
+    `${screenedTotal.toLocaleString("en-GB")} postings screened, ${relevantTotal} relevant, ${runRow.jobs_discovered} new vacancies stored, ${runRow.jobs_updated ?? 0} known vacancies updated, ${runRow.jobs_duplicates ?? 0} duplicate listing(s), ${runRow.jobs_filtered ?? 0} rejected during discovery, ${runRow.jobs_eligible} eligible, ${runRow.jobs_qualified} qualified at ${qualifyingThreshold()}% or higher, ${runRow.packages_prepared} package(s) prepared, ${runRow.applications_submitted} submitted and verified, ${runRow.applications_unverified} unverified, ${runRow.applications_simulated} simulated, ${runRow.applications_intervention} needing your attention. Run status: ${runRow.status.replace(/_/g, " ")}.`,
+  );
+  const scope = runRow.discovery_scope === "incremental" ? "incremental" : "full";
+  lines.push(
+    `Discovery scope: ${scope}. ${scope === "incremental" ? "New and source-updated vacancies were reconciled against the previous successful discovery; known vacancies were not reprocessed." : "Every enabled source was read in full and all new vacancies were reconciled."}`,
   );
   if (runRow.sources_checked) {
     lines.push(
@@ -1983,7 +2034,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
     lines.push("Source contribution:");
     for (const metric of sourceMetrics) {
       lines.push(
-        `- ${metric.label}: ${metric.status ?? "unknown"} · ${metric.requests} request(s), ${metric.responses} response(s), ${metric.attempts ?? 0} attempt(s), ${metric.durationMs ?? 0} ms, ${metric.postings} posting(s), ${metric.fresh} fresh, ${metric.relevant} relevant, ${metric.duplicates} duplicate(s), ${metric.inserted} new · ${metric.eligible} eligible · ${metric.qualified} qualified`,
+        `- ${metric.label}: ${metric.status ?? "unknown"} · ${metric.requests} request(s), ${metric.responses} response(s), ${metric.attempts ?? 0} attempt(s), ${metric.durationMs ?? 0} ms, ${metric.postings} posting(s), ${metric.fresh} fresh, ${metric.relevant} relevant, ${metric.updated ?? 0} updated, ${metric.duplicates} duplicate(s), ${metric.inserted} new · ${metric.eligible} eligible · ${metric.qualified} qualified`,
       );
     }
   }
@@ -2052,8 +2103,9 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   for (const warning of warningList) lines.push(`- Warning: ${warning}`);
   lines.push("");
   lines.push("## 10. Next scheduled run");
+  const nextClock = localClockTime(schedule?.next_run_at ?? null);
   lines.push(
-    `${formatInZone(schedule?.next_run_at ?? null)} (${RECRUITMENT_TIMEZONE}, ${RECRUITMENT_TIME}). ` +
+    `${formatInZone(schedule?.next_run_at ?? null)}${nextClock ? ` (${nextClock} ${RECRUITMENT_TIMEZONE})` : ""}. ` +
       "The scheduler state is stored in the database and survives a restart, but the host and this application must be running at that time for the run to execute.",
   );
   lines.push("");

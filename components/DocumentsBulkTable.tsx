@@ -35,7 +35,7 @@ export type BulkDocument = {
  * single-document server action; multi-select queues those exact forms through
  * a hidden sink so the action and payload contract stay untouched.
  */
-export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] }) {
+export function DocumentsBulkTable({ documents, showToolbar = true }: { documents: BulkDocument[]; showToolbar?: boolean }) {
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -79,16 +79,18 @@ export function DocumentsBulkTable({ documents }: { documents: BulkDocument[] })
 
   return (
     <>
-      <div className="bulk-toolbar">
-        <div className="bulk-toolbar-copy">
-          <span className="bulk-toolbar-icon"><Icon name="docs" size={14} /></span>
-          <span>{selectMode ? "Select documents to remove them together." : "Manage generated files for each vacancy."}</span>
+      {showToolbar ? (
+        <div className="bulk-toolbar">
+          <div className="bulk-toolbar-copy">
+            <span className="bulk-toolbar-icon"><Icon name="docs" size={14} /></span>
+            <span>{selectMode ? "Select documents to remove them together." : "Manage generated files for each vacancy."}</span>
+          </div>
+          <button type="button" className={`btn btn-sm ${selectMode ? "btn-primary" : ""}`} onClick={toggleMode}>
+            <Icon name={selectMode ? "close" : "check"} size={12} />
+            {selectMode ? "Exit select" : "Select"}
+          </button>
         </div>
-        <button type="button" className={`btn btn-sm ${selectMode ? "btn-primary" : ""}`} onClick={toggleMode}>
-          <Icon name={selectMode ? "close" : "check"} size={12} />
-          {selectMode ? "Exit select" : "Select"}
-        </button>
-      </div>
+      ) : null}
 
       <div className="table-wrap">
         <table className="data docs-data">

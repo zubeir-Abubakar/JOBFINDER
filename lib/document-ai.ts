@@ -2,6 +2,12 @@ import type { MasterCv, MasterRole } from "./master-cv";
 import type { JobAnalysis } from "./scoring";
 import { generateText } from "./providers";
 import {
+  coverLetterLengthIssues,
+  extractCoverLetterRequirements,
+  measureCoverLetter,
+  type CoverLetterRequirements,
+} from "./cover-letter-requirements";
+import {
   claimsNoSponsorship,
   claimsRequiresSponsorship,
   hasGenericCoverLanguage,
@@ -44,6 +50,8 @@ type AiContext = {
   analysis: JobAnalysis;
   taskId: string | null;
   workflowId: string | null;
+  /** Resolved from persisted vacancy requirements; falls back to the description. */
+  coverLetterRequirements?: CoverLetterRequirements;
 };
 
 const STOP_WORDS = new Set(
@@ -147,47 +155,103 @@ function authorisationSentence(master: MasterCv, job: JobLike): string {
   return "I hold a valid Swiss Permit B with work authorisation and do not require employer sponsorship. ";
 }
 
+function sentenceParts(value: string): string[] {
+  return (value.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [value]).map((part) => part.trim()).filter(Boolean);
+}
+
+/** Trim only optional sentences when a recruiter maximum is exceeded. */
+function fitCoverLetterToMaximum(
+  content: CoverLetterContent,
+  job: JobLike,
+  requirements: CoverLetterRequirements,
+): CoverLetterContent {
+  const exceedsMaximum = () =>
+    coverLetterLengthIssues(measureCoverLetter(content), requirements).some(
+      (issue) => issue.code === "too_long" || issue.code === "characters_above_maximum",
+    );
+  if (!exceedsMaximum()) return content;
+
+  const paragraphs = content.paragraphs.map((paragraph) => sentenceParts(paragraph));
+  // Keep the opening target, one verified achievement and the closing. Remove
+  // supporting sentences first rather than padding or deleting evidence wholesale.
+  const priorities = [2, 1, 3, 0];
+  for (let pass = 0; pass < 24 && exceedsMaximum(); pass += 1) {
+    let removed = false;
+    for (const paragraphIndex of priorities) {
+      const parts = paragraphs[paragraphIndex];
+      if (!parts || parts.length <= 1) continue;
+      for (let sentenceIndex = parts.length - 1; sentenceIndex >= 0; sentenceIndex -= 1) {
+        const sentence = parts[sentenceIndex];
+        if (paragraphIndex === 3 && /\b(?:Permit B|sponsorship)\b/i.test(sentence)) continue;
+        const candidateParts = [...parts.slice(0, sentenceIndex), ...parts.slice(sentenceIndex + 1)];
+        const candidateParagraphs = paragraphs.map((item, index) =>
+          index === paragraphIndex ? candidateParts.join(" ") : item.join(" "),
+        );
+        const candidateText = candidateParagraphs.join(" ");
+        if (!candidateText.toLowerCase().includes(job.company.toLowerCase())) continue;
+        if (!hasMetric(candidateText)) continue;
+        paragraphs[paragraphIndex] = candidateParts;
+        removed = true;
+        break;
+      }
+      if (removed) break;
+    }
+    if (!removed) break;
+  }
+  return {
+    ...content,
+    paragraphs: paragraphs.map((parts) => parts.join(" ")).filter(Boolean),
+    warnings: [...content.warnings, "Optional supporting detail was condensed to respect the stated cover-letter maximum."],
+  };
+}
+
 export function deterministicCoverLetter(
   master: MasterCv,
   job: JobLike,
   analysis: JobAnalysis,
+  requirements: CoverLetterRequirements = extractCoverLetterRequirements(job.description),
 ): CoverLetterContent {
   const keywords = keywordSet(job, analysis);
-  const achievements = pickAchievements(master, keywords, 2);
+  const achievements = pickAchievements(master, keywords, 3);
   const skills = relevantSkills(master, keywords, 4);
   const lead = master.roles[0];
   const salutation = "Dear Hiring Team,";
-  const requirements = requirementPhrase(analysis, job);
+  const requirementSummary = requirementPhrase(analysis, job);
   const skillPhrase = skills.length > 0 ? skills.join(", ") : "test automation, API testing and release quality";
   const first = achievements[0];
-  const second = achievements[1];
-  const evidence = first
-    ? `As ${first.role.title} at ${first.role.company}, I ${lowerFirst(first.bullet.replace(/\.$/, ""))}.`
+  const evidence = achievements.length
+    ? achievements
+        .map((item, index) => {
+          const text = lowerFirst(item.bullet.replace(/\.$/, ""));
+          if (index === 0) return `As ${item.role.title} at ${item.role.company}, I ${text}.`;
+          if (item.role.key === first?.role.key) return `In the same role, I ${text}.`;
+          return `Earlier, as ${item.role.title} at ${item.role.company}, I ${text}.`;
+        })
+        .join(" ")
     : `At ${lead?.company ?? "my most recent employer"} I owned test planning, automation and release validation for business-critical products.`;
-  const secondEvidence = second
-    ? second.role.key === first?.role.key
-      ? `In the same role, I ${lowerFirst(second.bullet.replace(/\.$/, ""))}.`
-      : `Earlier, as ${second.role.title} at ${second.role.company}, I ${lowerFirst(second.bullet.replace(/\.$/, ""))}.`
-    : "";
   const requirementMap =
     (analysis.matched ?? []).length > 0
       ? `That evidence is relevant to the vacancy's focus on ${(analysis.matched ?? []).slice(0, 2).join(" and ")}.`
       : "The evidence above reflects the technical depth and release ownership described in the vacancy.";
 
-  return {
-    salutation,
-    paragraphs: [
-      `The ${job.title} role at ${job.company} calls for ${requirements}. My verified experience covers ${skillPhrase}, with a record of turning test evidence into release decisions rather than simply adding more checks.`,
-      `${evidence}${secondEvidence ? ` ${secondEvidence}` : ""}`,
-      `${requirementMap} I work by making risk visible early, automating the checks that decide quality and keeping evidence traceable for engineering and product teams. I also make release trade-offs explicit, so decisions are based on evidence rather than opinion and the test approach stays proportionate to the risk.`,
-      `${authorisationSentence(master, job)}I would value the chance to discuss how I can contribute to ${job.company}'s quality engineering work.`,
-    ],
-    closing: "Sincerely,",
-    tailoredWithAi: false,
-    provider: null,
-    model: null,
-    warnings: ["Generated from the verified master CV using the deterministic fallback."],
-  };
+  return fitCoverLetterToMaximum(
+    {
+      salutation,
+      paragraphs: [
+        `The ${job.title} role at ${job.company} calls for ${requirementSummary}. My verified experience covers ${skillPhrase}, with a record of turning test evidence into release decisions rather than simply adding more checks.`,
+        evidence,
+        `${requirementMap} I work by making risk visible early, automating the checks that decide quality and keeping evidence traceable for engineering and product teams. I also make release trade-offs explicit, so decisions are based on evidence rather than opinion and the test approach stays proportionate to the risk.`,
+        `${authorisationSentence(master, job)}I would value the chance to discuss how I can contribute to ${job.company}'s quality engineering work.`,
+      ],
+      closing: "Sincerely,",
+      tailoredWithAi: false,
+      provider: null,
+      model: null,
+      warnings: ["Generated from the verified master CV using the deterministic fallback."],
+    },
+    job,
+    requirements,
+  );
 }
 
 function parseJsonObject(value: string): Record<string, unknown> | null {
@@ -305,7 +369,7 @@ const COVER_SCHEMA = {
   },
 } as const;
 
-function jobBrief(job: JobLike, analysis: JobAnalysis): string {
+function jobBrief(job: JobLike, analysis: JobAnalysis, requirements?: CoverLetterRequirements): string {
   return JSON.stringify({
     title: job.title,
     company: job.company,
@@ -314,6 +378,7 @@ function jobBrief(job: JobLike, analysis: JobAnalysis): string {
     matched: analysis.matched,
     missing: analysis.missing,
     concerns: analysis.concerns,
+    coverLetterRequirements: requirements ?? null,
     description: job.description.slice(0, 7_000),
   });
 }
@@ -411,11 +476,27 @@ export async function generateCoverLetter(
   master: MasterCv,
   context: AiContext,
 ): Promise<CoverLetterContent> {
-  const fallback = deterministicCoverLetter(master, context.job, context.analysis);
+  const requirements =
+    context.coverLetterRequirements ?? extractCoverLetterRequirements(context.job.description);
+  const fallback = deterministicCoverLetter(master, context.job, context.analysis, requirements);
+  const limitRule = requirements.source === "recruiter"
+    ? `The vacancy states an EXPLICIT recruiter limit. The complete letter body, including salutation and closing, must satisfy: ${
+        [
+          requirements.minWords !== null ? `at least ${requirements.minWords} words` : "",
+          requirements.maxWords !== null ? `at most ${requirements.maxWords} words` : "",
+          requirements.minCharacters !== null ? `at least ${requirements.minCharacters} characters` : "",
+          requirements.maxCharacters !== null ? `at most ${requirements.maxCharacters} characters` : "",
+          requirements.maxPages !== null ? `at most ${requirements.maxPages} rendered page(s)` : "",
+        ]
+          .filter(Boolean)
+          .join(" and ")
+      }. Count the actual final text. Do not add irrelevant filler.`
+    : "No explicit recruiter word or character limit was found. Use the internal professional target of 180 to 320 words. This is an internal default, not a recruiter requirement.";
   const prompt = `Write a concise, achievement-led cover letter for this specific vacancy. Return JSON only.
 
 RULES:
-- 3 to 5 paragraphs, 180 to 320 words.
+- ${limitRule}
+- Use 3 to 5 coherent paragraphs.
 - No generic opening such as "I am writing to apply" or "I am excited to apply".
 - Use one or two achievements from the master CV that are genuinely relevant to this vacancy.
 - Use only verified facts. Never invent employers, tools, certifications, metrics or responsibilities.
@@ -427,7 +508,7 @@ RULES:
 - End with a confident professional close.
 
 VACANCY AND ANALYSIS:
-${jobBrief(context.job, context.analysis)}
+${jobBrief(context.job, context.analysis, requirements)}
 
 MASTER CV:
 ${JSON.stringify({
@@ -459,8 +540,11 @@ ${JSON.stringify({
     const paragraphs = Array.isArray(parsed.paragraphs)
       ? parsed.paragraphs.map(cleanString).filter((paragraph): paragraph is string => Boolean(paragraph))
       : [];
+    const salutation = cleanString(parsed.salutation) ?? fallback.salutation;
+    const closing = cleanString(parsed.closing) ?? fallback.closing;
     const text = paragraphs.join(" ");
-    const wordCount = text.split(/\s+/).filter(Boolean).length;
+    const candidateLength = measureCoverLetter({ salutation, paragraphs, closing });
+    const lengthIssues = coverLetterLengthIssues(candidateLength, requirements);
     const source = sourceMetrics(master);
     const usedMetrics = [...new Set(metricsIn(text).map((metric) => metric.toLowerCase()))];
     const requirementTerms = [...new Set((context.analysis.matched ?? []).map((item) => item.toLowerCase()).filter(Boolean))];
@@ -471,8 +555,7 @@ ${JSON.stringify({
     const invalid =
       paragraphs.length < 3 ||
       paragraphs.length > 6 ||
-      wordCount < 180 ||
-      wordCount > 320 ||
+      lengthIssues.length > 0 ||
       invalidGenericOpening(paragraphs[0] ?? "") ||
       hasGenericCoverLanguage(text) ||
       hasKeywordStuffing(text, 6) ||
@@ -484,9 +567,10 @@ ${JSON.stringify({
       mentionsSalaryExpectation(text) ||
       (authorisationAsked && permitB && !authorisationMentioned) ||
       claimsRequiresSponsorship(text);
-    if (invalid) return { ...fallback, provider: result.provider, model: result.model, warnings: ["AI cover letter failed grounding, length or vacancy-targeting checks; deterministic letter retained."] };
-    const salutation = cleanString(parsed.salutation) ?? fallback.salutation;
-    const closing = cleanString(parsed.closing) ?? fallback.closing;
+    if (invalid) {
+      const reason = lengthIssues[0]?.message ?? "grounding, length or vacancy-targeting checks";
+      return { ...fallback, provider: result.provider, model: result.model, warnings: [`AI cover letter was rejected (${reason}); the deterministic letter was used.`] };
+    }
     return { salutation, paragraphs, closing, tailoredWithAi: true, provider: result.provider, model: result.model, warnings: [] };
   } catch (error) {
     return { ...fallback, warnings: [`AI cover letter was unavailable (${error instanceof Error ? error.message : "unknown error"}); deterministic letter retained.`] };

@@ -280,7 +280,7 @@ export default async function SettingsPage({
                 </div>
               </div>
               <p className="hint" data-testid="recruitment-next-run">
-                Next run: {formatInZone(recruitmentSchedule.nextRunAt, recruitmentSchedule.timezone)}. On unselected days no scheduled discovery, document generation or inference runs; manual requests still work.
+                Main discovery at {recruitmentSchedule.slotTimes[0]}; incremental discovery at {recruitmentSchedule.incrementalTimes.join(", ")} {recruitmentSchedule.timezone}. Next run: {formatInZone(recruitmentSchedule.nextRunAt, recruitmentSchedule.timezone)} ({recruitmentSchedule.nextRunMode ?? "none"}). On unselected days no scheduled discovery, document generation or inference runs; manual requests still work.
               </p>
               <div><SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save recruitment schedule</SubmitButton></div>
             </div>

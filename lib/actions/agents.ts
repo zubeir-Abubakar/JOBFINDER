@@ -14,7 +14,7 @@ export async function startWorkflowAction(formData: FormData): Promise<void> {
   const result = await startRecruitmentWorkflow(user.id, { pages, autoPackage: true });
   revalidatePath("/agents");
   revalidatePath("/dashboard");
-  redirect(`/agents?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
+  redirect(`/agents/list?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
 }
 
 export async function pauseWorkflowAction(): Promise<void> {
@@ -22,7 +22,7 @@ export async function pauseWorkflowAction(): Promise<void> {
   const message = await pauseRunningWorkflow(user);
   audit({ action: "workflow.pause_requested", entity: "workflow", detail: message, userId: user.id });
   revalidatePath("/agents");
-  redirect(`/agents?ok=${encodeURIComponent(message)}`);
+  redirect(`/agents/list?ok=${encodeURIComponent(message)}`);
 }
 
 export async function stopWorkflowAction(): Promise<void> {
@@ -30,14 +30,14 @@ export async function stopWorkflowAction(): Promise<void> {
   const message = await stopRunningWorkflow(user);
   audit({ action: "workflow.stop_requested", entity: "workflow", detail: message, userId: user.id });
   revalidatePath("/agents");
-  redirect(`/agents?ok=${encodeURIComponent(message)}`);
+  redirect(`/agents/list?ok=${encodeURIComponent(message)}`);
 }
 
 export async function resumeWorkflowAction(): Promise<void> {
   const user = await requireUser();
   const result = await resumeLatestWorkflow(user);
   revalidatePath("/agents");
-  redirect(`/agents?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
+  redirect(`/agents/list?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
 }
 
 export async function retryWorkflowAction(formData: FormData): Promise<void> {
@@ -45,7 +45,7 @@ export async function retryWorkflowAction(formData: FormData): Promise<void> {
   const id = String(formData.get("workflow_id") ?? "");
   const result = await retryWorkflow(user, id);
   revalidatePath("/agents");
-  redirect(`/agents?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
+  redirect(`/agents/list?${result.ok ? "ok" : "error"}=${encodeURIComponent(result.message)}`);
 }
 
 export async function pauseAllAction(): Promise<void> {
@@ -54,7 +54,7 @@ export async function pauseAllAction(): Promise<void> {
   audit({ action: "agents.paused", entity: "agents", detail: `${count} agents paused from dashboard`, userId: user.id });
   revalidatePath("/dashboard");
   revalidatePath("/agents");
-  redirect("/agents?ok=All+agents+paused");
+  redirect("/agents/list?ok=All+agents+paused");
 }
 
 export async function resumeAllAction(): Promise<void> {
@@ -63,7 +63,7 @@ export async function resumeAllAction(): Promise<void> {
   audit({ action: "agents.resumed", entity: "agents", detail: `${count} agents resumed from dashboard`, userId: user.id });
   revalidatePath("/dashboard");
   revalidatePath("/agents");
-  redirect("/agents?ok=All+agents+resumed");
+  redirect("/agents/list?ok=All+agents+resumed");
 }
 
 export async function runDiscoveryAction(formData: FormData): Promise<void> {
@@ -74,7 +74,7 @@ export async function runDiscoveryAction(formData: FormData): Promise<void> {
   revalidatePath("/dashboard");
   revalidatePath("/jobs");
   const message = encodeURIComponent([outcome.summary, ...outcome.details].join(" · "));
-  redirect(`/agents?${outcome.status === "completed" ? "ok" : "error"}=${message}`);
+  redirect(`/agents/list?${outcome.status === "completed" ? "ok" : "error"}=${message}`);
 }
 
 export async function analyseBacklogAction(): Promise<void> {
@@ -83,7 +83,7 @@ export async function analyseBacklogAction(): Promise<void> {
   audit({ action: "jobs.analysed_batch", entity: "jobs", detail: `${count} vacancies analysed`, userId: user.id });
   revalidatePath("/agents");
   revalidatePath("/jobs");
-  redirect(`/agents?ok=${encodeURIComponent(`${count} vacancies analysed.`)}`);
+  redirect(`/agents/list?ok=${encodeURIComponent(`${count} vacancies analysed.`)}`);
 }
 
 /** Enabling or disabling an agent is an administrative action. */

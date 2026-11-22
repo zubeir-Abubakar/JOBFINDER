@@ -14,27 +14,30 @@ import {
 import { audit } from "./audit";
 import { notify } from "./notify";
 import { tickExecutiveBriefSchedule } from "./executive-brief";
+import { recoverStalledTasks } from "./task-recovery";
 
 /**
  * Schedule tick. Called by the process timer and by the cron-compatible API
  * route, so the same rules apply locally and in a future hosted deployment.
  *
  * - the persisted weekday set decides whether today is an active day,
- * - one scheduled run per local calendar day (unique run key),
+ * - one durable run per main/incremental occurrence (unique run key),
  * - catch-up inside the configured window,
  * - an explicit "missed" record once that window has passed, never a silent skip,
  * - never two runs at once,
  * - a rest day performs no discovery, no model call and no token spend.
  */
 
-type TickGlobal = typeof globalThis & { __atwRecruitmentTimer?: ReturnType<typeof setInterval> };
-
-let lastTickAt: string | null = null;
+type TickGlobal = typeof globalThis & {
+  __atwRecruitmentTimer?: ReturnType<typeof setInterval>;
+  /** Shared across dev module copies, like the timer itself. */
+  __atwRecruitmentLastTickAt?: string | null;
+};
 
 /** Honest in-process scheduler health for the dashboard. */
 export function recruitmentSchedulerStatus(): { running: boolean; lastTickAt: string | null } {
   const g = globalThis as TickGlobal;
-  return { running: Boolean(g.__atwRecruitmentTimer), lastTickAt };
+  return { running: Boolean(g.__atwRecruitmentTimer), lastTickAt: g.__atwRecruitmentLastTickAt ?? null };
 }
 
 export type TickResult = {
@@ -51,6 +54,15 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
   // Liveness belongs to the process, not to whether this process won the tick
   // lease. A paused or resting schedule is still a running, healthy scheduler.
   heartbeatRuntimeWorker("recruitment_scheduler");
+  // Stale-task recovery is independent of the recruitment schedule. It only
+  // acts after the execution timeout and never touches a run with a live lease,
+  // so a rest day or a second process cannot fabricate a task failure.
+  try {
+    recoverStalledTasks(now);
+  } catch {
+    // Recovery is best-effort; the persisted task state remains the source of
+    // truth and the next tick will try again. This must not stop scheduling.
+  }
   // The daily report is a separate durable schedule row. It is ticked even when
   // recruitment rests, so a rest day cannot hide a due report.
   let executiveBrief: Awaited<ReturnType<typeof tickExecutiveBriefSchedule>> | undefined;
@@ -155,18 +167,20 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
       const scheduledAt = snapshot.nextRunAt;
       const missedId = `run_${randomId()}`;
       const reason = `The scheduled run at ${formatInZone(scheduledAt)} was missed by more than ${catchUpWindowHours()} hour(s). The host or application was not running. It was not silently executed late.`;
+      const missedScope = snapshot.nextRunMode ?? "full";
       run(
-        `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, failures, warnings, error, report, created_at, finished_at)
-         VALUES (?, ?, ?, 'catch_up', 'failed', ?, 0, 0, ?, ?, ?, ?)`,
+        `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, failures, warnings, error, report, created_at, finished_at, discovery_scope)
+         VALUES (?, ?, ?, 'catch_up', 'failed', ?, 0, 0, ?, ?, ?, ?, ?)`,
         [
           missedId,
-          `${localDateKey(new Date(scheduledAt ?? now.toISOString()))}#missed-${randomId().slice(0, 6)}`,
+          `${localDateKey(new Date(scheduledAt ?? now.toISOString()))}#missed-${missedScope}-${randomId().slice(0, 6)}`,
           scheduledAt,
           JSON.stringify([{ state: "scheduled", at: scheduledAt }, { state: "failed", at: now.toISOString(), message: reason }]),
           reason,
           reason,
           now.toISOString(),
           now.toISOString(),
+          missedScope,
         ],
       );
       recordScheduleRun({ runId: missedId, status: "failed", error: reason, now, scheduledFor: scheduledAt });
@@ -179,6 +193,7 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
       trigger: snapshot.overdueMs > 0 ? "catch_up" : "schedule",
       now,
       scheduledFor: snapshot.nextRunAt,
+      discoveryScope: snapshot.nextRunMode ?? "full",
     });
     if (!created.created) {
       return {
@@ -208,7 +223,7 @@ export function startRecruitmentScheduler(): void {
   if (g.__atwRecruitmentTimer) return;
   startRuntimeWorker("recruitment_scheduler", "Durable weekly recruitment schedule ticker");
   const tick = () => {
-    lastTickAt = new Date().toISOString();
+    g.__atwRecruitmentLastTickAt = new Date().toISOString();
     void tickRecruitmentSchedule().catch(() => {
       // A failed tick must not take the server down; the next tick retries and
       // the failure is visible in the run/schedule records.
@@ -223,5 +238,6 @@ export function stopRecruitmentScheduler(): void {
   const g = globalThis as TickGlobal;
   if (g.__atwRecruitmentTimer) clearInterval(g.__atwRecruitmentTimer);
   g.__atwRecruitmentTimer = undefined;
+  g.__atwRecruitmentLastTickAt = null;
   stopRuntimeWorker("recruitment_scheduler", "Stopped with the application process");
 }

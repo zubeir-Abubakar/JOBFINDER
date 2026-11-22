@@ -4,6 +4,7 @@ import { htmlToText } from "./scoring";
 import { researchJobs } from "./jobs";
 import { getSetting } from "./settings";
 import { classifyVacancy } from "./vacancy-classification";
+import { extractCoverLetterRequirements } from "./cover-letter-requirements";
 import {
   requestJson,
   requestText,
@@ -40,6 +41,8 @@ export type DiscoveredJob = {
   applicationUrl: string | null;
   description: string;
   publishedAt: string | null;
+  /** Source update timestamp when the connector exposes one. */
+  updatedAt?: string | null;
   raw?: unknown;
 };
 
@@ -54,6 +57,7 @@ export type DiscoverySource = {
   fresh: number;
   relevant: number;
   duplicates: number;
+  updated?: number;
   configured?: boolean;
   status?: "ok" | "empty" | "partial" | "failed" | "skipped";
   attempts?: number;
@@ -72,6 +76,7 @@ export type SourceMetrics = {
   relevant: number;
   duplicates: number;
   inserted: number;
+  updated: number;
   errors: number;
   eligible: number;
   qualified: number;
@@ -84,10 +89,13 @@ export type DiscoveryResult = {
   discovered: number;
   inserted: number;
   duplicates: number;
+  updated: number;
   filtered: number;
   jobIds: string[];
   sources: DiscoverySource[];
   warnings: string[];
+  scope?: "full" | "incremental";
+  since?: string | null;
   sourcesChecked?: number;
   sourcesSucceeded?: number;
   sourcesFailed?: number;
@@ -205,12 +213,49 @@ function touchJobSeen(id: string, source: string): void {
   run("UPDATE jobs SET last_seen_at = ?, last_seen_source = ? WHERE id = ?", [nowIso(), source, id]);
 }
 
-/** Returns the new row id, or null when the vacancy is a duplicate. */
-export function insertDiscovered(job: DiscoveredJob, runId: string | null): string | null {
+function sourceUpdatedAt(job: DiscoveredJob): string | null {
+  return job.updatedAt ?? job.publishedAt ?? null;
+}
+
+export type ReconcileOutcome = {
+  id: string | null;
+  outcome: "new" | "known" | "updated";
+  rule?: DuplicateMatch["rule"];
+};
+
+/**
+ * Reconcile a source listing with the canonical vacancy store.
+ *
+ * - `new`: a row was inserted.
+ * - `known`: the same vacancy was already present and is merely seen again.
+ * - `updated`: the source supplied a newer update timestamp than the one last
+ *   acknowledged. The row is not duplicated and is not reprocessed as new.
+ */
+export function reconcileDiscovered(job: DiscoveredJob, runId: string | null): ReconcileOutcome {
   const duplicate = findDuplicateJob(job);
   if (duplicate) {
-    touchJobSeen(duplicate.id, job.source);
-    return null;
+    const existing = one<{ source_updated_at: string | null }>(
+      "SELECT source_updated_at FROM jobs WHERE id = ?",
+      [duplicate.id],
+    );
+    const candidate = sourceUpdatedAt(job);
+    let nextSeen = existing?.source_updated_at ?? null;
+    let outcome: "known" | "updated" = "known";
+    if (candidate && Number.isFinite(Date.parse(candidate))) {
+      if (!nextSeen) {
+        // Backfill for a row created before update evidence was stored. This is
+        // not a new observation of an update and must not inflate the counter.
+        nextSeen = candidate;
+      } else if (Date.parse(candidate) > Date.parse(nextSeen)) {
+        nextSeen = candidate;
+        outcome = "updated";
+      }
+    }
+    run(
+      "UPDATE jobs SET last_seen_at = ?, last_seen_source = ?, source_updated_at = COALESCE(?, source_updated_at) WHERE id = ?",
+      [nowIso(), job.source, nextSeen, duplicate.id],
+    );
+    return { id: duplicate.id, outcome, rule: duplicate.rule };
   }
 
   const id = `job_${crypto.randomBytes(8).toString("hex")}`;
@@ -221,13 +266,19 @@ export function insertDiscovered(job: DiscoveredJob, runId: string | null): stri
     location: job.location,
     description: job.description,
   });
+  const retrievedAt = nowIso();
+  const coverLetter = extractCoverLetterRequirements(job.description, {
+    sourceUrl: job.url,
+    retrievedAt,
+  });
+  const updatedAt = sourceUpdatedAt(job);
   try {
     run(
       `INSERT INTO jobs (id, source, source_platform, external_id, title, company, company_domain, location, remote,
                          employment_type, salary, url, application_url, description, classification, requirements,
                          published_at, posted_at, discovered_at, status, dedupe_key, run_id, raw,
-                         last_seen_at, last_seen_source)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)`,
+                         last_seen_at, last_seen_source, source_updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)`,
       [
         id,
         job.source,
@@ -244,7 +295,11 @@ export function insertDiscovered(job: DiscoveredJob, runId: string | null): stri
         job.applicationUrl ?? job.url,
         job.description.slice(0, 24000),
         JSON.stringify(classification).slice(0, 12000),
-        JSON.stringify({ mandatory: classification.mandatory, preferences: classification.preferences }).slice(0, 8000),
+        JSON.stringify({
+          mandatory: classification.mandatory,
+          preferences: classification.preferences,
+          coverLetter,
+        }).slice(0, 12000),
         job.publishedAt,
         job.publishedAt,
         nowIso(),
@@ -253,14 +308,21 @@ export function insertDiscovered(job: DiscoveredJob, runId: string | null): stri
         job.raw ? JSON.stringify(job.raw).slice(0, 20000) : null,
         nowIso(),
         job.source,
+        updatedAt,
       ],
     );
   } catch (error) {
     // The unique dedupe index is the final guard if two connectors race.
-    if (/unique/i.test(error instanceof Error ? error.message : "")) return null;
+    if (/unique/i.test(error instanceof Error ? error.message : "")) return { id: null, outcome: "known" };
     throw error;
   }
-  return id;
+  return { id, outcome: "new" };
+}
+
+/** Returns the new row id, or null when the vacancy is already known or updated. */
+export function insertDiscovered(job: DiscoveredJob, runId: string | null): string | null {
+  const reconciled = reconcileDiscovered(job, runId);
+  return reconciled.outcome === "new" ? reconciled.id : null;
 }
 
 type AshbyPosting = {
@@ -448,6 +510,7 @@ export async function discoverFromAshby(boards: string[]): Promise<RawDiscovery>
           applicationUrl: posting.applyUrl ?? posting.jobUrl ?? url,
           description,
           publishedAt: posting.publishedAt ?? null,
+          updatedAt: posting.publishedAt ?? null,
           raw: { board: slug, id: posting.id, department: posting.department, team: posting.team },
         });
       }
@@ -601,6 +664,7 @@ export async function discoverFromCareerPages(pages: string[]): Promise<RawDisco
           applicationUrl: url,
           description,
           publishedAt: asText(posting.datePosted) || null,
+          updatedAt: asText(posting.dateModified) || asText(posting.datePosted) || null,
           raw: { page: pageUrl, identifier: asText(posting.identifier) },
         });
       }
@@ -728,6 +792,7 @@ export async function discoverFromGreenhouse(boards: string[]): Promise<RawDisco
           applicationUrl: url,
           description,
           publishedAt: posted,
+          updatedAt: posting.updated_at ?? posted,
           raw: { board: token, id: posting.id },
         });
       }
@@ -869,6 +934,7 @@ export async function discoverFromLever(sites: string[]): Promise<RawDiscovery> 
           applicationUrl: posting.applyUrl ?? url,
           description,
           publishedAt: posted,
+          updatedAt: posted,
           raw: { site: slug, id: posting.id, team: posting.categories?.team },
         });
       }
@@ -926,6 +992,7 @@ export type SourceHealth = {
   last_duration_ms: number;
   last_checked_at: string;
   last_success_at: string | null;
+  last_run_id: string | null;
 };
 
 /** Persist the real retrieval evidence for one connector/endpoint. */
@@ -1148,6 +1215,7 @@ export async function discoverFromJobsCh(
           applicationUrl: url,
           description,
           publishedAt,
+          updatedAt: publishedAt,
           raw: { job_id: document.job_id, query, page, publication_date: publishedAt, languages: document.language_skills },
         });
       }
@@ -1225,28 +1293,53 @@ export function configuredLeverSites(): string[] {
   return [...new Set(value)];
 }
 
+function previousSuccessfulDiscoveryAt(runId: string): string | null {
+  const row = one<{ started_at: string | null; finished_at: string | null }>(
+    `SELECT started_at, finished_at FROM recruitment_runs
+     WHERE id != ? AND status IN ('completed','completed_with_warnings')
+       AND discovery_state != 'failed'
+     ORDER BY finished_at DESC LIMIT 1`,
+    [runId],
+  );
+  // Start, not finish, so a vacancy published while the previous run was still
+  // reading sources is inside the next incremental window.
+  return row?.started_at ?? row?.finished_at ?? null;
+}
+
 /**
- * Runs every connector for one daily run. A source that fails is recorded and
- * the remaining sources still contribute; the run never reports a source as
+ * Runs every connector for one scheduled run. A source that fails is recorded
+ * and the remaining sources still contribute; the run never reports a source as
  * searched when it errored.
+ *
+ * Incremental scope still performs the safe full-source read for connectors
+ * that do not expose a reliable cursor. The previous successful discovery time
+ * is recorded and used for new/updated evidence; overlap is reconciled by the
+ * canonical dedupe rules rather than by discarding unexpected postings.
  */
 export async function discoverJobSources(options: {
   runId: string;
   pages?: number;
+  scope?: "full" | "incremental";
+  since?: string | null;
   ashbyBoards?: string[];
   careerPages?: string[];
   greenhouseBoards?: string[];
   leverSites?: string[];
   jobsChQueries?: string[];
 }): Promise<DiscoveryResult> {
+  const scope = options.scope ?? "full";
+  const since = options.since ?? (scope === "incremental" ? previousSuccessfulDiscoveryAt(options.runId) : null);
   const result: DiscoveryResult = {
     discovered: 0,
     inserted: 0,
     duplicates: 0,
+    updated: 0,
     filtered: 0,
     jobIds: [],
     sources: [],
     warnings: [],
+    scope,
+    since,
   };
   const pages = Math.min(5, Math.max(1, options.pages ?? 2));
 
@@ -1254,6 +1347,7 @@ export async function discoverJobSources(options: {
   logSourceDiagnostics(options.runId, "arbeitnow", research.diagnostics);
   result.inserted += research.inserted;
   result.duplicates += research.duplicates;
+  result.updated += research.updated ?? 0;
   result.filtered += research.filteredOut;
   for (const job of research.jobs) {
     run("UPDATE jobs SET run_id = ?, source_platform = COALESCE(source_platform, 'Arbeitnow') WHERE id = ?", [options.runId, job.id]);
@@ -1270,6 +1364,7 @@ export async function discoverJobSources(options: {
     fresh: research.fresh,
     relevant: Math.max(0, research.fetched - research.filteredOut),
     duplicates: research.duplicates,
+    updated: research.updated ?? 0,
     configured: true,
     status: research.error ? (research.responses > 0 ? "partial" : "failed") : research.fetched === 0 ? "empty" : "ok",
     attempts: research.attempts,
@@ -1297,17 +1392,20 @@ export async function discoverJobSources(options: {
   logSourceDiagnostics(options.runId, "ashby", ashby.diagnostics);
   let ashbyInserted = 0;
   let ashbyDuplicates = 0;
+  let ashbyUpdated = 0;
   for (const job of ashby.jobs) {
-    const id = insertDiscovered(job, options.runId);
-    if (id) {
+    const reconciled = reconcileDiscovered(job, options.runId);
+    if (reconciled.outcome === "new" && reconciled.id) {
       ashbyInserted += 1;
-      result.jobIds.push(id);
+      result.jobIds.push(reconciled.id);
     } else {
       ashbyDuplicates += 1;
+      if (reconciled.outcome === "updated") ashbyUpdated += 1;
     }
   }
   result.inserted += ashbyInserted;
   result.duplicates += ashbyDuplicates;
+  result.updated += ashbyUpdated;
   result.filtered += ashby.filtered;
   result.sources.push({
     key: "ashby",
@@ -1320,6 +1418,7 @@ export async function discoverJobSources(options: {
     fresh: ashby.fresh,
     relevant: Math.max(0, ashby.fetched - ashby.filtered),
     duplicates: ashbyDuplicates,
+    updated: ashbyUpdated,
     configured: boards.length > 0,
     status: boards.length === 0 ? "skipped" : ashby.responses === 0 ? "failed" : ashby.error ? "partial" : ashby.fetched === 0 ? "empty" : "ok",
     attempts: ashby.attempts,
@@ -1333,17 +1432,20 @@ export async function discoverJobSources(options: {
   logSourceDiagnostics(options.runId, "greenhouse", greenhouse.diagnostics);
   let greenhouseInserted = 0;
   let greenhouseDuplicates = 0;
+  let greenhouseUpdated = 0;
   for (const job of greenhouse.jobs) {
-    const id = insertDiscovered(job, options.runId);
-    if (id) {
+    const reconciled = reconcileDiscovered(job, options.runId);
+    if (reconciled.outcome === "new" && reconciled.id) {
       greenhouseInserted += 1;
-      result.jobIds.push(id);
+      result.jobIds.push(reconciled.id);
     } else {
       greenhouseDuplicates += 1;
+      if (reconciled.outcome === "updated") greenhouseUpdated += 1;
     }
   }
   result.inserted += greenhouseInserted;
   result.duplicates += greenhouseDuplicates;
+  result.updated += greenhouseUpdated;
   result.filtered += greenhouse.filtered;
   result.sources.push({
     key: "greenhouse",
@@ -1356,6 +1458,7 @@ export async function discoverJobSources(options: {
     fresh: greenhouse.fresh,
     relevant: Math.max(0, greenhouse.fetched - greenhouse.filtered),
     duplicates: greenhouseDuplicates,
+    updated: greenhouseUpdated,
     configured: greenhouseBoards.length > 0,
     status: greenhouseBoards.length === 0 ? "skipped" : greenhouse.responses === 0 ? "failed" : greenhouse.error ? "partial" : greenhouse.fetched === 0 ? "empty" : "ok",
     attempts: greenhouse.attempts,
@@ -1369,17 +1472,20 @@ export async function discoverJobSources(options: {
   logSourceDiagnostics(options.runId, "lever", lever.diagnostics);
   let leverInserted = 0;
   let leverDuplicates = 0;
+  let leverUpdated = 0;
   for (const job of lever.jobs) {
-    const id = insertDiscovered(job, options.runId);
-    if (id) {
+    const reconciled = reconcileDiscovered(job, options.runId);
+    if (reconciled.outcome === "new" && reconciled.id) {
       leverInserted += 1;
-      result.jobIds.push(id);
+      result.jobIds.push(reconciled.id);
     } else {
       leverDuplicates += 1;
+      if (reconciled.outcome === "updated") leverUpdated += 1;
     }
   }
   result.inserted += leverInserted;
   result.duplicates += leverDuplicates;
+  result.updated += leverUpdated;
   result.filtered += lever.filtered;
   result.sources.push({
     key: "lever",
@@ -1392,6 +1498,7 @@ export async function discoverJobSources(options: {
     fresh: lever.fresh,
     relevant: Math.max(0, lever.fetched - lever.filtered),
     duplicates: leverDuplicates,
+    updated: leverUpdated,
     configured: leverSites.length > 0,
     status: leverSites.length === 0 ? "skipped" : lever.responses === 0 ? "failed" : lever.error ? "partial" : lever.fetched === 0 ? "empty" : "ok",
     attempts: lever.attempts,
@@ -1437,17 +1544,20 @@ export async function discoverJobSources(options: {
   logSourceDiagnostics(options.runId, "jobs_ch", jobsCh.diagnostics);
   let jobsChInserted = 0;
   let jobsChDuplicates = 0;
+  let jobsChUpdated = 0;
   for (const job of jobsCh.jobs) {
-    const id = insertDiscovered(job, options.runId);
-    if (id) {
+    const reconciled = reconcileDiscovered(job, options.runId);
+    if (reconciled.outcome === "new" && reconciled.id) {
       jobsChInserted += 1;
-      result.jobIds.push(id);
+      result.jobIds.push(reconciled.id);
     } else {
       jobsChDuplicates += 1;
+      if (reconciled.outcome === "updated") jobsChUpdated += 1;
     }
   }
   result.inserted += jobsChInserted;
   result.duplicates += jobsChDuplicates;
+  result.updated += jobsChUpdated;
   result.filtered += jobsCh.filtered;
   result.sources.push({
     key: "jobs_ch",
@@ -1460,6 +1570,7 @@ export async function discoverJobSources(options: {
     fresh: jobsCh.fresh,
     relevant: Math.max(0, jobsCh.fetched - jobsCh.filtered),
     duplicates: jobsChDuplicates,
+    updated: jobsChUpdated,
     configured: jobsChQueries.length > 0,
     status: jobsChQueries.length === 0 ? "skipped" : jobsCh.responses === 0 ? "failed" : jobsCh.error ? "partial" : jobsCh.fetched === 0 ? "empty" : "ok",
     attempts: jobsCh.attempts,
@@ -1473,17 +1584,20 @@ export async function discoverJobSources(options: {
   logSourceDiagnostics(options.runId, "career_pages", careers.diagnostics);
   let careerInserted = 0;
   let careerDuplicates = 0;
+  let careerUpdated = 0;
   for (const job of careers.jobs) {
-    const id = insertDiscovered(job, options.runId);
-    if (id) {
+    const reconciled = reconcileDiscovered(job, options.runId);
+    if (reconciled.outcome === "new" && reconciled.id) {
       careerInserted += 1;
-      result.jobIds.push(id);
+      result.jobIds.push(reconciled.id);
     } else {
       careerDuplicates += 1;
+      if (reconciled.outcome === "updated") careerUpdated += 1;
     }
   }
   result.inserted += careerInserted;
   result.duplicates += careerDuplicates;
+  result.updated += careerUpdated;
   result.filtered += careers.filtered;
   result.sources.push({
     key: "career_pages",
@@ -1496,6 +1610,7 @@ export async function discoverJobSources(options: {
     fresh: careers.fresh,
     relevant: Math.max(0, careers.fetched - careers.filtered),
     duplicates: careerDuplicates,
+    updated: careerUpdated,
     configured: pagesConfig.length > 0,
     status: pagesConfig.length === 0 ? "skipped" : careers.responses === 0 ? "failed" : careers.error ? "partial" : careers.fetched === 0 ? "empty" : "ok",
     attempts: careers.attempts,
@@ -1549,6 +1664,22 @@ export async function discoverJobSources(options: {
     );
   } else if (checked.length === 0) {
     result.warnings.push("No job source is configured. Discovery did not run.");
+  }
+  // Newly stored vacancies are presented newest-first so a limit or interruption
+  // prioritises recently published, still-open opportunities.
+  const publishedById = new Map(
+    all<{ id: string; published_at: string | null }>(
+      "SELECT id, published_at FROM jobs WHERE run_id = ?",
+      [options.runId],
+    ).map((row) => [row.id, row.published_at]),
+  );
+  result.jobIds.sort((a, b) => {
+    const at = Date.parse(publishedById.get(a) ?? "");
+    const bt = Date.parse(publishedById.get(b) ?? "");
+    return (Number.isFinite(bt) ? bt : 0) - (Number.isFinite(at) ? at : 0);
+  });
+  for (const source of result.sources) {
+    run("UPDATE discovery_source_status SET last_run_id = ? WHERE source_key = ?", [options.runId, source.key]);
   }
   result.discovered = result.inserted;
   return result;

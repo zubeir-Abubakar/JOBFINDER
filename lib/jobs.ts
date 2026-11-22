@@ -28,6 +28,7 @@ export type JobRow = {
   raw: string | null;
   last_seen_at: string | null;
   last_seen_source: string | null;
+  requirements?: string | null;
 };
 
 const QA_TITLE = /\b(qa|quality assurance|test(ing)? engineer|test automation|sdet|software test|test lead|test manager|automation engineer)\b/i;
@@ -50,6 +51,7 @@ export type ResearchResult = {
   fetched: number;
   inserted: number;
   duplicates: number;
+  updated: number;
   filteredOut: number;
   requests: number;
   responses: number;
@@ -102,6 +104,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
     fetched: 0,
     inserted: 0,
     duplicates: 0,
+    updated: 0,
     filteredOut: 0,
     requests: 0,
     responses: 0,
@@ -195,26 +198,56 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
         continue;
       }
 
-      const existing = one<{ id: string }>("SELECT id FROM jobs WHERE source = 'arbeitnow' AND external_id = ?", [item.slug]);
+      const postedIso = item.created_at ? new Date(item.created_at * 1000).toISOString() : null;
+      const existing = one<{ id: string; source_updated_at: string | null }>(
+        "SELECT id, source_updated_at FROM jobs WHERE source = 'arbeitnow' AND external_id = ?",
+        [item.slug],
+      );
       if (existing) {
-        run("UPDATE jobs SET last_seen_at = ?, last_seen_source = ? WHERE id = ?", [nowIso(), "arbeitnow", existing.id]);
+        let nextSeen = existing.source_updated_at;
+        let updated = false;
+        if (postedIso && Number.isFinite(Date.parse(postedIso))) {
+          if (!nextSeen) nextSeen = postedIso;
+          else if (Date.parse(postedIso) > Date.parse(nextSeen)) {
+            nextSeen = postedIso;
+            updated = true;
+          }
+        }
+        run(
+          "UPDATE jobs SET last_seen_at = ?, last_seen_source = ?, source_updated_at = COALESCE(?, source_updated_at) WHERE id = ?",
+          [nowIso(), "arbeitnow", nextSeen, existing.id],
+        );
         result.duplicates += 1;
+        if (updated) result.updated += 1;
         continue;
       }
-      const nearDuplicate = one<{ id: string }>(
-        "SELECT id FROM jobs WHERE lower(trim(title)) = lower(trim(?)) AND lower(trim(company)) = lower(trim(?))",
+      const nearDuplicate = one<{ id: string; source_updated_at: string | null }>(
+        "SELECT id, source_updated_at FROM jobs WHERE lower(trim(title)) = lower(trim(?)) AND lower(trim(company)) = lower(trim(?))",
         [item.title, item.company_name],
       );
       if (nearDuplicate) {
-        run("UPDATE jobs SET last_seen_at = ?, last_seen_source = ? WHERE id = ?", [nowIso(), "arbeitnow", nearDuplicate.id]);
+        let nextSeen = nearDuplicate.source_updated_at;
+        let updated = false;
+        if (postedIso && Number.isFinite(Date.parse(postedIso))) {
+          if (!nextSeen) nextSeen = postedIso;
+          else if (Date.parse(postedIso) > Date.parse(nextSeen)) {
+            nextSeen = postedIso;
+            updated = true;
+          }
+        }
+        run(
+          "UPDATE jobs SET last_seen_at = ?, last_seen_source = ?, source_updated_at = COALESCE(?, source_updated_at) WHERE id = ?",
+          [nowIso(), "arbeitnow", nextSeen, nearDuplicate.id],
+        );
         result.duplicates += 1;
+        if (updated) result.updated += 1;
         continue;
       }
 
       const id = `job_${randomId()}`;
       run(
-        `INSERT INTO jobs (id, source, external_id, title, company, location, remote, employment_type, salary, url, description, posted_at, discovered_at, status, raw, last_seen_at, last_seen_source)
-         VALUES (?, 'arbeitnow', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'new', ?, ?, 'arbeitnow')`,
+        `INSERT INTO jobs (id, source, external_id, title, company, location, remote, employment_type, salary, url, description, posted_at, discovered_at, status, raw, last_seen_at, last_seen_source, source_updated_at)
+         VALUES (?, 'arbeitnow', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'new', ?, ?, 'arbeitnow', ?)`,
         [
           id,
           item.slug,
@@ -225,10 +258,11 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
           (item.job_types ?? []).join(", ") || null,
           item.url,
           plain.slice(0, 24000),
-          item.created_at ? new Date(item.created_at * 1000).toISOString() : null,
+          postedIso,
           nowIso(),
           JSON.stringify(item).slice(0, 20000),
           nowIso(),
+          postedIso,
         ],
       );
       result.inserted += 1;

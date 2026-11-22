@@ -293,7 +293,8 @@ test("a complete, evidenced package passes every readiness check", () => {
   const result = evaluateReadiness(readinessInput());
   assert.equal(result.ready, true, result.reasons.join(" "));
   assert.equal(result.state, "ready_for_submission");
-  assert.equal(result.items.length, 15);
+  assert.equal(result.items.length, 16);
+  assert.equal(result.items.find((entry) => entry.key === "cover_length")?.passed, true);
 });
 
 test("readiness refuses stale vacancies, missing CVs, unsupported claims and wrong cover targets", () => {

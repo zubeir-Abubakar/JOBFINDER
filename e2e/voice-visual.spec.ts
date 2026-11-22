@@ -37,7 +37,7 @@ test("a live voice walkthrough collapses to a floating companion and survives na
     .toMatch(/Mic live|Mic muted/);
   testInfo.annotations.push({ type: "SIMULATED", description: "Browser fake microphone; real Gemini Live provider." });
 
-  await page.getByRole("link", { name: "CV & documents" }).click();
+  await page.getByRole("link", { name: "Documents", exact: true }).click();
   await page.waitForURL("**/documents");
   await expect(float).toBeVisible();
   await expect(float.locator(".lv-presence")).toContainText("Connected");

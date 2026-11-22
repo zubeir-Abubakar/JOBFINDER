@@ -17,6 +17,7 @@ export type WorkflowEventType =
   | "agent.progress"
   | "agent.completed"
   | "agent.failed"
+  | "agent.blocked"
   | "agent.retrying"
   | "approval.required"
   | "approval.granted";

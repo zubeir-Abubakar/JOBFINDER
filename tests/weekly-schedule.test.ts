@@ -24,12 +24,23 @@ after(() => {
   rmSync(process.env.DATA_DIR!, { recursive: true, force: true });
 });
 
-test("initial state is Monday–Friday at 09:00 for recruitment and 16:00 for the report", () => {
+test("initial state is Monday–Saturday at 10:00 with five incremental slots and 16:00 for the report", () => {
   const recruitment = schedule.ensureSchedule(new Date("2026-11-20T08:00:00Z"));
-  assert.equal(recruitment.time, "09:00");
+  assert.equal(recruitment.time, "10:00");
   assert.equal(recruitment.timezone, "Europe/Zurich");
-  assert.deepEqual(schedule.parseWeekdays(recruitment.weekdays), [1, 2, 3, 4, 5]);
+  assert.deepEqual(schedule.parseWeekdays(recruitment.weekdays), [1, 2, 3, 4, 5, 6]);
   assert.equal(recruitment.enabled, 1);
+  assert.deepEqual(
+    schedule.recruitmentRunTimes(recruitment.time),
+    [
+      { time: "10:00", mode: "full" },
+      { time: "12:00", mode: "incremental" },
+      { time: "14:00", mode: "incremental" },
+      { time: "16:00", mode: "incremental" },
+      { time: "18:00", mode: "incremental" },
+      { time: "20:00", mode: "incremental" },
+    ],
+  );
 
   const report = brief.ensureExecutiveBriefSchedule(new Date("2026-11-20T08:00:00Z"));
   assert.equal(report.time, "16:00");
@@ -104,13 +115,17 @@ test("invalid time, timezone and weekday values are rejected server-side", () =>
   assert.equal(emptyDays.ok, false);
 });
 
-test("the next occurrence skips unselected weekdays", () => {
-  // Friday 20 Nov 2026 after the run; Monday is the next selected day.
-  const next = schedule.nextScheduledRun(new Date("2026-11-20T09:00:00Z"), {
-    time: "09:00",
-    weekdays: [1, 2, 3, 4, 5],
+test("Saturday is an operating day and Sunday is excluded", () => {
+  // Saturday 21 Nov 2026 at 10:00 local has just occurred; Sunday is skipped.
+  const next = schedule.nextScheduledRun(new Date("2026-11-21T09:00:00Z"), {
+    time: "10:00",
+    weekdays: [1, 2, 3, 4, 5, 6],
   });
-  assert.equal(next.toISOString(), "2026-11-23T08:00:00.000Z");
+  assert.equal(next.toISOString(), "2026-11-23T09:00:00.000Z");
+  const sunday = schedule.nextRecruitmentOccurrence(new Date("2026-11-22T12:00:00Z"));
+  assert.equal(sunday.scheduledFor, "2026-11-23T09:00:00.000Z");
+  assert.equal(sunday.mode, "full");
+  assert.equal(sunday.time, "10:00");
 });
 
 test("DST spring-forward shifts a nonexistent local time forward and autumn-back resolves to the earlier instant", () => {
@@ -123,17 +138,27 @@ test("DST spring-forward shifts a nonexistent local time forward and autumn-back
   // 2026-10-25 02:30 occurs twice; the earlier (CEST) instant is chosen.
   const autumn = schedule.zonedTimeToUtc(2026, 10, 25, 2, 30, "Europe/Zurich");
   assert.equal(autumn.toISOString(), "2026-10-25T00:30:00.000Z");
+
+  // The next 10:00 Monday occurrence keeps its wall clock across both changes.
+  assert.equal(
+    schedule.nextRecruitmentOccurrence(new Date("2026-03-28T19:30:00Z")).scheduledFor,
+    "2026-03-30T08:00:00.000Z",
+  );
+  assert.equal(
+    schedule.nextRecruitmentOccurrence(new Date("2026-10-24T18:30:00Z")).scheduledFor,
+    "2026-10-26T09:00:00.000Z",
+  );
 });
 
 test("a rest day makes no scheduled recruitment decision and consumes no run", async () => {
   const mondayMorning = new Date("2026-11-23T08:00:00Z");
   schedule.saveScheduleConfiguration(
     schedule.RECRUITMENT_SCHEDULE_KEY,
-    { enabled: true, weekdays: [2], time: "09:00", timezone: "Europe/Zurich" },
+    { enabled: true, weekdays: [2], time: "10:00", timezone: "Europe/Zurich" },
     new Date("2026-11-20T08:00:00Z"),
   );
   db.run("UPDATE schedule_jobs SET next_run_at = ? WHERE key = ?", [
-    new Date("2026-11-23T08:00:00Z").toISOString(),
+    new Date("2026-11-23T09:00:00Z").toISOString(),
     schedule.RECRUITMENT_SCHEDULE_KEY,
   ]);
   const before = Number(db.one<{ c: number }>("SELECT COUNT(*) AS c FROM recruitment_runs")?.c ?? 0);

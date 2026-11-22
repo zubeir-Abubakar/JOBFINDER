@@ -18,7 +18,7 @@ setup("provision synthetic accounts and save authentication state", async ({ pag
 
   await page.getByRole("button", { name: /Create accounts and open workspace/i }).click();
   await page.waitForURL("**/dashboard", { timeout: 45_000 });
-  await expect(page.getByText("Recruitment pipeline")).toBeVisible();
+  await expect(page.getByText("Active opportunities")).toBeVisible();
 
   // Synthetic verified profile facts. The application deliberately refuses to
   // run matching/document agents when the profile only contains demo seed data.

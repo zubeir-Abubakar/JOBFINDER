@@ -610,7 +610,7 @@ test("all-source failure is explicit and never reported as a successful discover
 
 test("dashboard and agents launchers use the multi-vacancy engine and scheduler orchestration", () => {
   const dashboard = readFileSync("app/(app)/dashboard/page.tsx", "utf8");
-  const agents = readFileSync("app/(app)/agents/page.tsx", "utf8");
+  const agents = readFileSync("app/(app)/agents/list/page.tsx", "utf8");
   const action = readFileSync("lib/actions/recruitment.ts", "utf8");
   const ticker = readFileSync("lib/recruitment-ticker.ts", "utf8");
   const workflow = readFileSync("lib/workflow.ts", "utf8");
@@ -673,6 +673,7 @@ test("a six-vacancy fixture run prepares and submits only the configured daily l
         discovered: 6,
         inserted: 6,
         duplicates: 0,
+        updated: 0,
         filtered: 0,
         jobIds: discoveryIds,
         sources: [
@@ -687,6 +688,7 @@ test("a six-vacancy fixture run prepares and submits only the configured daily l
             fresh: 6,
             relevant: 6,
             duplicates: 0,
+            updated: 0,
             configured: true,
             status: "ok",
             attempts: 1,

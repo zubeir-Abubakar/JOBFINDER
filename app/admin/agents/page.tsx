@@ -3,6 +3,9 @@ import { all } from "@/lib/db";
 import { PageHead, Flash } from "@/components/ui";
 import { formatDateTime, param, relativeTime } from "@/lib/format";
 import { toggleAgentAction, saveAgentConfigAction, setAgentStatusAction } from "@/lib/actions/agents";
+import { setAgentVoiceAction } from "@/lib/actions/admin-voice";
+import { supportedVoices } from "@/lib/agent-voices";
+import { agentVoiceOverrides, effectiveVoiceProfileForAgent } from "@/lib/agent-voice-settings";
 import { SubmitButton } from "@/components/SubmitButton";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
 import { agentIdentity } from "@/lib/agent-identity";
@@ -33,14 +36,71 @@ export default async function AdminAgentsPage({
   const failures = all<{ id: string; agent_key: string; title: string; error: string | null; created_at: string }>(
     "SELECT id, agent_key, title, error, created_at FROM tasks WHERE status = 'failed' ORDER BY created_at DESC LIMIT 10",
   );
+  const voices = supportedVoices();
+  const overrides = agentVoiceOverrides();
 
   return (
     <>
       <Flash ok={param(sp.ok)} error={param(sp.error)} saved={param(sp.saved)} />
       <PageHead
-        title="Agent management"
-        sub="Enable agents, pause execution, adjust JSON configuration and inspect failures. Execution stays sequential to fit an 8 GB machine."
+        title="Agents & voice"
+        sub="Enable agents, pause execution, adjust JSON configuration, choose each agent's voice and inspect failures. Execution stays sequential to fit an 8 GB machine."
       />
+
+      <section className="card mb-4" id="voices">
+        <div className="card-head">
+          <div>
+            <h2>Agent voice configuration</h2>
+            <p className="card-sub">
+              Each agent's voice is independent. Changing it updates only the selected agent's voice; model, provider, instructions, personality and routing are untouched.
+              Only voices in the supported Gemini Live set are listed.
+            </p>
+          </div>
+          <span className="badge badge-neutral">{voices.length} supported voices</span>
+        </div>
+        <div className="table-wrap">
+          <table className="data">
+            <thead><tr><th>Agent</th><th>Responsibility</th><th>Current voice</th><th>Change voice</th></tr></thead>
+            <tbody>
+              {agents.map((agent) => {
+                const identity = agentIdentity(agent.key);
+                const profile = effectiveVoiceProfileForAgent(agent.key);
+                const overridden = Boolean(overrides[agent.key as keyof typeof overrides]);
+                return (
+                  <tr key={`voice-${agent.key}`}>
+                    <td>
+                      <div className="flex items-center gap-2.5">
+                        <AgentAvatar agentKey={agent.key} status={agent.status} size={32} />
+                        <div>
+                          <div className="cell-title">{identity.name}</div>
+                          <div className="cell-sub">{agent.key}</div>
+                        </div>
+                      </div>
+                    </td>
+                    <td className="cell-sub">{identity.title}</td>
+                    <td>
+                      <span className="text-[12px]">{profile.voiceName}</span>
+                      <div className="cell-sub">{overridden ? "Admin override" : "Configured default"}</div>
+                    </td>
+                    <td>
+                      <form action={setAgentVoiceAction} className="flex flex-wrap items-center gap-2">
+                        <input type="hidden" name="key" value={agent.key} />
+                        <select name="voiceId" className="select" defaultValue={overridden ? profile.voiceId : ""} aria-label={`Voice for ${identity.name}`}>
+                          <option value="">Use configured default ({agentIdentity(agent.key).name})</option>
+                          {voices.map((voice) => (
+                            <option key={voice.voiceId} value={voice.voiceId}>{voice.voiceName}</option>
+                          ))}
+                        </select>
+                        <SubmitButton className="btn btn-sm" pendingLabel="Saving…">Save voice</SubmitButton>
+                      </form>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       <section className="card mb-4">
         <div className="table-wrap">

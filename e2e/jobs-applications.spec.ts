@@ -1,10 +1,31 @@
 import { test, expect, gotoReady } from "./support/fixtures";
-import { one, waitForDb } from "./support/db";
+import { execute, one, waitForDb } from "./support/db";
 
 test.describe.configure({ mode: "serial" });
 test.setTimeout(150_000);
 
 const syntheticTitle = "Senior QA Automation Engineer";
+
+/**
+ * SubmitButton disables until an editable field changes. If the first change
+ * event lands before hydration, keep dispatching a real change until the form
+ * observes it, rather than retrying an inaccessible click.
+ */
+async function chooseStatus(form: import("@playwright/test").Locator, option: string): Promise<void> {
+  const select = form.locator("select[name=status]");
+  const save = form.getByRole("button", { name: "Save status" });
+  await select.selectOption(option);
+  await expect
+    .poll(
+      async () => {
+        if (await save.isEnabled()) return true;
+        await select.dispatchEvent("change");
+        return save.isEnabled();
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+}
 
 test("browser discovery inserts only eligible synthetic vacancies and deduplicates reruns", async ({ page, diagnostics }) => {
   await gotoReady(page, "/jobs");
@@ -86,6 +107,19 @@ test("job filters and manual duplicate prevention operate on stored records", as
 test("application creation, status update and in-app notification are persisted without submission", async ({ page, diagnostics }) => {
   const job = one<{ id: string }>("SELECT id FROM jobs WHERE title = ?", syntheticTitle);
   expect(job).toBeTruthy();
+
+  // A Playwright retry reuses the isolated runtime. Reset only this synthetic
+  // application so the pre-submission assertions run against a clean record.
+  const stale = one<{ id: string; submitted_at: string | null }>(
+    "SELECT id, submitted_at FROM applications WHERE job_id = ?",
+    job!.id,
+  );
+  if (stale?.submitted_at) {
+    execute("DELETE FROM submission_attempts WHERE job_id = ?", job!.id);
+    execute("DELETE FROM applications WHERE id = ?", stale.id);
+    execute("UPDATE jobs SET status = 'documents' WHERE id = ?", job!.id);
+  }
+
   await gotoReady(page, `/jobs/${job!.id}`);
   let app = one<{ id: string; status: string; submitted_at: string | null }>(
     "SELECT id, status, submitted_at FROM applications WHERE job_id = ?",
@@ -103,7 +137,7 @@ test("application creation, status update and in-app notification are persisted 
   }
   const application = app!;
   if (createdNow) expect(["documents_preparing", "quality_check", "ready_to_submit"]).toContain(application.status);
-  else expect(["documents_preparing", "quality_check", "ready_to_submit", "awaiting_approval", "interview_invited"]).toContain(application.status);
+  else expect(["documents_preparing", "quality_check", "ready_to_submit", "awaiting_approval", "interview_invited", "submitted"]).toContain(application.status);
   expect(application.submitted_at).toBeNull();
   const jobStatus = one<{ status: string }>("SELECT status FROM jobs WHERE id = ?", job!.id)?.status;
   expect(jobStatus).toBe("documents");
@@ -113,23 +147,90 @@ test("application creation, status update and in-app notification are persisted 
   await expect(page.getByText(/automatic submission/i).first()).toBeVisible();
   await expect(page.getByText("Approve application package")).toHaveCount(0);
 
-  const statusForm = page.locator("form").filter({ has: page.getByRole("button", { name: "Save status" }) });
-  await statusForm.locator("select[name=status]").selectOption("interview_invited");
-  await statusForm.getByRole("button", { name: "Save status" }).click();
-  await page.waitForURL(new RegExp(`/applications/${application.id}\\?ok=`), { timeout: 30_000 });
+  // The old UI allowed this. The server must now reject an interview stage when
+  // no verified employer evidence exists, and leave the record untouched.
+  const beforeReject = one<{ status: string; submitted_at: string | null; confirmation: string | null; last_update: string }>(
+    "SELECT status, submitted_at, confirmation, last_update FROM applications WHERE id = ?",
+    application.id,
+  );
+  expect(beforeReject).toBeTruthy();
+  const interviewsBefore = one<{ c: number }>("SELECT COUNT(*) AS c FROM notifications WHERE kind = 'interview'")?.c ?? 0;
 
+  const statusForm = page.locator("form").filter({ has: page.getByRole("button", { name: "Save status" }) });
+  await chooseStatus(statusForm, "interview_invited");
+  await statusForm.getByRole("button", { name: "Save status" }).click();
+  await page.waitForURL(new RegExp(`/applications/${application.id}\\?error=`), { timeout: 30_000 });
+  await expect(page.locator(".alert-error").first()).toContainText(/verified employer confirmation/i);
+
+  const afterReject = one<{ status: string; submitted_at: string | null; confirmation: string | null; last_update: string }>(
+    "SELECT status, submitted_at, confirmation, last_update FROM applications WHERE id = ?",
+    application.id,
+  );
+  expect(afterReject).toEqual(beforeReject);
+  expect(one<{ c: number }>("SELECT COUNT(*) AS c FROM notifications WHERE kind = 'interview'")?.c ?? 0).toBe(interviewsBefore);
+  expect(
+    one<{ c: number }>("SELECT COUNT(*) AS c FROM audit_logs WHERE action = 'application.transition_rejected'")?.c ?? 0,
+  ).toBeGreaterThan(0);
+
+  // The Kanban drop target uses the same rule; a rejected drop leaves the card
+  // where it was and explains why.
+  await gotoReady(page, "/applications");
+  const boardCard = page.locator(`.kanban-card[data-card-id="${application.id}"]`);
+  await expect(boardCard).toBeVisible();
+  await boardCard.locator("summary.kanban-move-summary").click();
+  await boardCard.getByRole("button", { name: /Move to Applied/ }).click();
+  await expect(page.locator(".kanban-notice")).toContainText(/verified employer confirmation/i);
+  expect(one<{ status: string }>("SELECT status FROM applications WHERE id = ?", application.id)?.status).toBe(
+    beforeReject!.status,
+  );
+
+  // Recording real employer evidence is the supported path. Afterwards the
+  // interview transition is allowed and the board counts it as Applied.
+  await page.goto(`/applications/${application.id}`, { waitUntil: "domcontentloaded" });
+  const confirmation = `E2E-${Date.now()}`;
+  const submissionForm = page.locator("form").filter({ has: page.getByRole("button", { name: /Record confirmed submission/i }) });
+  await submissionForm.locator("#confirmation").fill(confirmation);
+  await submissionForm.getByRole("button", { name: /Record confirmed submission/i }).click();
+  const verifiedRow = await waitForDb(
+    () => {
+      const row = one<{ status: string; submitted_at: string | null; confirmation: string | null }>(
+        "SELECT status, submitted_at, confirmation FROM applications WHERE id = ?",
+        application.id,
+      );
+      return row?.status === "submitted" ? row : null;
+    },
+    { timeout: 20_000 },
+  );
+  expect(verifiedRow.status).toBe("submitted");
+  expect(verifiedRow.confirmation).toBe(confirmation);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const verifiedStatusForm = page.locator("form").filter({ has: page.getByRole("button", { name: "Save status" }) });
+  await chooseStatus(verifiedStatusForm, "interview_invited");
+  await verifiedStatusForm.getByRole("button", { name: "Save status" }).click();
+  await page.waitForURL(new RegExp(`/applications/${application.id}\\?ok=`), { timeout: 30_000 });
   const updated = await waitForDb(
     () => one<{ status: string; submitted_at: string | null }>("SELECT status, submitted_at FROM applications WHERE id = ?", application.id),
     { timeout: 15_000 },
   );
   expect(updated.status).toBe("interview_invited");
-  expect(updated.submitted_at).toBeNull();
+  expect(updated.submitted_at).not.toBeNull();
   const notification = one<{ kind: string; subject: string; delivery_status: string | null; provider_message_id: string | null }>(
     "SELECT kind, subject, delivery_status, provider_message_id FROM notifications WHERE kind = 'interview' ORDER BY id DESC LIMIT 1",
   );
   expect(notification?.subject).toContain("Interview invitation");
   expect(notification?.provider_message_id).toBeNull();
-  const attempts = one<{ c: number }>("SELECT COUNT(*) AS c FROM submission_attempts")?.c ?? 0;
-  expect(attempts).toBe(0);
+
+  // Column headers must equal the cards actually rendered.
+  await gotoReady(page, "/applications");
+  for (const column of ["considering", "to_apply", "applied", "needs_attention"]) {
+    const region = page.locator(`.kanban-col[data-column="${column}"]`);
+    const header = Number((await region.locator(".kanban-col-head .num").innerText()).trim());
+    const cards = await region.locator(".kanban-card").count();
+    const viewAll = await region.getByRole("link", { name: /View all/ }).count();
+    if (!viewAll) expect(cards, `${column} header/card mismatch`).toBe(header);
+  }
+  const attempts = one<{ c: number }>("SELECT COUNT(*) AS c FROM submission_attempts WHERE job_id = ?", job!.id)?.c ?? 0;
+  expect(attempts).toBeGreaterThanOrEqual(1);
   diagnostics.assertClean();
 });

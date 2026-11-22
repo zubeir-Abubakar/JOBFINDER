@@ -1,0 +1,14 @@
+{
+  "backup": "/Users/abubakartowfiq/Desktop/jobs/reset-backups/atw-backup-2026-11-22T09-52-19-493Z",
+  "schema": 23,
+  "integrity": "ok",
+  "counts": {
+    "users": 1,
+    "agents": 8,
+    "jobs": 22,
+    "applications": 4,
+    "documents": 34,
+    "tasks": 124
+  },
+  "files": 6
+}

@@ -7,7 +7,14 @@ import { requireUser } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { notify } from "@/lib/notify";
 import { getSetting } from "@/lib/settings";
-import { APPLICATION_STATUSES, readinessAllowsSubmission, statusLabel, submissionBlockedReason } from "@/lib/application-status";
+import {
+  APPLICATION_STATUSES,
+  readinessAllowsSubmission,
+  statusLabel,
+  submissionBlockedReason,
+  validateApplicationStatusTransition,
+} from "@/lib/application-status";
+import { BOARD_COLUMNS, BOARD_DROP_TARGETS, boardColumnForRow, type BoardColumnKey } from "@/lib/application-board";
 import { emitWorkflowEvent } from "@/lib/events";
 import { randomId } from "@/lib/security";
 import { existingVerifiedSubmission } from "@/lib/submission";
@@ -194,24 +201,55 @@ export async function answerInterventionAction(formData: FormData): Promise<void
   );
 }
 
+type StatusDecisionRow = {
+  id: string;
+  job_id: string;
+  status: string;
+  readiness: string | null;
+  submitted_at: string | null;
+  confirmation: string | null;
+};
+
+/**
+ * Rejects a transition without touching the stored record. The rejection is
+ * auditable and the caller receives an actionable explanation.
+ */
+function rejectStatusTransition(input: {
+  userId: string;
+  row: StatusDecisionRow;
+  nextStatus: string;
+  reason: string;
+}): never {
+  audit({
+    action: "application.transition_rejected",
+    entity: "application",
+    entityId: input.row.id,
+    detail: `${input.row.status} → ${input.nextStatus}: ${input.reason}`,
+    userId: input.userId,
+  });
+  redirect(`/applications/${input.row.id}?error=${encodeURIComponent(input.reason)}`);
+}
+
 export async function updateApplicationStatusAction(formData: FormData): Promise<void> {
   const user = await requireUser();
   const id = String(formData.get("id") ?? "");
   const status = String(formData.get("status") ?? "");
   if (!(APPLICATION_STATUSES as readonly string[]).includes(status)) redirect("/applications?error=Invalid+status");
-  if (status === "submitted") {
-    redirect(`/applications/${id}?error=${encodeURIComponent("Use the submission form with the employer's confirmation reference.")}`);
-  }
-  const app = one<{ id: string; job_id: string; readiness: string | null }>(
-    "SELECT id, job_id, readiness FROM applications WHERE id = ?",
+  const app = one<StatusDecisionRow>(
+    "SELECT id, job_id, status, readiness, submitted_at, confirmation FROM applications WHERE id = ?",
     [id],
   );
   if (!app) redirect("/applications?error=Application+not+found");
-  if (status === "ready_to_submit" && !readinessAllowsSubmission(app.readiness)) {
-    redirect(
-      `/applications/${id}?error=${encodeURIComponent("The readiness checklist has not passed. Re-run the quality check before marking this application ready.")}`,
-    );
-  }
+
+  const decision = validateApplicationStatusTransition({
+    currentStatus: app.status,
+    nextStatus: status,
+    submitted_at: app.submitted_at,
+    confirmation: app.confirmation,
+    readiness: app.readiness,
+  });
+  if (!decision.allowed) rejectStatusTransition({ userId: user.id, row: app, nextStatus: status, reason: decision.reason });
+
   run("UPDATE applications SET status = ?, last_update = ? WHERE id = ?", [status, nowIso(), id]);
   const job = one<{ title: string; company: string }>("SELECT title, company FROM jobs WHERE id = ?", [app.job_id]);
   if (status === "interview_invited") {
@@ -227,6 +265,81 @@ export async function updateApplicationStatusAction(formData: FormData): Promise
   revalidatePath(`/applications/${id}`);
   revalidatePath("/dashboard");
   redirect(`/applications/${id}?ok=${encodeURIComponent(`Status updated to ${statusLabel(status)}.`)}`);
+}
+
+export type MoveCardResult = { ok: boolean; message: string };
+
+function moveTargetLabel(column: BoardColumnKey): string {
+  return BOARD_COLUMNS.find((candidate) => candidate.key === column)?.label ?? column;
+}
+
+/**
+ * Kanban drag and drop. It is a thin transport over the same persisted record
+ * and the same validateApplicationStatusTransition rule as the status form, so
+ * a drop can never bypass lifecycle or submission-evidence checks.
+ */
+export async function moveApplicationCardAction(input: {
+  id: string;
+  column: string;
+}): Promise<MoveCardResult> {
+  const user = await requireUser();
+  const id = String(input.id ?? "");
+  const column = String(input.column ?? "") as BoardColumnKey;
+  if (!BOARD_COLUMNS.some((candidate) => candidate.key === column)) {
+    return { ok: false, message: "That board column does not exist. Nothing was changed." };
+  }
+  const app = one<StatusDecisionRow>(
+    "SELECT id, job_id, status, readiness, submitted_at, confirmation FROM applications WHERE id = ?",
+    [id],
+  );
+  if (!app) return { ok: false, message: "Application not found. Nothing was changed." };
+
+  const currentColumn = boardColumnForRow(app);
+  if (currentColumn === column) {
+    return { ok: true, message: `The card is already in ${moveTargetLabel(column)}.` };
+  }
+  if (column === "needs_attention") {
+    return {
+      ok: false,
+      message:
+        "Needs attention is set by the system when a submission or package cannot be verified. Resolve the blocker on the application instead of moving the card.",
+    };
+  }
+
+  const nextStatus = BOARD_DROP_TARGETS[column];
+  if (!nextStatus) {
+    return { ok: false, message: `Cards cannot be moved to ${moveTargetLabel(column)}. Nothing was changed.` };
+  }
+  const decision = validateApplicationStatusTransition({
+    currentStatus: app.status,
+    nextStatus,
+    submitted_at: app.submitted_at,
+    confirmation: app.confirmation,
+    readiness: app.readiness,
+  });
+  if (!decision.allowed) {
+    audit({
+      action: "application.transition_rejected",
+      entity: "application",
+      entityId: id,
+      detail: `board drop ${app.status} → ${column}: ${decision.reason}`,
+      userId: user.id,
+    });
+    return { ok: false, message: decision.reason };
+  }
+
+  run("UPDATE applications SET status = ?, last_update = ? WHERE id = ?", [nextStatus, nowIso(), id]);
+  audit({
+    action: `application.${nextStatus}`,
+    entity: "application",
+    entityId: id,
+    detail: `Moved from the ${currentColumn === "closed" ? "closed" : moveTargetLabel(currentColumn)} group to ${moveTargetLabel(column)} on the board.`,
+    userId: user.id,
+  });
+  revalidatePath("/applications");
+  revalidatePath(`/applications/${id}`);
+  revalidatePath("/dashboard");
+  return { ok: true, message: `Moved to ${moveTargetLabel(column)}. Status is now ${statusLabel(nextStatus)}.` };
 }
 
 export async function saveApplicationNotesAction(formData: FormData): Promise<void> {

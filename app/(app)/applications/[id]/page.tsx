@@ -4,7 +4,14 @@ import { requireUser } from "@/lib/auth";
 import { all, one } from "@/lib/db";
 import { PageHead, Empty, Flash } from "@/components/ui";
 import { formatDate, formatDateTime, param } from "@/lib/format";
-import { statusLabel, statusClass, APPLICATION_STATUSES, isApplicationSubmitted } from "@/lib/application-status";
+import {
+  statusLabel,
+  statusClass,
+  APPLICATION_STATUSES,
+  statusRequiresVerifiedSubmission,
+  submissionEvidenceLabel,
+  submissionEvidenceState,
+} from "@/lib/application-status";
 import { answerInterventionAction, requestDocumentChangesAction, updateApplicationStatusAction, saveApplicationNotesAction } from "@/lib/actions/applications";
 import { handoffForApplication } from "@/lib/handoff";
 import { SubmissionForm } from "@/components/SubmissionForm";
@@ -49,8 +56,9 @@ export default async function ApplicationDetailPage({
     match_flag: string | null;
     salary: string | null;
     employment_type: string | null;
+    description: string | null;
   }>(
-    `SELECT a.*, j.title, j.company, j.location, j.url, j.match_score, j.match_flag, j.salary, j.employment_type
+    `SELECT a.*, j.title, j.company, j.location, j.url, j.match_score, j.match_flag, j.salary, j.employment_type, j.description
      FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?`,
     [id],
   );
@@ -64,6 +72,7 @@ export default async function ApplicationDetailPage({
     readiness = null;
   }
   const readinessLabel = readiness?.state ? readiness.state.replace(/_/g, " ") : readiness?.ready ? "ready for submission" : "not assessed";
+  const evidenceState = submissionEvidenceState(app);
 
   const cv = app.cv_document_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cv_document_id]) : null;
   const cover = app.cover_letter_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cover_letter_id]) : null;
@@ -143,15 +152,24 @@ export default async function ApplicationDetailPage({
                 <div>
                   <h2>Submission</h2>
                   <p className="card-sub">
-                    {agentIdentity("application").name} — {agentIdentity("application").title} ·                    {app.submitted_at
-                      ? `recorded ${formatDateTime(app.submitted_at)} via ${(app.method ?? "").replace(/_/g, " ")}`
-                      : "automatic submission after every eligibility, document and safety check"}
+                    {agentIdentity("application").name} — {agentIdentity("application").title} ·{" "}
+                    {evidenceState === "verified"
+                      ? `employer-confirmed${app.submitted_at ? ` ${formatDateTime(app.submitted_at)}` : ""}${app.method ? ` via ${app.method.replace(/_/g, " ")}` : ""}`
+                      : evidenceState === "partial"
+                        ? "a submission was attempted, but no employer confirmation is verified"
+                        : "no verified submission evidence is stored for this application"}
                   </p>
+                  {evidenceState !== "verified" && statusRequiresVerifiedSubmission(app.status) ? (
+                    <div className="alert alert-warn mt-2" style={{ padding: "7px 10px", fontSize: 12 }}>
+                      This record is marked {statusLabel(app.status)}, but no employer confirmation is stored. It is not counted as applied and is
+                      listed under Needs attention until a confirmation reference is recorded or the status is corrected.
+                    </div>
+                  ) : null}
                 </div>
               </div>
             </div>
             <div className="card-body">
-              {isApplicationSubmitted(app) ? (
+              {evidenceState === "verified" ? (
                 <div className="card-quiet p-3">
                   <div className="label" style={{ marginBottom: 2 }}>Employer confirmation</div>
                   <div className="text-[13px]">{app.confirmation ?? "No reference stored"}</div>
@@ -181,7 +199,12 @@ export default async function ApplicationDetailPage({
                     <div className="alert alert-warn" style={{ padding: "8px 10px", fontSize: 12 }}>
                       Quality review is required before this package can be sent. Regenerate the documents after correcting the findings above.
                     </div>
-                  ) : app.status === "human_intervention_required" || app.status === "submission_unverified" ? (
+                  ) : app.status === "submission_unverified" || app.status === "submission_unknown" ? (
+                    <div className="alert alert-warn" style={{ padding: "8px 10px", fontSize: 12 }}>
+                      A submission was attempted, but the employer&apos;s confirmation has not been verified. This record is not counted as applied and is
+                      listed under Needs attention. Record the confirmation reference below only if the employer actually confirmed the application.
+                    </div>
+                  ) : app.status === "human_intervention_required" ? (
                     <div className="alert alert-warn" style={{ padding: "8px 10px", fontSize: 12 }}>
                       Automatic submission stopped at a legitimate human step. The handoff package below contains the employer link, documents, prepared answers and remaining steps. There is no approval flag to clear.
                     </div>
@@ -267,7 +290,7 @@ export default async function ApplicationDetailPage({
                 [cv, cover].filter(Boolean).map((doc) => (
                   <div key={doc!.id} className="between card-quiet p-3">
                     <div>
-                      <div className="text-[12.5px] font-medium">{doc!.kind === "tailored_cv" ? "Tailored CV" : "Cover letter"} · v{doc!.version}</div>
+                      <div className="text-[12.5px] font-medium">{app.company} — {app.title} · {doc!.kind === "tailored_cv" ? "Tailored CV" : "Cover letter"} · v{doc!.version}</div>
                       <div className="text-[11px]" style={{ color: "var(--muted)" }}>
                         {doc!.kind === "tailored_cv" ? `CV ATS compatibility ${doc!.ats_score ?? "—"}/100` : "Cover-letter ATS score not applicable"} · quality {doc!.quality_status ?? "not checked"}{doc!.quality_score !== null ? ` (${doc!.quality_score}/100)` : ""}
                       </div>
@@ -278,11 +301,11 @@ export default async function ApplicationDetailPage({
               )}
               {siblings.length > 2 ? (
                 <details className="mt-1">
-                  <summary className="text-[11.5px]" style={{ color: "var(--muted)", cursor: "pointer" }}>All {siblings.length} files for this vacancy</summary>
+                  <summary className="text-[11.5px]" style={{ color: "var(--muted)", cursor: "pointer" }}>All {siblings.length} version-labelled files for this vacancy</summary>
                   <div className="stack mt-2" style={{ gap: 6 }}>
                     {siblings.map((doc) => (
                       <div key={doc.id} className="between card-quiet px-3 py-2">
-                        <span className="text-[11.5px]">{doc.display_name}{doc.quality_status ? ` · ${doc.quality_status}` : ""}</span>
+                        <span className="text-[11.5px]">{doc.version ? `v${doc.version} · ` : ""}{doc.display_name}{doc.quality_status ? ` · ${doc.quality_status}` : ""}</span>
                         <a href={`/api/documents/${doc.id}`} className="btn btn-sm">Download</a>
                       </div>
                     ))}
@@ -336,6 +359,31 @@ export default async function ApplicationDetailPage({
         </div>
 
         <div className="stack">
+          <section className="card" id="vacancy">
+            <div className="card-head">
+              <div>
+                <h2>Vacancy &amp; assessment</h2>
+                <p className="card-sub">{app.company} · {app.title}</p>
+              </div>
+            </div>
+            <div className="card-body stack" style={{ gap: 8 }}>
+              <div className="between text-[12.5px]"><span style={{ color: "var(--muted)" }}>Match score</span><span>{app.match_score ?? "—"}% · {app.match_flag ?? "not analysed"}</span></div>
+              <div className="between text-[12.5px]"><span style={{ color: "var(--muted)" }}>Location</span><span>{app.location ?? "Not stated"}</span></div>
+              <div className="between text-[12.5px]"><span style={{ color: "var(--muted)" }}>Employment</span><span>{app.employment_type ?? "Not stated"}</span></div>
+              <div className="between text-[12.5px]"><span style={{ color: "var(--muted)" }}>Salary</span><span>{app.salary ?? "Not stated"}</span></div>
+              <div className="row">
+                {app.url ? <a href={app.url} target="_blank" rel="noreferrer" className="btn btn-sm">Original source URL</a> : <span className="badge badge-neutral">No source URL recorded</span>}
+                <Link href={`/jobs/${app.job_id}`} className="btn btn-sm">Eligibility &amp; match evidence</Link>
+              </div>
+              <details className="mt-1">
+                <summary className="text-[11.5px]" style={{ color: "var(--muted)", cursor: "pointer" }}>Original job description</summary>
+                <p className="text-[11.5px] mt-2" style={{ whiteSpace: "pre-wrap", maxHeight: 320, overflow: "auto", color: "var(--ink-soft)" }}>
+                  {app.description ?? "No description was stored for this vacancy."}
+                </p>
+              </details>
+            </div>
+          </section>
+
           <section className="card">
             <div className="card-head">
               <div>
@@ -353,7 +401,10 @@ export default async function ApplicationDetailPage({
                 </select>
                 <SubmitButton className="btn">Save status</SubmitButton>
               </form>
-              <p className="hint">Selecting Submitted is blocked here; use the confirmation form instead.</p>
+              <p className="hint">
+                Applied and post-submission statuses (Acknowledged, Interview, Offer) require a stored employer confirmation. Without one the server
+                rejects the change and keeps the current status; use the confirmation form above to record real evidence.
+              </p>
             </div>
           </section>
 
@@ -366,7 +417,10 @@ export default async function ApplicationDetailPage({
               <div className="between"><span style={{ color: "var(--muted)" }}>Created</span><span>{formatDate(app.created_at)}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Last update</span><span>{formatDateTime(app.last_update)}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Match score</span><span>{app.match_score ?? "—"}%</span></div>
-              <div className="between"><span style={{ color: "var(--muted)" }}>Submission</span><span>{app.submitted_at ? "Employer-confirmed" : "Not yet verified"}</span></div>
+              <div className="between"><span style={{ color: "var(--muted)" }}>Submission</span><span>{submissionEvidenceLabel(app)}</span></div>
+              {evidenceState === "verified" ? (
+                <div className="between"><span style={{ color: "var(--muted)" }}>Confirmation</span><span className="num">{app.confirmation}</span></div>
+              ) : null}
             </div>
           </section>
         </div>

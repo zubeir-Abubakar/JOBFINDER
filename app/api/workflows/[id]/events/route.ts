@@ -18,7 +18,12 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   if (!workflowSnapshotForUser(user, id)?.workflow) return new Response("Not found", { status: 404 });
 
   const url = new URL(request.url);
-  const after = Number(url.searchParams.get("after") ?? 0) || 0;
+  // EventSource resends its last id on reconnect. Honour it even though the
+  // initial URL only carries `after`, so a reconnect cannot replay events the
+  // client has already consumed.
+  const queryAfter = Number(url.searchParams.get("after") ?? 0) || 0;
+  const headerAfter = Number(request.headers.get("last-event-id") ?? 0) || 0;
+  const after = Math.max(0, queryAfter, headerAfter);
   const encoder = new TextEncoder();
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | null = null;

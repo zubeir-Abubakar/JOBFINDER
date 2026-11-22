@@ -174,22 +174,25 @@ db.run("UPDATE settings SET value = 'false' WHERE key = 'approval_mode'");
 db.run("UPDATE settings SET value = '5' WHERE key = 'max_applications_per_day'");
 db.run("INSERT INTO settings (key, value, updated_at) VALUES ('standing_authorisation_activated_at', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [JSON.stringify(new Date().toISOString()), new Date().toISOString()]);
 
-test("the weekly schedule is 09:00 Europe/Zurich on Monday–Friday and survives both DST transitions", () => {
-  assert.equal(schedule.nextDailyRun(new Date("2026-01-15T07:00:00Z")).toISOString(), "2026-01-15T08:00:00.000Z");
-  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T06:00:00Z")).toISOString(), "2026-07-15T07:00:00.000Z");
-  // After 09:00 local the next execution is tomorrow, still at 09:00 local.
-  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T08:00:00Z")).toISOString(), "2026-07-16T07:00:00.000Z");
-  // Spring forward (29 Mar 2026) and autumn back (25 Oct 2026).
-  assert.equal(schedule.nextDailyRun(new Date("2026-03-28T12:00:00Z")).toISOString(), "2026-03-29T07:00:00.000Z");
-  assert.equal(schedule.nextDailyRun(new Date("2026-10-24T12:00:00Z")).toISOString(), "2026-10-25T08:00:00.000Z");
+test("the main schedule is 10:00 Europe/Zurich Monday–Saturday and survives both DST transitions", () => {
+  const weekdays = [1, 2, 3, 4, 5, 6];
+  assert.equal(schedule.nextDailyRun(new Date("2026-01-15T07:00:00Z"), { weekdays }).toISOString(), "2026-01-15T09:00:00.000Z");
+  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T06:00:00Z"), { weekdays }).toISOString(), "2026-07-15T08:00:00.000Z");
+  // After 10:00 local the next execution is the next slot, still at the wall clock.
+  assert.equal(schedule.nextDailyRun(new Date("2026-07-15T08:00:00Z"), { weekdays }).toISOString(), "2026-07-16T08:00:00.000Z");
+  // Friday after the main run rolls to Saturday, not Sunday.
+  assert.equal(schedule.nextDailyRun(new Date("2026-11-20T09:00:00Z"), { weekdays }).toISOString(), "2026-11-21T09:00:00.000Z");
+  // Spring forward (29 Mar 2026) and autumn back (25 Oct 2026); Sunday is skipped.
+  assert.equal(schedule.nextDailyRun(new Date("2026-03-28T12:00:00Z"), { weekdays }).toISOString(), "2026-03-30T08:00:00.000Z");
+  assert.equal(schedule.nextDailyRun(new Date("2026-10-24T12:00:00Z"), { weekdays }).toISOString(), "2026-10-26T09:00:00.000Z");
   assert.equal(schedule.localDateKey(new Date("2026-11-18T23:30:00Z")), "2026-11-19");
 });
 
 test("the schedule is persisted in SQLite, not only in memory", () => {
   const row = schedule.ensureSchedule();
-  assert.equal(row.time, "09:00");
+  assert.equal(row.time, "10:00");
   assert.equal(row.timezone, "Europe/Zurich");
-  assert.deepEqual(schedule.parseWeekdays(row.weekdays), [1, 2, 3, 4, 5]);
+  assert.deepEqual(schedule.parseWeekdays(row.weekdays), [1, 2, 3, 4, 5, 6]);
   assert.ok(row.next_run_at);
   const toggled = schedule.setScheduleEnabled(false);
   assert.equal(toggled.enabled, 0);
@@ -202,15 +205,38 @@ test("the schedule is persisted in SQLite, not only in memory", () => {
   assert.equal(snapshot.requiresRunningHost, true);
 });
 
-test("one scheduled run per local day: a second run is refused, not duplicated", () => {
-  const first = runs.createRecruitmentRun({ trigger: "schedule", now: new Date("2030-05-05T08:00:00Z") });
+test("each main and incremental occurrence has a distinct run key and is never duplicated", () => {
+  const saved = schedule.saveScheduleConfiguration(
+    schedule.RECRUITMENT_SCHEDULE_KEY,
+    { enabled: true, weekdays: [1, 2, 3, 4, 5, 6], time: "10:00", timezone: "Europe/Zurich" },
+    new Date("2030-05-06T06:00:00Z"),
+  );
+  assert.equal(saved.ok, true);
+  const first = runs.createRecruitmentRun({ trigger: "schedule", now: new Date("2030-05-06T07:00:00Z") });
   assert.equal(first.created, true);
-  const second = runs.createRecruitmentRun({ trigger: "schedule", now: new Date("2030-05-05T09:30:00Z") });
-  assert.equal(second.created, false);
-  assert.equal(second.run.id, first.run.id);
-  assert.match(second.message, /already exists|in progress/i);
-  // Leave no non-terminal run behind for the orchestration test.
+  assert.equal(first.run.scheduled_for, "2030-05-06T08:00:00.000Z");
+  assert.equal(first.run.discovery_scope, "full");
+  assert.match(first.run.run_key, /#full-1000$/);
   db.run("UPDATE recruitment_runs SET status = 'failed', finished_at = ? WHERE id = ?", [new Date().toISOString(), first.run.id]);
+
+  const second = runs.createRecruitmentRun({
+    trigger: "schedule",
+    now: new Date("2030-05-06T08:00:00Z"),
+    discoveryScope: "incremental",
+  });
+  assert.equal(second.created, true);
+  assert.equal(second.run.scheduled_for, "2030-05-06T10:00:00.000Z");
+  assert.equal(second.run.discovery_scope, "incremental");
+  assert.match(second.run.run_key, /#incremental-1200$/);
+  db.run("UPDATE recruitment_runs SET status = 'failed', finished_at = ? WHERE id = ?", [new Date().toISOString(), second.run.id]);
+
+  const duplicate = runs.createRecruitmentRun({
+    trigger: "schedule",
+    now: new Date("2030-05-06T08:00:00Z"),
+    discoveryScope: "incremental",
+  });
+  assert.equal(duplicate.created, false);
+  assert.equal(duplicate.run.id, second.run.id);
 });
 
 test("the 85% threshold cannot be lowered by configuration", () => {
@@ -487,6 +513,7 @@ test("a discovery-only run records results without preparing documents or submit
         discovered: jobIds.length,
         inserted: 0,
         duplicates: 0,
+        updated: 0,
         filtered: 0,
         jobIds,
         sources: [
@@ -501,6 +528,7 @@ test("a discovery-only run records results without preparing documents or submit
             fresh: 3,
             relevant: 3,
             duplicates: 0,
+            updated: 0,
           },
         ],
         warnings: [],
@@ -581,6 +609,7 @@ test("a vacancy scoring below 85% is excluded before any document work", async (
         discovered: 1,
         inserted: 1,
         duplicates: 0,
+        updated: 0,
         filtered: 0,
         jobIds: [jobId],
         sources: [],

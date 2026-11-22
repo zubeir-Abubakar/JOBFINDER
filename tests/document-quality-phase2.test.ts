@@ -9,6 +9,7 @@ import { deterministicCoverLetter } from "../lib/document-ai.ts";
 import { validateCoverQuality, validateCvQuality } from "../lib/document-quality.ts";
 import { buildCoverLetterModel, buildCvModel, modelToText } from "../lib/docgen.ts";
 import { evaluateReadiness } from "../lib/application-readiness.ts";
+import { extractCoverLetterRequirements } from "../lib/cover-letter-requirements.ts";
 
 const JOB = {
   title: "Senior QA Automation Engineer",
@@ -239,6 +240,76 @@ test("the cover letter is vacancy-specific, evidence-led and states the verified
   const quality = validateCoverQuality(MASTER, content, rendered, 1, { ...JOB, analysis: ANALYSIS });
   assert.equal(quality.status, "passed", quality.issues.map((issue) => issue.message).join(" "));
   assert.ok(quality.checks.some((check) => check.label === "Addresses vacancy requirements" && check.passed));
+  assert.equal(quality.coverLetter?.requirements.source, "professional_default");
+  assert.equal(quality.coverLetter?.renderedBodyVerified, true);
+  assert.ok(quality.checks.some((check) => check.label === "Letter length matches the professional default" && check.passed));
+});
+
+test("recruiter-specific cover-letter limits override the professional default and are measured on the rendered body", () => {
+  const { content, rendered } = coverText();
+  const recruiterMaximum = extractCoverLetterRequirements(
+    "Please attach a cover letter of no more than 120 words for this Senior QA Automation Engineer role.",
+  );
+  const tooLong = validateCoverQuality(MASTER, content, rendered, 1, {
+    ...JOB,
+    analysis: ANALYSIS,
+    coverLetterRequirements: recruiterMaximum,
+  });
+  assert.equal(tooLong.status, "failed");
+  assert.ok(tooLong.issues.some((issue) => issue.code === "too_long"));
+  assert.match(tooLong.issues.find((issue) => issue.code === "too_long")?.message ?? "", /recruiter requires at most 120 words/i);
+  assert.equal(tooLong.coverLetter?.requirements.explicit, true);
+  assert.ok((tooLong.coverLetter?.actualWords ?? 0) > 120);
+
+  const recruiterMinimum = extractCoverLetterRequirements(
+    "Your cover letter must contain at least 500 words and address the role in detail.",
+  );
+  const tooShort = validateCoverQuality(MASTER, content, rendered, 1, {
+    ...JOB,
+    analysis: ANALYSIS,
+    coverLetterRequirements: recruiterMinimum,
+  });
+  assert.equal(tooShort.status, "failed");
+  assert.ok(tooShort.issues.some((issue) => issue.code === "too_short"));
+  assert.match(tooShort.issues.find((issue) => issue.code === "too_short")?.message ?? "", /at least 500 words/i);
+
+  const recruiterCharacters = extractCoverLetterRequirements(
+    "Please keep your cover letter under 1,000 characters.",
+  );
+  const tooManyCharacters = validateCoverQuality(MASTER, content, rendered, 1, {
+    ...JOB,
+    analysis: ANALYSIS,
+    coverLetterRequirements: recruiterCharacters,
+  });
+  assert.equal(tooManyCharacters.status, "failed");
+  assert.ok(tooManyCharacters.issues.some((issue) => issue.code === "characters_above_maximum"));
+});
+
+test("explicit page limits and requested supporting documents block readiness", () => {
+  const { content, rendered } = coverText();
+  const requirements = extractCoverLetterRequirements(
+    "Please submit a cover letter of no more than one page in PDF format. Portfolio required.",
+  );
+  assert.equal(requirements.maxPages, 1);
+  assert.ok(requirements.supportingDocuments.includes("portfolio"));
+  const quality = validateCoverQuality(MASTER, content, rendered, 2, {
+    ...JOB,
+    analysis: ANALYSIS,
+    coverLetterRequirements: requirements,
+  });
+  assert.equal(quality.status, "failed");
+  assert.ok(quality.issues.some((item) => item.code === "page_limit_exceeded"));
+  assert.ok(quality.issues.some((item) => item.code === "missing_supporting_documents"));
+  assert.match(quality.issues.find((item) => item.code === "missing_supporting_documents")?.message ?? "", /portfolio/i);
+});
+
+test("the quality gate verifies every rendered letter segment rather than trusting the intended model", () => {
+  const { content, rendered } = coverText();
+  const clipped = rendered.replace(content.paragraphs[2], "");
+  const quality = validateCoverQuality(MASTER, content, clipped, 1, { ...JOB, analysis: ANALYSIS });
+  assert.equal(quality.status, "failed");
+  assert.ok(quality.issues.some((issue) => issue.code === "rendered_body_incomplete"));
+  assert.equal(quality.coverLetter?.renderedBodyVerified, false);
 });
 
 test("a generic, salary-led cover letter is rejected and unsupported claims are detected", () => {
@@ -407,4 +478,20 @@ test("readiness requires document quality and policy, and distinguishes review f
   }));
   assert.equal(paused.ready, false);
   assert.equal(paused.state, "documents_ready");
+});
+
+test("readiness independently blocks a stored letter that violates an explicit recruiter limit", () => {
+  const base = readinessInput();
+  const recruiterMaximum = extractCoverLetterRequirements(
+    "Please attach a cover letter of no more than 120 words.",
+  );
+  const result = evaluateReadiness({
+    ...base,
+    job: { ...base.job, coverLetterRequirements: recruiterMaximum },
+  });
+  assert.equal(result.ready, false);
+  assert.equal(result.state, "blocked");
+  const lengthItem = result.items.find((item) => item.key === "cover_length");
+  assert.equal(lengthItem?.passed, false);
+  assert.match(lengthItem?.detail ?? "", /recruiter requires at most 120 words/i);
 });

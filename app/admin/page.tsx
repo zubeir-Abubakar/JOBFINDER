@@ -72,21 +72,16 @@ export default async function AdminOverviewPage() {
         <section className="card">
           <div className="card-head">
             <div>
-              <h2>Service health</h2>
-              <p className="card-sub">Local deployment — no external queue or container platform required.</p>
+              <h2>Diagnostics</h2>
+              <p className="card-sub">Health, background runner, providers, delivery and voice status are consolidated in one page.</p>
             </div>
-            <span className="badge badge-good"><span className="dot" /> Operational</span>
+            <Link href="/admin/diagnostics" className="btn btn-sm">Open diagnostics</Link>
           </div>
           <div className="card-body stack text-[12.5px]" style={{ gap: 8 }}>
             <div className="between"><span style={{ color: "var(--muted)" }}>Application server</span><span>Next.js · Node {process.version}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Database</span><span>SQLite (node:sqlite) · WAL mode</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Storage</span><span>{formatBytes(stats.totalBytes)} across {counts.documents} files</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Agent execution</span><span>Sequential, single process</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Job source</span><span>Arbeitnow public API (keyless)</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>AI provider</span><span>{settings.ai?.provider ?? "rules"} · {settings.ai?.model ?? "at-rules-v1"}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Email provider</span><span>{settings.email?.connected ? settings.email.provider : "not connected"}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Approval mode</span><span>{settings.approval_mode === false ? "disabled" : "enabled"}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Retention</span><span>{settings.retention_days ?? 30} days · {settings.auto_delete_expired === false ? "auto-delete off" : "auto-delete on"}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Database</span><span>SQLite · WAL</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Storage</span><span>{formatBytes(stats.totalBytes)}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Execution</span><span>Sequential, single process</span></div>
           </div>
         </section>
 

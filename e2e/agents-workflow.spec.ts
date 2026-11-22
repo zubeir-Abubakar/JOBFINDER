@@ -6,7 +6,7 @@ test.describe.configure({ mode: "serial" });
 test.setTimeout(120_000);
 
 test("all eight registered agents and their operational roles are shown", async ({ page, diagnostics }) => {
-  await gotoReady(page, "/agents");
+  await gotoReady(page, "/agents/list");
   const cards = page.locator(".agent-card");
   await expect(cards).toHaveCount(8);
   for (const identity of AGENT_IDENTITIES) {
@@ -25,9 +25,9 @@ test("all eight registered agents and their operational roles are shown", async 
 test("source failure is surfaced truthfully without fabricating completed work", async ({ page, request, diagnostics }) => {
   await request.post(E2E.jobControlURL, { data: { mode: "fail" } });
   try {
-    await gotoReady(page, "/agents");
+    await gotoReady(page, "/agents/list");
     await page.getByRole("button", { name: /Quick discovery only/i }).click();
-    await page.waitForURL(/\/agents\?error=/, { timeout: 90_000 });
+    await page.waitForURL(/\/agents\/list\?error=/, { timeout: 90_000 });
 
     const workflow = await waitForDb(
       () =>
@@ -57,9 +57,9 @@ test("source failure is surfaced truthfully without fabricating completed work",
 });
 
 test("successful discovery creates completed task records and updates agent activity", async ({ page, diagnostics }) => {
-  await gotoReady(page, "/agents");
+  await gotoReady(page, "/agents/list");
   await page.getByRole("button", { name: /Quick discovery only/i }).click();
-  await page.waitForURL(/\/agents\?ok=/, { timeout: 90_000 });
+  await page.waitForURL(/\/agents\/list\?ok=/, { timeout: 90_000 });
 
   const workflow = await waitForDb(
     () =>

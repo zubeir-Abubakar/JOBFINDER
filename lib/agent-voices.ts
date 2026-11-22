@@ -133,3 +133,27 @@ export function voiceProfileForAgent(agentKey: string): AgentVoiceProfile {
 export function isLiveVoiceId(value: string): value is LiveVoiceId {
   return LIVE_VOICE_IDS.includes(value as LiveVoiceId);
 }
+
+/** Human label for any supported voice, including one not currently assigned. */
+export function voiceNameForId(voiceId: LiveVoiceId): string {
+  const profile = Object.values(AGENT_VOICE_PROFILES).find((candidate) => candidate.voiceId === voiceId);
+  return profile?.voiceName ?? `${voiceId} — Gemini Live voice`;
+}
+
+/** The existing supported set, in its published order. No new voices are invented. */
+export function supportedVoices(): Array<{ voiceId: LiveVoiceId; voiceName: string }> {
+  return LIVE_VOICE_IDS.map((voiceId) => ({ voiceId, voiceName: voiceNameForId(voiceId) }));
+}
+
+/**
+ * Applies a stored per-agent override. Only the voice fields change; identity,
+ * provider, language, style and every other agent's profile are untouched.
+ */
+export function applyVoiceOverride(
+  profile: AgentVoiceProfile,
+  overrides: Partial<Record<AgentKey, string>>,
+): AgentVoiceProfile {
+  const candidate = overrides[profile.agentKey];
+  if (!candidate || !isLiveVoiceId(candidate)) return profile;
+  return { ...profile, voiceId: candidate, voiceName: voiceNameForId(candidate) };
+}

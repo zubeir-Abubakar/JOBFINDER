@@ -353,6 +353,9 @@ CREATE TABLE IF NOT EXISTS recruitment_runs (
   jobs_discovered INTEGER NOT NULL DEFAULT 0,
   jobs_duplicates INTEGER NOT NULL DEFAULT 0,
   jobs_filtered INTEGER NOT NULL DEFAULT 0,
+  jobs_updated INTEGER NOT NULL DEFAULT 0,
+  discovery_scope TEXT NOT NULL DEFAULT 'full',
+  discovery_since TEXT,
   jobs_eligible INTEGER NOT NULL DEFAULT 0,
   jobs_qualified INTEGER NOT NULL DEFAULT 0,
   sources_checked INTEGER NOT NULL DEFAULT 0,
@@ -462,6 +465,7 @@ CREATE TABLE IF NOT EXISTS discovery_source_status (
   last_duration_ms INTEGER NOT NULL DEFAULT 0,
   last_checked_at TEXT NOT NULL,
   last_success_at TEXT,
+  last_run_id TEXT,
   PRIMARY KEY (source_key, endpoint)
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_source_checked ON discovery_source_status(last_checked_at DESC);
@@ -769,7 +773,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 23;
+export const SCHEMA_VERSION = 24;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -885,6 +889,11 @@ function ensureSchema(db: DatabaseSync): void {
   // zero/NULL values rather than being backfilled from less precise data.
   ensureColumn(db, "recruitment_runs", "jobs_duplicates", "jobs_duplicates INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "recruitment_runs", "jobs_filtered", "jobs_filtered INTEGER NOT NULL DEFAULT 0");
+  // Incremental discovery is persisted on the run: the 10:00 occurrence is a
+  // full pass; later two-hourly occurrences reconcile new and updated postings.
+  ensureColumn(db, "recruitment_runs", "jobs_updated", "jobs_updated INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "recruitment_runs", "discovery_scope", "discovery_scope TEXT NOT NULL DEFAULT 'full'");
+  ensureColumn(db, "recruitment_runs", "discovery_since", "discovery_since TEXT");
   ensureColumn(db, "recruitment_runs", "sources_checked", "sources_checked INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "recruitment_runs", "sources_succeeded", "sources_succeeded INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "recruitment_runs", "sources_failed", "sources_failed INTEGER NOT NULL DEFAULT 0");
@@ -894,6 +903,9 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "discovery_source_status", "status_code", "status_code INTEGER");
   ensureColumn(db, "discovery_source_status", "last_attempts", "last_attempts INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "discovery_source_status", "last_duration_ms", "last_duration_ms INTEGER NOT NULL DEFAULT 0");
+  // Which durable run last exercised this connector, in addition to the last
+  // success timestamp and the per-vacancy last-seen evidence on jobs.
+  ensureColumn(db, "discovery_source_status", "last_run_id", "last_run_id TEXT");
   ensureColumn(db, "schedule_jobs", "last_checked_at", "last_checked_at TEXT");
   ensureColumn(db, "schedule_jobs", "weekdays", "weekdays TEXT");
   ensureColumn(db, "schedule_jobs", "last_scheduled_for", "last_scheduled_for TEXT");
@@ -922,6 +934,7 @@ function ensureSchema(db: DatabaseSync): void {
   // and from which source it was last seen without overwriting its origin.
   ensureColumn(db, "jobs", "last_seen_at", "last_seen_at TEXT");
   ensureColumn(db, "jobs", "last_seen_source", "last_seen_source TEXT");
+  ensureColumn(db, "jobs", "source_updated_at", "source_updated_at TEXT");
   // Final vacancy verification is additive: existing jobs keep NULL/unknown
   // until a run re-reads the employer/listing page. No historical decision is
   // rewritten, and an absent expiry is stored as unknown rather than invented.
@@ -951,6 +964,21 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "notification_outbox", "resend_count", "resend_count INTEGER NOT NULL DEFAULT 0");
   db.exec("CREATE INDEX IF NOT EXISTS idx_notification_outbox_report ON notification_outbox(report_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(status, next_retry_at)");
+  // Phase 2 durable task contract. Every column is additive and nullable, so
+  // historical rows retain their original values and remain readable. The
+  // dependency list references existing task ids; no table is rebuilt.
+  ensureColumn(db, "tasks", "run_id", "run_id TEXT");
+  ensureColumn(db, "tasks", "task_type", "task_type TEXT");
+  ensureColumn(db, "tasks", "depends_on", "depends_on TEXT");
+  ensureColumn(db, "tasks", "input_refs", "input_refs TEXT");
+  ensureColumn(db, "tasks", "output_refs", "output_refs TEXT");
+  ensureColumn(db, "tasks", "heartbeat_at", "heartbeat_at TEXT");
+  ensureColumn(db, "tasks", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0");
+  ensureColumn(db, "tasks", "error_class", "error_class TEXT");
+  ensureColumn(db, "tasks", "recovery_state", "recovery_state TEXT");
+  ensureColumn(db, "tasks", "idempotency_key", "idempotency_key TEXT");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_heartbeat ON tasks(status, heartbeat_at)");
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 
@@ -1353,10 +1381,10 @@ function migrateLegacyApprovalQueue(db: DatabaseSync) {
 }
 
 /**
- * Initial weekly schedule: Monday–Friday, recruitment 09:00 and the daily
- * report 16:00 in Europe/Zurich. Existing custom times or weekday sets are
- * preserved; only the legacy defaults (10:00 recruitment / 17:00 report and no
- * weekday list) are upgraded once.
+ * Initial schedule: Monday–Saturday, main recruitment discovery at 10:00 with
+ * persisted incremental slots at 12:00, 14:00, 16:00, 18:00 and 20:00, and the
+ * daily report at 16:00 Monday–Friday in Europe/Zurich. Existing custom times or
+ * weekday sets are preserved; only rows with no weekday list are initialised.
  */
 function migrateWeeklyScheduleDefaults(db: DatabaseSync) {
   const marker = db.prepare("SELECT value FROM settings WHERE key = 'schedule_defaults_v1'").get();
@@ -1364,12 +1392,12 @@ function migrateWeeklyScheduleDefaults(db: DatabaseSync) {
   const update = db.prepare(
     "UPDATE schedule_jobs SET time = ?, timezone = ?, weekdays = ?, updated_at = ? WHERE key = ? AND (weekdays IS NULL OR weekdays = '')",
   );
-  update.run("09:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5]), nowIso(), "daily_recruitment");
+  update.run("10:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5, 6]), nowIso(), "daily_recruitment");
   update.run("16:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5]), nowIso(), "daily_executive_brief");
   // Legacy rows may already have a weekday value after this build; fix only the
   // known old clock defaults when the row still has no explicit weekday list.
   db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('schedule_defaults_v1', ?, ?)").run(
-    JSON.stringify({ applied_at: nowIso(), version: 1, recruitmentTime: "09:00", reportTime: "16:00" }),
+    JSON.stringify({ applied_at: nowIso(), version: 1, recruitmentTime: "10:00", reportTime: "16:00" }),
     nowIso(),
   );
 }
