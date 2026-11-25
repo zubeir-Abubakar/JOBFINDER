@@ -48,7 +48,14 @@ export type AgentPresentation = {
 function availabilityView(
   enabled: boolean,
   status: string,
-  availability: { available: boolean; reason: string | null; dependency: string | null; cause?: "configuration" | "health" | null },
+  availability: {
+    available: boolean;
+    reason: string | null;
+    dependency: string | null;
+    cause?: "configuration" | "health" | null;
+    restricted?: boolean;
+    restriction?: "ai_inference" | "email_access" | null;
+  },
 ): AgentAvailabilityView {
   if (!enabled) {
     return { state: "offline", label: "Offline", detail: "Disabled in agent management." };
@@ -58,6 +65,13 @@ function availabilityView(
   }
   if (status === "initialising") {
     return { state: "initialising", label: "Initialising", detail: "Agent runtime is starting." };
+  }
+  if (availability.available && availability.restricted) {
+    return {
+      state: "degraded",
+      label: "Operational · AI restricted",
+      detail: `${availability.dependency ?? "AI inference"}: ${availability.reason ?? "AI-assisted work is restricted; deterministic work remains available."}`,
+    };
   }
   if (!availability.available) {
     const dependency = availability.dependency ?? "Dependency";
@@ -132,6 +146,8 @@ export function agentPresentation(input: {
     reason: string | null;
     dependency: string | null;
     cause?: "configuration" | "health" | null;
+    restricted?: boolean;
+    restriction?: "ai_inference" | "email_access" | null;
   };
   lastTask?: { status: string; title: string; at: string | null } | null;
 }): AgentPresentation {

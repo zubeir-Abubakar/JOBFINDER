@@ -45,7 +45,13 @@ export default async function AdminDiagnosticsPage() {
   const disabled = one<{ c: number }>("SELECT COUNT(*) AS c FROM agents WHERE enabled = 0")?.c ?? 0;
   const overrides = agentVoiceOverrides();
   const notificationFailures = Number(outbox.find((row) => row.status === "failed")?.c ?? 0);
-  const providerProblem = providers.every((provider) => !provider.available);
+  // A policy-blocked external route is an expected zero-spend state, not an
+  // outage. Only a configured, enabled, non-policy route that is unreachable
+  // needs intervention. Deterministic operations remain healthy independently.
+  const providerProblem = providers.some(
+    (provider) => provider.configured && provider.enabled && !provider.policyBlocked && !provider.available,
+  );
+  const aiRestricted = !providers.some((provider) => provider.available && !provider.policyBlocked);
   const needsAttention = health.status !== "operational" || notificationFailures > 0 || providerProblem;
 
   return (
@@ -61,13 +67,21 @@ export default async function AdminDiagnosticsPage() {
           <strong>Intervention may be needed.</strong>{" "}
           {health.status !== "operational" ? health.detail : ""}
           {notificationFailures ? ` ${notificationFailures} outbound email(s) failed.` : ""}
-          {providerProblem ? " No AI provider is currently reachable." : ""}
+          {providerProblem ? " A configured AI route is unreachable." : ""}
         </div>
       ) : (
         <div className="alert alert-ok mb-4">
           <strong>No intervention needed.</strong> Database, scheduler and background workers report operational.
         </div>
       )}
+
+      {aiRestricted ? (
+        <div className="alert alert-info mb-4">
+          <strong>No AI route is verified by a successful call yet.</strong>{" "}
+          Gemini text, vision and Live voice use only a verified free tier; Live voice is {voice.blockedByPolicy ? `blocked (${voice.freeTierState})` : "verified free-tier"} under the same CHF 0.00 policy.
+          Availability is not claimed from configuration alone. Deterministic discovery, scoring, document checks and Chief coordination continue.
+        </div>
+      ) : null}
 
       <section className="card mb-4">
         <div className="card-head">
@@ -157,8 +171,16 @@ export default async function AdminDiagnosticsPage() {
                   <div>{provider.name}</div>
                   <div className="cell-sub">{provider.detail}{provider.model ? ` · ${provider.model}` : ""}</div>
                 </div>
-                <span className={`badge ${provider.available ? "badge-good" : provider.configured ? "badge-bad" : "badge-warn"}`}>
-                  {provider.available ? "connected" : provider.configured ? "unreachable" : "not configured"}
+                <span className={`badge ${provider.available ? "badge-good" : provider.configured && !provider.policyBlocked ? (provider.name === "gemini" ? "badge-warn" : "badge-bad") : "badge-warn"}`}>
+                  {provider.available
+                    ? "verified by successful call"
+                    : provider.configured && provider.policyBlocked
+                      ? "blocked by policy"
+                      : provider.configured && provider.name === "gemini"
+                        ? "configured · awaiting verified call"
+                        : provider.configured
+                          ? "unreachable"
+                          : "not configured"}
                 </span>
               </div>
             ))}
@@ -190,13 +212,18 @@ export default async function AdminDiagnosticsPage() {
         <div className="card-head">
           <div>
             <h2>Voice service</h2>
-            <p className="card-sub">Gemini Live is voice-only. Each agent uses its configured or admin-overridden voice.</p>
+            <p className="card-sub">Gemini Live uses only the verified Gemini free tier under the CHF 0.00 policy. Chief remains the first voice contact with the Charon voice; each agent keeps its configured or admin-overridden identity.</p>
           </div>
-          <span className={`badge ${voice.configured ? "badge-good" : "badge-warn"}`}>{voice.configured ? "configured" : "not configured"}</span>
+          <span className={`badge ${voice.blockedByPolicy ? "badge-warn" : voice.configured ? "badge-good" : "badge-neutral"}`}>
+            {voice.blockedByPolicy ? "blocked by policy" : voice.configured ? "free-tier verified" : "not configured"}
+          </span>
         </div>
         <div className="card-body grid g2" style={{ gap: 12 }}>
           <div className="stack" style={{ gap: 6 }}>
-            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Live model</span><span className="num">{voice.model}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>External model</span><span className="num">{voice.model}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Policy</span><span>{voice.blockedByPolicy ? "blocked; no microphone audio sent" : "verified free tier · no paid fallback · CHF 0.00"}</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Chief voice</span><span>Charon · Gemini Live</span></div>
+            <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Local voice</span><span>not used as the primary voice</span></div>
             <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Missing configuration</span><span>{voice.missing.length ? voice.missing.join(", ") : "none"}</span></div>
             <div className="between text-[12px]"><span style={{ color: "var(--muted)" }}>Admin overrides</span><span className="num">{Object.keys(overrides).length}</span></div>
             <Link href="/admin/agents#voices" className="btn btn-sm" style={{ alignSelf: "flex-start" }}>Change agent voices</Link>

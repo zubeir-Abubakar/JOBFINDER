@@ -606,14 +606,20 @@ export async function syncInbox(limit = 20, context: InboxContext = {}) {
     }
   }
 
-  // The email task is marked AI-assisted only when an advisory call actually
-  // ran inline. Queued work marks the same task when it completes.
-  const aiExecuted = aiClassified + aiFailed;
-  if (context.taskId && aiExecuted > 0) {
-    run(
-      "UPDATE tasks SET execution_mode = 'ai', ai_outcome = ?, provider = COALESCE(?, provider), model = COALESCE(?, model), attempts = attempts + ? WHERE id = ?",
-      [aiClassified > 0 ? "ok" : "failed", aiProvider, aiModel, aiExecuted, context.taskId],
+  // The email task is marked AI-assisted only when a provider call actually
+  // ran. A policy block or queued advisory performs no inference and therefore
+  // must not be labelled as an AI execution with invented attempts.
+  if (context.taskId && aiChecked > 0) {
+    const usage = one<{ calls: number }>(
+      "SELECT COUNT(*) AS calls FROM provider_usage WHERE task_id = ? AND agent_key = 'email' AND source = 'task'",
+      [context.taskId],
     );
+    if (Number(usage?.calls ?? 0) === 0) {
+      run(
+        "UPDATE tasks SET execution_mode = 'deterministic', ai_outcome = ? WHERE id = ?",
+        [aiFailed > 0 ? "blocked" : "failed", context.taskId],
+      );
+    }
   }
   run("UPDATE gmail_accounts SET last_sync_at = ? WHERE id = 1", [nowIso()]);
   return { inserted, matched, drafts, scanned: list.messages?.length ?? 0, aiChecked, aiClassified, aiQueued, aiFailed };

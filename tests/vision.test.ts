@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { geminiEvidence } from "./helpers/free-tier-evidence.ts";
 
 process.env.VISION_ENABLED = "true";
+process.env.GEMINI_FREE_TIER_EVIDENCE = geminiEvidence(["gemini-3.6-flash"]);
 delete process.env.GEMINI_API_KEY;
 delete process.env.VISION_MODEL;
 
@@ -21,6 +23,29 @@ test("an explicit disable is truthful and mentions no transmission", () => {
   assert.equal(capability.enabled, false);
   assert.match(capability.detail, /not sent/);
   process.env.VISION_ENABLED = "true";
+});
+
+test("free-tier Gemini vision is enabled without inventing a cost", () => {
+  const saved = new Map(
+    ["GEMINI_API_KEY", "GEMINI_PAID_AUTHORISED", "GEMINI_FREE_TIER_VERIFIED", "VISION_MODEL", "GEMINI_MODEL"].map((key) => [key, process.env[key]]),
+  );
+  process.env.GEMINI_API_KEY = "test-gemini-key";
+  process.env.GEMINI_FREE_TIER_VERIFIED = "true";
+  process.env.VISION_MODEL = "gemini-3.6-flash";
+  try {
+    const capability = visionCapability();
+    assert.equal(capability.enabled, true);
+    assert.equal(capability.configured, true);
+    assert.equal(capability.blockedByPolicy, false);
+    assert.equal(capability.model, "gemini-3.6-flash");
+    assert.match(capability.detail, /free tier/i);
+    assert.doesNotMatch(capability.detail, /CHF\s*0\.00|owner-authorised/i);
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("only a bounded base64 image data URL is accepted", () => {

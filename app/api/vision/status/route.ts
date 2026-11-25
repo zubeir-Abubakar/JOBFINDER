@@ -13,6 +13,7 @@ export async function GET() {
     {
       enabled: capability.enabled,
       configured: capability.configured,
+      blockedByPolicy: capability.blockedByPolicy,
       provider: capability.provider,
       model: capability.model,
       supportsImages: capability.provider === "gemini",
@@ -20,7 +21,9 @@ export async function GET() {
       verifiedAt: capability.verifiedAt,
       lastError: capability.lastError,
       detail: capability.detail,
-      transmission: "A frame is sent only after the owner clicks “Ask about this screen”.",
+      transmission: capability.blockedByPolicy
+        ? "No frame is transmitted. Gemini vision is not authorised."
+        : "No frame is transmitted until you explicitly ask about one. When asked, one approved frame is sent to Gemini; actual Google charges are not estimated.",
     },
     { headers: { "Cache-Control": "no-store" } },
   );

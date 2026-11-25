@@ -29,7 +29,13 @@ export async function handleSpecialistMessage(
   const firstTurn = context === "No previous conversation.";
   const local = [
     firstTurn ? identity.introduction : `I'm still here as ${identity.name}.`,
-    availability.available ? "" : `My dependency is currently unavailable: ${availability.dependency ?? "unknown"}. ${availability.reason ?? ""}`,
+    availability.available && availability.restricted
+      ? availability.restriction === "email_access"
+        ? `Mailbox access is restricted: ${availability.reason ?? "Gmail is unavailable"} In-app tracking remains available.`
+        : `AI inference is restricted: ${availability.reason ?? "the configured route is unavailable"} Deterministic workspace answers remain available.`
+      : availability.available
+        ? ""
+        : `My dependency is currently unavailable: ${availability.dependency ?? "unknown"}. ${availability.reason ?? ""}`,
   ].filter(Boolean).join("\n");
 
   // A deterministic operational result is useful as grounding, but returning it

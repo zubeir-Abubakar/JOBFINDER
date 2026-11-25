@@ -1,4 +1,5 @@
 import { one, run } from "./db";
+import { isAggregatorUrl } from "./job-identity";
 import { readLimitedText, safeFetch } from "./safe-http";
 
 /**
@@ -12,7 +13,7 @@ import { readLimitedText, safeFetch } from "./safe-http";
  */
 
 export type VacancyVerificationStatus = "open" | "closed" | "unverified";
-export type VacancyCheckKind = "application" | "listing" | "employer";
+export type VacancyCheckKind = "application" | "application_form" | "listing" | "employer";
 export type VacancyCheck = {
   kind: VacancyCheckKind;
   url: string;
@@ -21,6 +22,36 @@ export type VacancyCheck = {
   outcome: "open" | "closed" | "unavailable" | "not_available";
   detail: string;
   identityMatched: boolean;
+};
+
+/**
+ * Route evidence is deliberately cumulative. A URL extracted from listing
+ * metadata is only URL_RESOLVED; it becomes URL_REACHABLE, then identity and
+ * open-vacancy verified only from the page actually read. Form support is
+ * recorded separately because a reachable page can still be unsupported by the
+ * local Playwright executor.
+ */
+export type ApplicationRouteStatus =
+  | "URL_RESOLVED"
+  | "URL_REACHABLE"
+  | "EMPLOYER_IDENTITY_VERIFIED"
+  | "VACANCY_OPEN_VERIFIED"
+  | "APPLICATION_FORM_SUPPORTED"
+  | "APPLICATION_ROUTE_UNRESOLVED";
+
+export type ApplicationRouteVerification = {
+  statuses: ApplicationRouteStatus[];
+  finalStatus: ApplicationRouteStatus;
+  urlResolved: boolean;
+  urlReachable: boolean;
+  employerIdentityVerified: boolean;
+  vacancyOpenVerified: boolean;
+  applicationFormSupported: boolean;
+  finalUrl: string | null;
+  finalHost: string | null;
+  httpStatus: number | null;
+  formEvidence: string[];
+  reason: string;
 };
 
 export type VacancyVerification = {
@@ -33,6 +64,7 @@ export type VacancyVerification = {
   expirySource: "structured_data" | null;
   reason: string;
   checks: VacancyCheck[];
+  route: ApplicationRouteVerification;
 };
 
 export type VacancyVerificationJob = {
@@ -46,6 +78,9 @@ export type VacancyVerificationJob = {
   company_domain?: string | null;
   source?: string | null;
   expiry_at?: string | null;
+  ats_vendor?: string | null;
+  url_confidence?: string | null;
+  employer_url?: string | null;
 };
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -165,6 +200,56 @@ function closedSignal(html: string): string | null {
   for (const item of CLOSED_PATTERNS) {
     const match = text.match(item.pattern);
     if (match) return match[0];
+  }
+  return null;
+}
+
+const KNOWN_APPLICATION_VENDORS = new Set([
+  "greenhouse",
+  "lever",
+  "ashby",
+  "workday",
+  "smartrecruiters",
+  "personio",
+  "recruitee",
+  "teamtailor",
+  "bamboohr",
+  "onlyfy",
+  "prospective",
+  "join",
+]);
+
+function applicationFormEvidence(html: string, vendor: string | null): string[] {
+  const evidence: string[] = [];
+  const form = /<form\b/i.test(html);
+  const upload = /<input[^>]+type=["']file["']/i.test(html);
+  const email = /<input[^>]+type=["']email["']|<input[^>]+name=["'][^"']*email/i.test(html);
+  const embedded = /<iframe\b[^>]+src\s*=\s*["']https?:\/\//i.test(html);
+  if (form) evidence.push("HTML form element");
+  if (upload) evidence.push("CV/document upload control");
+  if (email) evidence.push("email contact control");
+  if (embedded) evidence.push("embedded third-party iframe (unsupported by the local executor)");
+  if (form && vendor && KNOWN_APPLICATION_VENDORS.has(vendor)) evidence.push(`${vendor} application route`);
+  return evidence;
+}
+
+/** Follow only an explicit apply link that the employer page itself publishes. */
+function explicitApplyLink(html: string, base: string | null): string | null {
+  if (!base) return null;
+  for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const href = match[1].match(/\bhref\s*=\s*["']([^"']+)["']/i)?.[1]?.trim();
+    if (!href || href.startsWith("#")) continue;
+    const label = decodeEntities(match[2].replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+    if (!/\b(apply(?: now)?|bewerben|jetzt bewerben|application form|online bewerben)\b/i.test(label)) continue;
+    try {
+      const url = new URL(href, base);
+      const baseUrl = new URL(base);
+      if (url.origin === baseUrl.origin && url.pathname === baseUrl.pathname) continue;
+      if (!/^https?:$/.test(url.protocol) || isAggregatorUrl(url.href)) continue;
+      return url.href;
+    } catch {
+      // A malformed explicit link is skipped; it is never guessed.
+    }
   }
   return null;
 }
@@ -319,6 +404,8 @@ export async function verifyVacancy(
   let closedFound = false;
   let openFound = false;
   let identitySeen = false;
+  let applicationHtml = "";
+  let applicationCheck = checks.find((check) => check.kind === "application") ?? null;
 
   for (const entry of urls) {
     const result = await checkPage({
@@ -328,12 +415,41 @@ export async function verifyVacancy(
       timeoutMs: options.timeoutMs ?? 20_000,
     });
     checks.push(result.check);
+    if (entry.kind === "application") {
+      applicationHtml = result.html;
+      applicationCheck = result.check;
+    }
     if (result.check.outcome === "closed") closedFound = true;
     if (result.check.outcome === "open" && result.check.identityMatched) openFound = true;
     if (result.check.identityMatched) identitySeen = true;
     if (!expiryAt && result.expiry) {
       expiryAt = result.expiry;
       expirySource = "structured_data";
+    }
+  }
+
+  // Many employer pages present the form on a separate, explicitly linked URL.
+  // Follow one such link only; no link is synthesised from a path pattern.
+  let formCheck: VacancyCheck | null = null;
+  if (applicationCheck?.httpStatus && applicationCheck.httpStatus >= 200 && applicationCheck.httpStatus < 400) {
+    const linked = explicitApplyLink(applicationHtml, applicationCheck.finalUrl ?? applicationCheck.url);
+    if (linked && linked !== applicationCheck.finalUrl && linked !== applicationCheck.url) {
+      const form = await checkPage({
+        kind: "application_form",
+        url: linked,
+        job,
+        fetchImpl,
+        timeoutMs: options.timeoutMs ?? 20_000,
+      });
+      checks.push(form.check);
+      formCheck = form.check;
+      if (form.html) applicationHtml = form.html;
+      if (form.check.outcome === "closed") closedFound = true;
+      if (form.check.identityMatched) identitySeen = true;
+      if (!expiryAt && form.expiry) {
+        expiryAt = form.expiry;
+        expirySource = "structured_data";
+      }
     }
   }
 
@@ -394,6 +510,54 @@ export async function verifyVacancy(
       : "The listing is reachable and matched the role. No application expiry was supplied, so the expiry is recorded as unknown.";
   }
 
+  const applicationUrl = job.application_url?.trim() || null;
+  const effectiveVendor = job.ats_vendor?.trim().toLowerCase() || null;
+  const formEvidence = applicationHtml ? applicationFormEvidence(applicationHtml, effectiveVendor) : [];
+  const urlResolved = Boolean(applicationUrl && !isAggregatorUrl(applicationUrl));
+  const routeCheck = formCheck ?? applicationCheck;
+  const urlReachable = Boolean(
+    routeCheck?.httpStatus !== null &&
+      routeCheck?.httpStatus !== undefined &&
+      routeCheck.httpStatus >= 200 &&
+      routeCheck.httpStatus < 400,
+  );
+  const employerIdentityVerified = checks.some(
+    (check) => (check.kind === "application" || check.kind === "application_form" || check.kind === "employer") && check.identityMatched,
+  );
+  const vacancyOpenVerified = status === "open" && applicationCheck?.outcome === "open" && employerIdentityVerified;
+  const embeddedIframe = formEvidence.some((item) => /embedded third-party iframe/i.test(item));
+  const supportedFormEvidence = formEvidence.filter((item) => !/embedded third-party iframe/i.test(item));
+  // A parent-page form may be a search/newsletter form. When the application is
+  // embedded, do not claim support from unrelated parent HTML.
+  const applicationFormSupported = urlReachable && supportedFormEvidence.length > 0 && !embeddedIframe;
+  const routeStatuses: ApplicationRouteStatus[] = [];
+  if (urlResolved) routeStatuses.push("URL_RESOLVED");
+  if (urlResolved && urlReachable) routeStatuses.push("URL_REACHABLE");
+  if (urlResolved && urlReachable && employerIdentityVerified) routeStatuses.push("EMPLOYER_IDENTITY_VERIFIED");
+  if (vacancyOpenVerified) routeStatuses.push("VACANCY_OPEN_VERIFIED");
+  if (vacancyOpenVerified && applicationFormSupported) routeStatuses.push("APPLICATION_FORM_SUPPORTED");
+  const finalStatus = routeStatuses.at(-1) ?? "APPLICATION_ROUTE_UNRESOLVED";
+  const finalUrl = routeCheck?.finalUrl ?? null;
+  let finalHost: string | null = null;
+  try {
+    finalHost = finalUrl ? new URL(finalUrl).hostname.replace(/^www\./, "").toLowerCase() : null;
+  } catch {
+    finalHost = null;
+  }
+  const routeReason = !urlResolved
+    ? "No non-aggregator employer/ATS application URL is recorded."
+    : !urlReachable
+      ? "The application route was resolved but did not return a reachable page."
+      : !employerIdentityVerified
+        ? "The application page was reachable but the employer and role could not be matched."
+        : !vacancyOpenVerified
+          ? "The employer and role were matched, but the vacancy is not verified open."
+          : formEvidence.some((item) => /embedded third-party iframe/i.test(item))
+            ? "The vacancy is open, but its application form is embedded in a third-party iframe the local executor does not enter."
+            : !applicationFormSupported
+              ? "The vacancy is open, but no supported application form was detected."
+              : "The employer route, open vacancy and application form are verified.";
+
   return {
     status,
     checkedAt,
@@ -404,6 +568,20 @@ export async function verifyVacancy(
     expirySource,
     reason,
     checks,
+    route: {
+      statuses: routeStatuses.length > 0 ? routeStatuses : ["APPLICATION_ROUTE_UNRESOLVED"],
+      finalStatus,
+      urlResolved,
+      urlReachable,
+      employerIdentityVerified,
+      vacancyOpenVerified,
+      applicationFormSupported,
+      finalUrl,
+      finalHost,
+      httpStatus: routeCheck?.httpStatus ?? null,
+      formEvidence,
+      reason: routeReason,
+    },
   };
 }
 

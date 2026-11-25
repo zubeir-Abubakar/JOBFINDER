@@ -4,6 +4,15 @@ import { htmlToText } from "./scoring";
 import { researchJobs } from "./jobs";
 import { getSetting } from "./settings";
 import { classifyVacancy } from "./vacancy-classification";
+import { analyseVacancyGermanRequirement, MANDATORY_GERMAN_REQUIREMENT } from "./language-requirements";
+import { vacancyIdentity, isAggregatorUrl } from "./job-identity";
+import {
+  employerUrlProvenance,
+  resolveJobsChEmployerUrl,
+  type EmployerUrlProvenance,
+  type LinkResolution,
+} from "./employer-links";
+import { persistEmployerUrlProvenance } from "./jobs-ch-resolution";
 import { extractCoverLetterRequirements } from "./cover-letter-requirements";
 import {
   requestJson,
@@ -43,8 +52,48 @@ export type DiscoveredJob = {
   publishedAt: string | null;
   /** Source update timestamp when the connector exposes one. */
   updatedAt?: string | null;
+  /** Evidence for a resolved employer application URL. */
+  urlProvenance?: EmployerUrlProvenance | null;
   raw?: unknown;
 };
+
+/** Auditable reason a real source listing did not become a vacancy. */
+export type DiscoveryRejection = {
+  title: string;
+  company: string;
+  url: string | null;
+  reason: string;
+};
+
+export type DiscoveryRejectionSummary = {
+  rejectionReasons: Record<string, number>;
+  rejectedSamples: DiscoveryRejection[];
+};
+
+const MAX_REJECTION_SAMPLES = 40;
+
+function rejectionSummary(source: RawDiscovery): DiscoveryRejectionSummary {
+  return {
+    rejectionReasons: { ...source.rejectionReasons },
+    rejectedSamples: source.rejectedSamples.slice(0, MAX_REJECTION_SAMPLES),
+  };
+}
+
+function rejectListing(
+  source: RawDiscovery,
+  input: { title: string; company: string; url?: string | null; reason: string },
+): void {
+  source.filtered += 1;
+  source.rejectionReasons[input.reason] = (source.rejectionReasons[input.reason] ?? 0) + 1;
+  if (source.rejectedSamples.length < MAX_REJECTION_SAMPLES) {
+    source.rejectedSamples.push({
+      title: input.title.trim().slice(0, 240) || "Untitled listing",
+      company: input.company.trim().slice(0, 160) || "Unknown employer",
+      url: input.url?.trim().slice(0, 1000) || null,
+      reason: input.reason,
+    });
+  }
+}
 
 export type DiscoverySource = {
   key: string;
@@ -63,6 +112,8 @@ export type DiscoverySource = {
   attempts?: number;
   durationMs?: number;
   errorCategory?: SourceErrorCategory | null;
+  rejectionReasons?: Record<string, number>;
+  rejectedSamples?: DiscoveryRejection[];
 };
 
 /** Per-source contribution, persisted on the run and shown in the report/UI. */
@@ -83,6 +134,8 @@ export type SourceMetrics = {
   attempts?: number;
   durationMs?: number;
   status?: string;
+  rejectionReasons?: Record<string, number>;
+  rejectedSamples?: DiscoveryRejection[];
 };
 
 export type DiscoveryResult = {
@@ -105,10 +158,10 @@ export type DiscoveryResult = {
 };
 
 const QA_TITLE =
-  /\b(qa|quality assurance|test(?:ing)? engineer|test automation|automation engineer|sdet|software (?:development )?engineer in test|software test|test lead|test manager|lead qa|qa lead|qa automation|qa engineer|test analyst|quality engineer)\b/i;
+  /\b(qa|quality assurance(?: engineer| analyst)?|quality engineer|quality manager|test(?:ing)? engineer|test automation|test architect|automation test(?:ing)? engineer|automation engineer|sdet|software (?:development )?engineer in test|software test|test lead|test manager|testmanager|lead qa|qa lead|qa automation|qa engineer|qa analyst|qa specialist|qa tester|api test(?:er|ing)? engineer|mobile qa(?: engineer)?|software qa|test analyst|test specialist|test consultant|teamlead(?:er)? (?:test|testing|qa|quality)|head of (?:test|testing|qa|quality)|testingenieur|ing[ée]nieur (?:test|qa|qualit[ée])|testeur|testeuse|analyste qa|responsable (?:test|qa))\b/i;
 
 const SWISS_SIGNAL =
-  /(switzerland|schweiz|suisse|svizzera|swiss|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.?\s*gallen|lugano|fribourg|vaud|ticino|neuch|bienne|olten|aarau|schaffhausen|sion|chur)/i;
+  /(switzerland|schweiz|suisse|svizzera|swiss|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.?\s*gallen|lugano|fribourg|vaud|ticino|neuch|bienne|biel|thun|olten|aarau|schaffhausen|sion|chur|emmen|bonaduz|altdorf|nidau|sarnen|bellach|puidoux|burgdorf|d[üu]bendorf|manno|reinach|d[äa]llikon|kreuzlingen|moosseedorf|zollikofen|wohlen)/i;
 
 const EUROPE_OPEN = /\b(eu\/efta|european union|europe|eea|emea|dach|worldwide|anywhere|global|international|remote)\b/i;
 
@@ -120,8 +173,27 @@ export function normaliseText(value: string): string {
 }
 
 /** Employer + role identity used to stop the same vacancy being stored twice. */
-export function dedupeKeyFor(company: string, title: string): string {
-  return crypto.createHash("sha1").update(`${normaliseText(company)}|${normaliseText(title)}`).digest("hex");
+export function normaliseLocationForDedupe(value: string | null | undefined): string {
+  return normaliseText(value ?? "")
+    .replace(/\b(switzerland|schweiz|suisse|svizzera|swiss|remote|hybrid|on site|onsite|full time|part time)\b/g, " ")
+    .replace(/\b\d{2,3}\s*(?:%|percent)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Employer + role + city identity.
+ *
+ * Location is part of the key because the same title at the same employer in
+ * Zürich and Bern is two genuine vacancies, not a duplicate. A missing location
+ * falls back to the legacy employer+title key for older rows.
+ */
+export function dedupeKeyFor(company: string, title: string, location?: string | null): string {
+  const locationKey = normaliseLocationForDedupe(location);
+  const identity = locationKey
+    ? `${normaliseText(company)}|${normaliseText(title)}|${locationKey}`
+    : `${normaliseText(company)}|${normaliseText(title)}`;
+  return crypto.createHash("sha1").update(identity).digest("hex");
 }
 
 export function normaliseApplicationUrl(value: string | null | undefined): string | null {
@@ -156,24 +228,38 @@ export function isQaTitle(title: string): boolean {
   return QA_TITLE.test(title);
 }
 
-function titleFiltered(title: string, company: string, location: string, description: string): string | null {
+function titleFiltered(
+  title: string,
+  company: string,
+  location: string,
+  description: string,
+  options: { assumeSwitzerland?: boolean } = {},
+): string | null {
   // Classification reads the responsibilities, not just the title: a general
   // engineering or product role that mentions testing is rejected here.
   const classification = classifyVacancy({ title, company, location, description });
   if (!classification.isQa) return `Not a hands-on QA/SDET role (classified as ${classification.label})`;
   if (title.trim().length < 3) return "Missing a real job title";
   if (company.trim().length < 2 || PLACEHOLDER_COMPANY.test(company.trim())) return "Placeholder employer rejected";
-  const swiss = SWISS_SIGNAL.test(location) || SWISS_SIGNAL.test(description.slice(0, 2000));
+  const swiss = options.assumeSwitzerland || SWISS_SIGNAL.test(location) || SWISS_SIGNAL.test(description.slice(0, 2000));
   if (!swiss && !EUROPE_OPEN.test(`${location} ${description.slice(0, 1200)}`)) return "Outside Switzerland and not remote";
   if (description.trim().length < 40) return "Missing the original vacancy description";
   return null;
 }
 
-function publishedWithinSevenDays(value: string | null): boolean {
-  if (!value) return true;
+/** Counts a recent publication for metrics only. Age is never a rejection rule. */
+function publishedRecently(value: string | null): boolean {
+  if (!value) return false;
   const time = Date.parse(value);
-  if (!Number.isFinite(time)) return true;
+  if (!Number.isFinite(time)) return false;
   return Date.now() - time <= 7 * 86400_000;
+}
+
+function expiryRejection(value: string | null | undefined, now = Date.now()): string | null {
+  if (!value?.trim()) return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  return parsed < now ? `Source states the application deadline has passed (${value.trim()})` : null;
 }
 
 export type DuplicateMatch = {
@@ -187,10 +273,6 @@ export function findDuplicateJob(job: DiscoveredJob): DuplicateMatch | null {
     const sameSource = one<{ id: string }>("SELECT id FROM jobs WHERE source = ? AND external_id = ?", [job.source, job.externalId]);
     if (sameSource) return { id: sameSource.id, rule: "source + external_id" };
   }
-  const dedupeKey = dedupeKeyFor(job.company, job.title);
-  const keyMatch = one<{ id: string }>("SELECT id FROM jobs WHERE dedupe_key = ?", [dedupeKey]);
-  if (keyMatch) return { id: keyMatch.id, rule: "normalised employer + title SHA-1" };
-
   const applicationUrl = normaliseApplicationUrl(job.applicationUrl);
   if (applicationUrl) {
     const rows = one<{ id: string }>(
@@ -200,10 +282,33 @@ export function findDuplicateJob(job: DiscoveredJob): DuplicateMatch | null {
     if (rows) return { id: rows.id, rule: "normalised application URL" };
   }
 
-  const nearDuplicate = one<{ id: string }>(
-    "SELECT id FROM jobs WHERE lower(trim(title)) = lower(trim(?)) AND lower(trim(company)) = lower(trim(?))",
+  const dedupeKey = dedupeKeyFor(job.company, job.title, job.location);
+  const keyMatch = one<{ id: string }>("SELECT id FROM jobs WHERE dedupe_key = ?", [dedupeKey]);
+  if (keyMatch) return { id: keyMatch.id, rule: "normalised employer + title SHA-1" };
+
+  // Backward compatibility for rows created before location was part of the
+  // key. Accept the legacy key only when the stored location also matches, so
+  // the same role in Zürich and Bern is never collapsed into one vacancy.
+  const legacyKey = dedupeKeyFor(job.company, job.title);
+  const legacyRows = all<{ id: string; location: string | null }>(
+    "SELECT id, location FROM jobs WHERE dedupe_key = ?",
+    [legacyKey],
+  );
+  const locationKey = normaliseLocationForDedupe(job.location);
+  const legacyMatch = legacyRows.find((row) => {
+    const existing = normaliseLocationForDedupe(row.location);
+    return !existing || !locationKey || existing === locationKey;
+  });
+  if (legacyMatch) return { id: legacyMatch.id, rule: "normalised employer + title SHA-1" };
+
+  const candidates = all<{ id: string; location: string | null }>(
+    "SELECT id, location FROM jobs WHERE lower(trim(title)) = lower(trim(?)) AND lower(trim(company)) = lower(trim(?))",
     [job.title, job.company],
   );
+  const nearDuplicate = candidates.find((row) => {
+    const existing = normaliseLocationForDedupe(row.location);
+    return !existing || !locationKey || existing === locationKey;
+  });
   if (nearDuplicate) return { id: nearDuplicate.id, rule: "case-insensitive employer + title" };
   return null;
 }
@@ -234,8 +339,8 @@ export type ReconcileOutcome = {
 export function reconcileDiscovered(job: DiscoveredJob, runId: string | null): ReconcileOutcome {
   const duplicate = findDuplicateJob(job);
   if (duplicate) {
-    const existing = one<{ source_updated_at: string | null }>(
-      "SELECT source_updated_at FROM jobs WHERE id = ?",
+    const existing = one<{ source_updated_at: string | null; description: string | null }>(
+      "SELECT source_updated_at, description FROM jobs WHERE id = ?",
       [duplicate.id],
     );
     const candidate = sourceUpdatedAt(job);
@@ -255,11 +360,123 @@ export function reconcileDiscovered(job: DiscoveredJob, runId: string | null): R
       "UPDATE jobs SET last_seen_at = ?, last_seen_source = ?, source_updated_at = COALESCE(?, source_updated_at) WHERE id = ?",
       [nowIso(), job.source, nextSeen, duplicate.id],
     );
+
+    // A re-listed vacancy can change its language requirement. Re-read the new
+    // description and enforce the same rule immediately; the earlier eligibility
+    // result is never allowed to survive a newly mandatory German requirement.
+    const changedDescription = job.description?.trim() ?? "";
+    if (changedDescription.length >= 40 && changedDescription !== (existing?.description ?? "").trim()) {
+      const german = analyseVacancyGermanRequirement(job.title, changedDescription);
+      const classification = classifyVacancy({
+        title: job.title,
+        company: job.company,
+        location: job.location,
+        description: changedDescription,
+      });
+      const coverLetter = extractCoverLetterRequirements(changedDescription, {
+        sourceUrl: job.url,
+        retrievedAt: nowIso(),
+      });
+      run(
+        "UPDATE jobs SET description = ?, classification = ?, requirements = ?, german_requirement = ?, language_evidence = ? WHERE id = ?",
+        [
+          changedDescription.slice(0, 24000),
+          JSON.stringify(classification).slice(0, 12000),
+          JSON.stringify({
+            mandatory: classification.mandatory,
+            preferences: classification.preferences,
+            coverLetter,
+            german,
+          }).slice(0, 12000),
+          german.status,
+          JSON.stringify(german).slice(0, 8000),
+          duplicate.id,
+        ],
+      );
+      if (german.status === "required") {
+        run(
+          `UPDATE jobs SET eligibility = 'ineligible', qualified = 0, qualification_status = 'ineligible',
+             eligibility_notes = ?, eligibility_checked_at = ?,
+             status = CASE WHEN status = 'applied' THEN status ELSE 'rejected' END
+           WHERE id = ?`,
+          [
+            JSON.stringify({
+              status: "ineligible",
+              blockers: [`${MANDATORY_GERMAN_REQUIREMENT}: ${german.detail}`],
+              germanStatus: german.status,
+              germanEvidence: german.evidence,
+              reasonCode: german.reasonCode,
+              checkedAt: nowIso(),
+            }).slice(0, 12000),
+            nowIso(),
+            duplicate.id,
+          ],
+        );
+        run(
+          `UPDATE applications SET status = 'rejected', submission_status = 'blocked', submission_evidence = ?, last_update = ?
+           WHERE job_id = ? AND status NOT IN ('submitted','acknowledged','interview_invited')`,
+          [
+            JSON.stringify({
+              outcomeClass: "blocked_external",
+              reasonCode: MANDATORY_GERMAN_REQUIREMENT,
+              germanStatus: german.status,
+              germanEvidence: german.evidence,
+              detail: german.detail,
+            }).slice(0, 12000),
+            nowIso(),
+            duplicate.id,
+          ],
+        );
+      } else if (german.status === "ambiguous" || german.status === "unknown") {
+        run(
+          `UPDATE jobs SET eligibility = CASE WHEN eligibility = 'eligible' THEN 'needs_review' ELSE eligibility END,
+             qualified = 0,
+             qualification_status = CASE WHEN qualification_status = 'qualified' THEN 'needs_review' ELSE qualification_status END,
+             eligibility_notes = ?, eligibility_checked_at = ?
+           WHERE id = ?`,
+          [
+            JSON.stringify({
+              status: "needs_review",
+              reasons: [german.detail],
+              germanStatus: german.status,
+              germanEvidence: german.evidence,
+              reasonCode: german.reasonCode,
+              checkedAt: nowIso(),
+            }).slice(0, 12000),
+            nowIso(),
+            duplicate.id,
+          ],
+        );
+      }
+    }
+    if (job.urlProvenance) persistEmployerUrlProvenance(duplicate.id, job.urlProvenance);
     return { id: duplicate.id, outcome, rule: duplicate.rule };
   }
 
   const id = `job_${crypto.randomBytes(8).toString("hex")}`;
-  const dedupeKey = dedupeKeyFor(job.company, job.title);
+  const dedupeKey = dedupeKeyFor(job.company, job.title, job.location);
+  // Canonical registry identity. An aggregator detail page is recorded as the
+  // source URL only; it is never stored as the employer application endpoint.
+  const identity = vacancyIdentity({
+    source: job.source,
+    externalId: job.externalId,
+    company: job.company,
+    title: job.title,
+    location: job.location,
+    listingUrl: job.url,
+    applicationUrl: job.applicationUrl,
+  });
+  const provenance = job.urlProvenance ?? null;
+  const applicationUrl = provenance?.employerUrl ?? identity.applicationUrl;
+  const employerUrl = provenance?.employerUrl ?? identity.employerUrl;
+  const urlConfidence = provenance?.confidence ?? identity.urlConfidence;
+  const atsVendor = provenance?.atsVendor ?? identity.atsVendor;
+  const requisitionId = provenance?.requisitionId ?? identity.requisitionId;
+  const canonicalKey = provenance?.employerUrl
+    ? provenance.requisitionId
+      ? `req:${identity.employerKey}:${provenance.requisitionId.toLowerCase()}`
+      : `url:${provenance.employerUrl}`
+    : identity.canonicalKey;
   const classification = classifyVacancy({
     title: job.title,
     company: job.company,
@@ -271,14 +488,17 @@ export function reconcileDiscovered(job: DiscoveredJob, runId: string | null): R
     sourceUrl: job.url,
     retrievedAt,
   });
+  const german = analyseVacancyGermanRequirement(job.title, job.description);
   const updatedAt = sourceUpdatedAt(job);
   try {
     run(
       `INSERT INTO jobs (id, source, source_platform, external_id, title, company, company_domain, location, remote,
                          employment_type, salary, url, application_url, description, classification, requirements,
-                         published_at, posted_at, discovered_at, status, dedupe_key, run_id, raw,
-                         last_seen_at, last_seen_source, source_updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)`,
+                         published_at, posted_at, discovered_at, status, dedupe_key, canonical_key, employer_key,
+                         requisition_id, employer_url, ats_vendor, url_confidence, url_provenance, vacancy_status,
+                         qualification_status, german_requirement, language_evidence,
+                         run_id, raw, last_seen_at, last_seen_source, source_updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?, 'new', 'pending', ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         job.source,
@@ -292,18 +512,28 @@ export function reconcileDiscovered(job: DiscoveredJob, runId: string | null): R
         job.employmentType,
         job.salary,
         job.url,
-        job.applicationUrl ?? job.url,
+        applicationUrl,
         job.description.slice(0, 24000),
         JSON.stringify(classification).slice(0, 12000),
         JSON.stringify({
           mandatory: classification.mandatory,
           preferences: classification.preferences,
           coverLetter,
+          german,
         }).slice(0, 12000),
         job.publishedAt,
         job.publishedAt,
         nowIso(),
         dedupeKey,
+        canonicalKey,
+        identity.employerKey,
+        requisitionId,
+        employerUrl,
+        atsVendor,
+        urlConfidence,
+        provenance ? JSON.stringify(provenance).slice(0, 12000) : null,
+        german.status,
+        JSON.stringify(german).slice(0, 8000),
         runId,
         job.raw ? JSON.stringify(job.raw).slice(0, 20000) : null,
         nowIso(),
@@ -358,6 +588,8 @@ export type RawDiscovery = {
   durationMs: number;
   diagnostics: SourceAttemptDiagnostic[];
   numPages?: number;
+  rejectionReasons: Record<string, number>;
+  rejectedSamples: DiscoveryRejection[];
 };
 
 function logSourceDiagnostics(runId: string, source: string, diagnostics: SourceAttemptDiagnostic[]): void {
@@ -393,6 +625,8 @@ function emptyRaw(): RawDiscovery {
     durationMs: 0,
     diagnostics: [],
     numPages: 1,
+    rejectionReasons: {},
+    rejectedSamples: [],
   };
 }
 
@@ -408,9 +642,17 @@ function prettifySlug(slug: string): string {
 
 function asText(value: unknown): string {
   if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(asText).filter(Boolean).join(" / ");
   if (value && typeof value === "object") {
     const record = value as Record<string, unknown>;
-    return [record.name, record.addressLocality, record.addressCountry].filter(Boolean).map(String).join(", ");
+    if (record.address) {
+      const address = asText(record.address);
+      if (address) return address;
+    }
+    return [record.name, record.addressLocality, record.addressRegion, record.addressCountry]
+      .filter(Boolean)
+      .map(String)
+      .join(", ");
   }
   return "";
 }
@@ -471,28 +713,45 @@ export async function discoverFromAshby(boards: string[]): Promise<RawDiscovery>
       postingCount = postings.length;
       out.fetched += postings.length;
       for (const posting of postings) {
-        if (posting.isListed === false) {
-          out.filtered += 1;
-          continue;
-        }
         const title = (posting.title ?? "").trim();
         const description = (posting.descriptionPlain ?? htmlToText(posting.descriptionHtml ?? "")).trim();
         const location =
           posting.location?.trim() ||
           (posting.secondaryLocations ?? []).map((item) => item.location ?? "").filter(Boolean).join(" / ") ||
           "Not specified";
-        const remote = Boolean(posting.isRemote) || /remote/i.test(posting.workplaceType ?? "");
         const url = posting.applyUrl || posting.jobUrl || "";
         const company = prettifySlug(slug);
-        const fresh = publishedWithinSevenDays(posting.publishedAt ?? null);
-        if (fresh) out.fresh += 1;
-        const reason = titleFiltered(title, company, location, description);
-        if (reason) {
-          out.filtered += 1;
+        if (posting.isListed === false) {
+          rejectListing(out, { title, company, url, reason: "Source marks this posting as unlisted" });
           continue;
         }
-        if (!fresh) {
-          out.filtered += 1;
+        const deadline = expiryRejection(posting.applicationDeadline);
+        if (deadline) {
+          rejectListing(out, { title, company, url, reason: deadline });
+          continue;
+        }
+        // Ashby often leaves isRemote null and workplaceType unset while the
+        // title and location still describe a remote EMEA role. Record the
+        // remote signal so eligibility does not treat it as an on-site role.
+        // A provider's isRemote flag can contradict its own description (for
+        // example a "fully onsite" office role). The explicit onsite evidence
+        // wins so a foreign office vacancy is not presented as remote-eligible.
+        const onsiteDescription = /\b(?:fully onsite|fully on-site|fully office|office[- ]based|based at our office|work from (?:our|the) office)\b/i.test(
+          description,
+        );
+        const remote =
+          !onsiteDescription &&
+          (Boolean(posting.isRemote) ||
+            /remote|anywhere|distributed/i.test(`${posting.workplaceType ?? ""} ${title} ${location}`) ||
+            (/\b(emea|europe|worldwide|global)\b/i.test(location) && /remote/i.test(description.slice(0, 600))));
+        if (publishedRecently(posting.publishedAt ?? null)) out.fresh += 1;
+        const reason = titleFiltered(title, company, location, description);
+        if (reason) {
+          rejectListing(out, { title, company, url, reason });
+          continue;
+        }
+        if (!url) {
+          rejectListing(out, { title, company, url, reason: "Missing the original job URL" });
           continue;
         }
         out.jobs.push({
@@ -631,22 +890,17 @@ export async function discoverFromCareerPages(pages: string[]): Promise<RawDisco
         const description = htmlToText(asText(posting.description)).trim();
         const company = asText(posting.hiringOrganization) || host;
         const location = asText(posting.jobLocation) || (posting.applicantLocationRequirements ? asText(posting.applicantLocationRequirements) : "") || "Not specified";
-        const remote = /remote|telecommute/i.test(`${asText(posting.jobLocationType)} ${description.slice(0, 400)}`);
+        const remote = /remote|telecommute/i.test(`${asText(posting.jobLocationType)} ${title} ${description.slice(0, 600)}`);
         const url = asText(posting.url) || pageUrl;
-        const fresh = publishedWithinSevenDays(asText(posting.datePosted) || null);
-        if (fresh) out.fresh += 1;
+        if (publishedRecently(asText(posting.datePosted) || null)) out.fresh += 1;
         const reason = titleFiltered(title, company, location, description);
         if (reason) {
-          out.filtered += 1;
+          rejectListing(out, { title, company, url, reason });
           continue;
         }
-        const validThrough = asText(posting.validThrough);
-        if (validThrough && Date.parse(validThrough) < Date.now()) {
-          out.filtered += 1;
-          continue;
-        }
-        if (!fresh) {
-          out.filtered += 1;
+        const expired = expiryRejection(asText(posting.validThrough) || asText(posting.applicationDeadline));
+        if (expired) {
+          rejectListing(out, { title, company, url, reason: expired });
           continue;
         }
         out.jobs.push({
@@ -760,21 +1014,16 @@ export async function discoverFromGreenhouse(boards: string[]): Promise<RawDisco
         const description = htmlToText(posting.content ?? "").trim();
         const location = posting.location?.name?.trim() || "Not specified";
         const posted = posting.first_published ?? posting.updated_at ?? null;
-        const fresh = publishedWithinSevenDays(posted);
-        if (fresh) out.fresh += 1;
+        if (publishedRecently(posted)) out.fresh += 1;
         const employer = (posting.company_name ?? "").trim() || company;
+        const url = posting.absolute_url ?? "";
         const reason = titleFiltered(title, employer, location, description);
         if (reason) {
-          out.filtered += 1;
+          rejectListing(out, { title, company: employer, url, reason });
           continue;
         }
-        if (!fresh) {
-          out.filtered += 1;
-          continue;
-        }
-        const url = posting.absolute_url ?? "";
         if (!url) {
-          out.filtered += 1;
+          rejectListing(out, { title, company: employer, url, reason: "Missing the original job URL" });
           continue;
         }
         out.jobs.push({
@@ -785,7 +1034,7 @@ export async function discoverFromGreenhouse(boards: string[]): Promise<RawDisco
           company: employer,
           companyDomain: companyDomain(employer, url),
           location,
-          remote: /remote/i.test(location) || /remote|anywhere|distributed/i.test(description.slice(0, 400)),
+          remote: /remote/i.test(`${title} ${location}`) || /remote|anywhere|distributed/i.test(description.slice(0, 600)),
           employmentType: null,
           salary: null,
           url,
@@ -901,20 +1150,15 @@ export async function discoverFromLever(sites: string[]): Promise<RawDiscovery> 
         const description = (posting.descriptionPlain ?? htmlToText(posting.description ?? "")).trim();
         const location = posting.categories?.location?.trim() || "Not specified";
         const posted = posting.createdAt ? new Date(posting.createdAt).toISOString() : null;
-        const fresh = publishedWithinSevenDays(posted);
-        if (fresh) out.fresh += 1;
+        if (publishedRecently(posted)) out.fresh += 1;
         const reason = titleFiltered(title, company, location, description);
         if (reason) {
-          out.filtered += 1;
-          continue;
-        }
-        if (!fresh) {
-          out.filtered += 1;
+          rejectListing(out, { title, company, url: posting.hostedUrl ?? posting.applyUrl ?? null, reason });
           continue;
         }
         const url = posting.hostedUrl || posting.applyUrl || "";
         if (!url) {
-          out.filtered += 1;
+          rejectListing(out, { title, company, url, reason: "Missing the original job URL" });
           continue;
         }
         out.jobs.push({
@@ -1066,11 +1310,16 @@ type JobsChDocument = {
 
 export async function discoverFromJobsCh(
   queries: string[],
-  options: { page?: number; detailsPerQuery?: number } = {},
+  options: {
+    page?: number;
+    detailsPerQuery?: number;
+    /** Test seam for deterministic employer-link resolution. */
+    resolveLink?: (url: string) => Promise<LinkResolution>;
+  } = {},
 ): Promise<RawDiscovery> {
   const out = emptyRaw();
   const page = Math.min(2, Math.max(1, Math.floor(options.page ?? 1)));
-  const detailsPerQuery = Math.min(8, Math.max(0, Math.floor(options.detailsPerQuery ?? 8)));
+  const detailsPerQuery = Math.min(16, Math.max(0, Math.floor(options.detailsPerQuery ?? 10)));
   if (queries.length === 0) return out;
   const source = one<{ enabled: number }>("SELECT enabled FROM job_sources WHERE key = 'jobs_ch'");
   if (source && source.enabled !== 1) {
@@ -1128,31 +1377,39 @@ export async function discoverFromJobsCh(
         // The same vacancy can match several queries; it is fetched and counted
         // once per run rather than being sent through detail retrieval twice.
         if (document.job_id && seenJobIds.has(document.job_id)) {
-          out.filtered += 1;
+          rejectListing(out, {
+            title: document.title ?? "",
+            company: document.company_name ?? "",
+            url: document._links?.detail_en?.href ?? document._links?.detail_de?.href ?? null,
+            reason: "Duplicate search result already assessed in this run",
+          });
           continue;
         }
         if (document.job_id) seenJobIds.add(document.job_id);
         const title = (document.title ?? "").trim();
         const preview = (document.preview ?? "").trim();
         const publishedAt = document.publication_date ?? null;
-        const fresh = publishedWithinSevenDays(publishedAt);
-        if (fresh) out.fresh += 1;
-        const classification = classifyVacancy({
-          title,
-          company: document.company_name,
-          location: document.place,
-          description: preview,
-        });
-        if (!classification.isQa) {
-          out.filtered += 1;
-          continue;
-        }
-        if (!fresh) {
-          out.filtered += 1;
+        if (publishedRecently(publishedAt)) out.fresh += 1;
+        // The search API only returns a truncated preview. Classifying that
+        // preview rejected real software-QA roles before their detail page (the
+        // only place carrying the responsibilities) was ever read. Use the
+        // title for the cheap gate, then classify the full detail description.
+        if (!isQaTitle(title)) {
+          rejectListing(out, {
+            title,
+            company: document.company_name ?? "",
+            url: document._links?.detail_en?.href ?? document._links?.detail_de?.href ?? null,
+            reason: "Not a QA/testing title",
+          });
           continue;
         }
         if (detailBudget <= 0) {
-          out.filtered += 1;
+          rejectListing(out, {
+            title,
+            company: document.company_name ?? "",
+            url: document._links?.detail_en?.href ?? document._links?.detail_de?.href ?? null,
+            reason: "Per-query detail budget exhausted; listing was not classified from a truncated preview",
+          });
           continue;
         }
         detailBudget -= 1;
@@ -1188,16 +1445,65 @@ export async function discoverFromJobsCh(
           }
         }
 
-        const reason = titleFiltered(title, document.company_name ?? "", document.place ?? "", description);
+        const reason = titleFiltered(title, document.company_name ?? "", document.place ?? "", description, {
+          assumeSwitzerland: true,
+        });
         if (reason) {
-          out.filtered += 1;
+          rejectListing(out, {
+            title,
+            company: document.company_name ?? "",
+            url: detailUrl,
+            reason,
+          });
+          continue;
+        }
+        const expired = expiryRejection(asText(posting?.validThrough) || asText(posting?.applicationDeadline));
+        if (expired) {
+          rejectListing(out, { title, company: document.company_name ?? "", url: detailUrl, reason: expired });
           continue;
         }
         const location = (document.place ?? "").trim() || asText(posting?.jobLocation) || "Not specified";
         const url = asText(posting?.url) || detailUrl || "";
         if (!url) {
-          out.filtered += 1;
+          rejectListing(out, {
+            title,
+            company: document.company_name ?? "",
+            url: detailUrl,
+            reason: "Missing the original job URL",
+          });
           continue;
+        }
+        // A jobs.ch detail page is a discovery source, not an application
+        // destination. Resolve its redirect or explicit employer apply link now
+        // and keep the evidence with the vacancy. Unresolved listings stay
+        // blocked from automatic submission.
+        let applicationUrl: string | null = url;
+        let urlProvenance: EmployerUrlProvenance | null = null;
+        if (isAggregatorUrl(url) || isAggregatorUrl(detailUrl)) {
+          out.requests += 1;
+          try {
+            const resolution = await (options.resolveLink ?? resolveJobsChEmployerUrl)(url);
+            urlProvenance = employerUrlProvenance(resolution);
+            applicationUrl = resolution.employerUrl;
+          } catch (error) {
+            urlProvenance = {
+              version: 1,
+              resolver: "jobs_ch",
+              method: "unresolved",
+              requestedUrl: url,
+              finalUrl: url,
+              employerUrl: null,
+              applicationUrl: null,
+              confidence: "unresolved",
+              atsVendor: null,
+              requisitionId: null,
+              reason: `The jobs.ch listing could not be resolved: ${error instanceof Error ? error.message : "unknown error"}`,
+              hops: 0,
+              httpStatus: null,
+              resolvedAt: nowIso(),
+            };
+            applicationUrl = null;
+          }
         }
         const employer = (document.company_name ?? "").trim();
         out.jobs.push({
@@ -1208,11 +1514,12 @@ export async function discoverFromJobsCh(
           company: employer || "Unknown employer",
           companyDomain: companyDomain(employer, url),
           location,
-          remote: /remote|home[- ]office|telecommut/i.test(`${location} ${description.slice(0, 500)}`),
+          remote: /remote|home[- ]office|telecommut/i.test(`${title} ${location} ${description.slice(0, 600)}`),
           employmentType: (document.employment_type_ids ?? []).join(", ") || null,
           salary: null,
           url,
-          applicationUrl: url,
+          applicationUrl,
+          urlProvenance,
           description,
           publishedAt,
           updatedAt: publishedAt,
@@ -1257,6 +1564,42 @@ export async function discoverFromJobsCh(
   return out;
 }
 
+/**
+ * Role-family coverage for the Swiss QA market. These are added only when at
+ * least one operator query is configured, so an unconfigured jobs.ch connector
+ * stays disabled and tests cannot accidentally contact the live board.
+ */
+export const DEFAULT_JOBS_CH_QA_QUERIES = [
+  "Senior QA Engineer",
+  "QA Automation Engineer",
+  "Senior QA Automation Engineer",
+  "SDET",
+  "Senior Test Automation Engineer",
+  "Mobile QA Engineer",
+  "Software Test Engineer",
+  "Test Lead",
+  "QA Lead",
+  "QA Engineer Fintech",
+  "API Test Engineer",
+  "Automation Test Engineer",
+] as const;
+
+/** Merge configured queries with the role-family set, preserving operator order. */
+export function expandJobsChQueries(configured: string[]): string[] {
+  const clean = configured.map((query) => query.trim()).filter(Boolean);
+  if (clean.length === 0) return [];
+  if (process.env.RECRUITMENT_DISCOVERY_EXPANSION === "false") return [...new Set(clean)];
+  const seen = new Set<string>();
+  const merged: string[] = [];
+  for (const query of [...clean, ...DEFAULT_JOBS_CH_QA_QUERIES]) {
+    const key = query.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(query);
+  }
+  return merged;
+}
+
 export function configuredJobsChQueries(): string[] {
   const fromSetting = getSetting<string[]>("jobs_ch_queries", []);
   const value =
@@ -1266,7 +1609,7 @@ export function configuredJobsChQueries(): string[] {
           .split("|")
           .map((item) => item.trim())
           .filter(Boolean);
-  return [...new Set(value)];
+  return expandJobsChQueries(value);
 }
 
 export function configuredAshbyBoards(): string[] {
@@ -1370,6 +1713,8 @@ export async function discoverJobSources(options: {
     attempts: research.attempts,
     durationMs: research.durationMs,
     errorCategory: research.errorCategory ?? null,
+    rejectionReasons: research.rejectionReasons,
+    rejectedSamples: research.rejectedSamples.slice(0, MAX_REJECTION_SAMPLES).map((sample) => ({ ...sample, url: null })),
   });
   if (research.error) result.warnings.push(`Arbeitnow: ${research.error}`);
   recordSourceCheck({
@@ -1424,6 +1769,7 @@ export async function discoverJobSources(options: {
     attempts: ashby.attempts,
     durationMs: ashby.durationMs,
     errorCategory: ashby.errorCategory,
+    ...rejectionSummary(ashby),
   });
   if (ashby.error) result.warnings.push(`Ashby: ${ashby.error}`);
 
@@ -1464,6 +1810,7 @@ export async function discoverJobSources(options: {
     attempts: greenhouse.attempts,
     durationMs: greenhouse.durationMs,
     errorCategory: greenhouse.errorCategory,
+    ...rejectionSummary(greenhouse),
   });
   if (greenhouse.error) result.warnings.push(`Greenhouse: ${greenhouse.error}`);
 
@@ -1504,6 +1851,7 @@ export async function discoverJobSources(options: {
     attempts: lever.attempts,
     durationMs: lever.durationMs,
     errorCategory: lever.errorCategory,
+    ...rejectionSummary(lever),
   });
   if (lever.error) result.warnings.push(`Lever: ${lever.error}`);
   recordSourceCheck({
@@ -1525,7 +1873,9 @@ export async function discoverJobSources(options: {
   const jobsChPageLimit = Math.min(2, Math.max(1, options.pages ?? 1));
   // Splitting the detail budget keeps a two-page run within the same maximum
   // number of full-detail fetches as the previous single-page connector.
-  const jobsChDetailsPerQuery = jobsChPageLimit > 1 ? 4 : 8;
+  // The search response is only a preview. Ten detail reads per query cover the
+  // QA-titled subset of a 20-result page without fetching every non-QA listing.
+  const jobsChDetailsPerQuery = jobsChPageLimit > 1 ? 10 : 16;
   const jobsCh = await discoverFromJobsCh(jobsChQueries, { page: 1, detailsPerQuery: jobsChDetailsPerQuery });
   if (jobsChPageLimit > 1 && (jobsCh.numPages ?? 1) > 1 && !jobsCh.error) {
     const secondPage = await discoverFromJobsCh(jobsChQueries, { page: 2, detailsPerQuery: jobsChDetailsPerQuery });
@@ -1538,6 +1888,10 @@ export async function discoverJobSources(options: {
     jobsCh.attempts += secondPage.attempts;
     jobsCh.durationMs += secondPage.durationMs;
     jobsCh.diagnostics.push(...secondPage.diagnostics);
+    for (const [reason, count] of Object.entries(secondPage.rejectionReasons)) {
+      jobsCh.rejectionReasons[reason] = (jobsCh.rejectionReasons[reason] ?? 0) + count;
+    }
+    jobsCh.rejectedSamples.push(...secondPage.rejectedSamples.slice(0, MAX_REJECTION_SAMPLES));
     jobsCh.error = jobsCh.error ?? secondPage.error;
     jobsCh.errorCategory = jobsCh.errorCategory ?? secondPage.errorCategory;
   }
@@ -1576,6 +1930,7 @@ export async function discoverJobSources(options: {
     attempts: jobsCh.attempts,
     durationMs: jobsCh.durationMs,
     errorCategory: jobsCh.errorCategory,
+    ...rejectionSummary(jobsCh),
   });
   if (jobsCh.error) result.warnings.push(`jobs.ch: ${jobsCh.error}`);
 
@@ -1616,6 +1971,7 @@ export async function discoverJobSources(options: {
     attempts: careers.attempts,
     durationMs: careers.durationMs,
     errorCategory: careers.errorCategory,
+    ...rejectionSummary(careers),
   });
   if (careers.error) result.warnings.push(`Employer pages: ${careers.error}`);
   recordSourceCheck({

@@ -187,11 +187,11 @@ export default async function RecruitmentPage({
               </div>
               <div>
                 <label className="label" htmlFor="policy_max_day">Maximum verified submissions per day</label>
-                <input id="policy_max_day" name="max_applications_per_day" type="number" min={1} max={10} className="input" defaultValue={policy.maxSubmissionsPerDay} />
+                <input id="policy_max_day" name="max_applications_per_day" type="number" min={1} max={3} className="input" defaultValue={policy.maxSubmissionsPerDay} />
                 <p className="hint">Today: {usage.verified} of {usage.limit} used; {usage.remaining} remaining. The limit is counted in {schedule.timezone}.</p>
               </div>
               <div className="text-[11.5px]" style={{ color: "var(--muted)" }}>
-                Freshness ≤ {policy.freshnessDays} days · verified and open vacancies only · duplicate applications blocked · no per-application approval.
+                Live-open vacancy verification · publication age alone never rejects · duplicate applications blocked · no per-application approval.
               </div>
               <div><SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save policy</SubmitButton></div>
             </form>
@@ -232,7 +232,7 @@ export default async function RecruitmentPage({
           </div>
           <div className="card-body stack text-[12.5px]" style={{ gap: 8 }}>
             <div className="between"><span style={{ color: "var(--muted)" }}>Days</span><span>{schedule.weekdayLabels.join(", ")}</span></div>
-            <div className="between"><span style={{ color: "var(--muted)" }}>Main / incremental</span><span className="num">{schedule.slotTimes.join(" · ")} · {schedule.timezone}</span></div>
+            <div className="between"><span style={{ color: "var(--muted)" }}>Daily run</span><span className="num">{schedule.slotTimes.join(" · ")} · {schedule.timezone}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Daily report</span><span className="num">{reportSchedule.weekdaysList.map((day) => ["", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][day]).join(", ")} · {reportSchedule.time}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Next report</span><span>{formatInZone(reportSchedule.next_run_at, reportSchedule.timezone)}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Next execution</span><span>{formatInZone(schedule.nextRunAt)}{schedule.nextRunMode ? ` · ${schedule.nextRunMode}` : ""}</span></div>
@@ -242,7 +242,7 @@ export default async function RecruitmentPage({
             <div className="between"><span style={{ color: "var(--muted)" }}>Minimum match</span><span>{qualifyingThreshold()}% (cannot be lowered automatically)</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Applications per day</span><span>{policy.maxSubmissionsPerDay} · {usage.remaining} remaining today</span></div>
             <p className="hint">
-              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at each scheduled time ({schedule.slotTimes.join(", ")} {schedule.timezone}) for the run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
+              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at {schedule.slotTimes[0]} {schedule.timezone} for the single daily run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped. There is no second scheduled run on the same day. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
             </p>
           </div>
         </section>

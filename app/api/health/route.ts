@@ -26,6 +26,8 @@ export async function GET(request: Request): Promise<Response> {
         uptimeSeconds: Math.round(process.uptime()),
         pid: process.pid,
         instanceId: health.instanceId,
+        nodeEnv: process.env.NODE_ENV ?? null,
+        production: process.env.NODE_ENV === "production",
       },
       operational: health,
     },

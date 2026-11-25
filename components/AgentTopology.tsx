@@ -10,6 +10,7 @@ import type {
   TopologyEvent,
   TopologyRun,
   TopologyTask,
+  TopologyRecovery,
 } from "@/lib/agent-topology";
 import { switchAgentAction } from "@/lib/actions/chat";
 import type { IdentityAgentKey } from "@/lib/agent-identity";
@@ -42,12 +43,13 @@ const NODE_COORDS: Record<IdentityAgentKey, { x: number; y: number }> = {
   email: { x: 175, y: 200 },
 };
 
-type FilterKey = "all" | "working" | "waiting" | "completed" | "failed";
+type FilterKey = "all" | "working" | "waiting" | "recovering" | "completed" | "failed";
 
 const FILTERS: Array<{ key: FilterKey; label: string }> = [
   { key: "all", label: "All agents" },
   { key: "working", label: "Working" },
   { key: "waiting", label: "Waiting" },
+  { key: "recovering", label: "Recovering" },
   { key: "completed", label: "Completed" },
   { key: "failed", label: "Failed" },
 ];
@@ -199,6 +201,7 @@ function AgentNode({
       data-testid={`topology-agent-${agent.key}`}
       data-agent-key={agent.key}
       data-state={agent.state}
+      data-assigned={agent.assigned ? "true" : "false"}
       onClick={onSelect}
       aria-label={`${agent.name}, ${agent.role}, ${agent.stateLabel}. ${agent.activity}`}
       aria-haspopup="dialog"
@@ -256,20 +259,48 @@ function ConnectionLines({
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
+          <marker id="topology-arrow-live" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="#47d7ff" />
+          </marker>
+          <marker id="topology-arrow-wait" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="#e9c477" />
+          </marker>
+          <marker id="topology-arrow-fail" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="#ff8d86" />
+          </marker>
+          <marker id="topology-arrow-recover" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="5" markerHeight="5" orient="auto">
+            <path d="M0,0 L8,4 L0,8 z" fill="#62e6a6" />
+          </marker>
         </defs>
         {specialists.map((agent) => {
           const target = NODE_COORDS[agent.key];
           const start = NODE_COORDS.coordinator;
           const d = `M ${start.x} ${start.y} C ${start.x + (target.x - start.x) * 0.42} ${start.y + (target.y - start.y) * 0.08}, ${start.x + (target.x - start.x) * 0.78} ${start.y + (target.y - start.y) * 0.56}, ${target.x} ${target.y}`;
           const connection = byAgent.get(agent.key);
+          const phase = connection?.phase ?? null;
+          const arrow =
+            phase === "failed"
+              ? "url(#topology-arrow-fail)"
+              : phase === "waiting"
+                ? "url(#topology-arrow-wait)"
+                : phase === "recovering"
+                  ? "url(#topology-arrow-recover)"
+                  : phase === "assignment" || phase === "result"
+                    ? "url(#topology-arrow-live)"
+                    : null;
           return (
             <g key={agent.key}>
               <path className="topology-edge-base" d={d} />
               <path
-                className={`topology-edge ${connection?.active ? "is-active" : ""} ${connection?.direction === "agent-to-chief" ? "is-reverse" : ""}`}
+                className={`topology-edge ${connection?.active ? "is-active" : ""} ${connection?.direction === "agent-to-chief" ? "is-reverse" : ""} ${phase ? `is-${phase}` : ""}`}
                 d={d}
                 data-agent-key={agent.key}
                 data-active={connection?.active ? "true" : "false"}
+                data-connection-phase={phase ?? "none"}
+                data-direction={connection?.direction ?? "none"}
+                data-task-id={connection?.taskId ?? ""}
+                markerEnd={connection?.direction === "chief-to-agent" && arrow ? arrow : undefined}
+                markerStart={connection?.direction === "agent-to-chief" && arrow ? arrow : undefined}
               >
                 {connection?.label ? <title>{connection.label}</title> : null}
               </path>
@@ -279,9 +310,12 @@ function ConnectionLines({
       </svg>
       <ul className="sr-only" aria-label="Recorded Chief and specialist connections">
         {connections
-          .filter((connection) => connection.active)
+          .filter((connection) => connection.phase !== null)
           .map((connection) => (
-            <li key={connection.agentKey}>{connection.label ?? `${connection.agentKey} active`}</li>
+            <li key={connection.agentKey}>
+              {connection.direction === "agent-to-chief" ? "Return to Chief: " : "Chief to specialist: "}
+              {connection.label ?? `${connection.agentKey} ${connection.phase}`}
+            </li>
           ))}
       </ul>
     </>
@@ -292,10 +326,12 @@ function RunPanel({
   run,
   now,
   workflowLabel,
+  recovery,
 }: {
   run: TopologyRun | null;
   now: number;
   workflowLabel: string | null;
+  recovery: TopologyRecovery | null;
 }) {
   if (!run) {
     return (
@@ -317,9 +353,11 @@ function RunPanel({
     now,
   );
   const counts = [
+    ["Assigned", run.counts.assigned],
     ["Completed", run.counts.completed],
-    ["Running", run.counts.running],
+    ["In progress", run.counts.running],
     ["Waiting", run.counts.waiting],
+    ["Recovering", run.counts.recovering],
     ["Failed", run.counts.failed],
   ] as const;
 
@@ -350,6 +388,23 @@ function RunPanel({
           </div>
         ))}
       </div>
+      {recovery ? (
+        <div className="topology-run-rows" aria-label="Persisted stage recovery">
+          <div><span>Last completed</span><strong>{recovery.lastCompleted?.replace(/_/g, " ") ?? "—"}</strong></div>
+          <div><span>Current stage</span><strong>{recovery.currentStage?.replace(/_/g, " ") ?? "—"}</strong></div>
+          <div><span>Failed stage</span><strong>{recovery.failedStage?.replace(/_/g, " ") ?? "—"}</strong></div>
+          <div><span>Next action</span><strong>{recovery.nextAction?.replace(/_/g, " ") ?? "—"}</strong></div>
+          <div><span>Retry count</span><strong className="num">{recovery.retryCount}</strong></div>
+          {recovery.checkpoints.slice(0, 4).map((checkpoint) => (
+            <div key={`${checkpoint.jobId}:${checkpoint.stage}`}>
+              <span>{checkpoint.stage.replace(/_/g, " ")}</span>
+              <strong title={checkpoint.reason ?? checkpoint.outputRefs ?? undefined}>
+                {checkpoint.status.replace(/_/g, " ")}{checkpoint.decision ? ` · ${checkpoint.decision.replace(/_/g, " ")}` : ""}
+              </strong>
+            </div>
+          ))}
+        </div>
+      ) : null}
       {run.error ? <p className="topology-run-error">{run.error}</p> : null}
       <Link href={`/recruitment/runs/${run.id}`} className="topology-panel-link">Open run report</Link>
     </aside>
@@ -626,9 +681,9 @@ export function AgentTopology({ initialSnapshot }: { initialSnapshot: AgentTopol
   const selectedAgent = selectedKey ? snapshot.agents.find((agent) => agent.key === selectedKey) ?? null : null;
 
   const filterCounts: Record<FilterKey, number> = {
-    all: snapshot.specialists.length,
-    working: snapshot.stats.working + snapshot.stats.processing,
+    all: snapshot.specialists.length,        working: snapshot.stats.working + snapshot.stats.processing,
     waiting: snapshot.stats.waiting,
+    recovering: snapshot.stats.recovering,
     completed: snapshot.stats.completed,
     failed: snapshot.stats.failed,
   };
@@ -685,6 +740,8 @@ export function AgentTopology({ initialSnapshot }: { initialSnapshot: AgentTopol
         </div>
         <div className="topology-legend" aria-label="Connection legend">
           <span><i className="legend-dot is-live" /> Active assignment</span>
+          <span><i className="legend-line is-return" /> Result to Chief</span>
+          <span><i className="legend-line is-waiting" /> Waiting / recovery</span>
           <span><i className="legend-line" /> Persisted connection</span>
         </div>
       </div>
@@ -737,7 +794,7 @@ export function AgentTopology({ initialSnapshot }: { initialSnapshot: AgentTopol
           ) : null}
         </section>
 
-        <RunPanel run={snapshot.run} now={now} workflowLabel={snapshot.workflow?.label ?? null} />
+        <RunPanel run={snapshot.run} now={now} workflowLabel={snapshot.workflow?.label ?? null} recovery={snapshot.recovery} />
       </div>
 
       <Timeline events={snapshot.events} streamLabel={streamLabel} />

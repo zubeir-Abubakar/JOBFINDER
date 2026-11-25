@@ -22,5 +22,25 @@ export function openVacancyVerification(checkedAt = new Date().toISOString()): V
         identityMatched: true,
       },
     ],
+    route: {
+      statuses: [
+        "URL_RESOLVED",
+        "URL_REACHABLE",
+        "EMPLOYER_IDENTITY_VERIFIED",
+        "VACANCY_OPEN_VERIFIED",
+        "APPLICATION_FORM_SUPPORTED",
+      ],
+      finalStatus: "APPLICATION_FORM_SUPPORTED",
+      urlResolved: true,
+      urlReachable: true,
+      employerIdentityVerified: true,
+      vacancyOpenVerified: true,
+      applicationFormSupported: true,
+      finalUrl: "https://fixture.test/apply",
+      finalHost: "fixture.test",
+      httpStatus: 200,
+      formEvidence: ["HTML form element", "CV/document upload control"],
+      reason: "Controlled fixture: route, identity, open status and form are verified.",
+    },
   };
 }

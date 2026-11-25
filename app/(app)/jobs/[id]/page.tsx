@@ -12,6 +12,7 @@ import { SubmitButton } from "@/components/SubmitButton";
 import { Icon } from "@/components/icons";
 import { statusLabel } from "@/lib/application-status";
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { GermanRequirementCard } from "@/components/GermanRequirementCard";
 
 export const dynamic = "force-dynamic";
 
@@ -266,6 +267,12 @@ export default async function JobDetailPage({
               <Link href="/documents" className="btn btn-ghost w-full">Manage all documents</Link>
             </div>
           </section>
+
+          <GermanRequirementCard
+            status={job.german_requirement}
+            evidence={job.language_evidence}
+            eligibility={job.eligibility}
+          />
 
           <section className="card">
             <div className="card-head">

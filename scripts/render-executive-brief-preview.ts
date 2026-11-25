@@ -123,7 +123,7 @@ for (const [id, name] of [["doc_preview_1", "CV.pdf"], ["doc_preview_2", "Cover.
 }
 db.run(
   `INSERT INTO schedule_jobs (key, label, time, timezone, enabled, next_run_at, updated_at)
-   VALUES ('daily_recruitment','Daily autonomous recruitment','10:00','Europe/Zurich',1,?,?)`,
+   VALUES ('daily_recruitment','Daily autonomous recruitment','12:00','Europe/Zurich',1,?,?)`,
   ["2026-11-21T09:00:00.000Z", at],
 );
 

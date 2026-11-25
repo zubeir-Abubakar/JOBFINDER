@@ -6,9 +6,17 @@ import { audit } from "./audit";
 import { recordApplicationEvent } from "./application-events";
 import { atsCredential, atsTargetFor, submitViaAts } from "./submission-ats";
 import { reconciliationDecision } from "./submission-reconciliation";
-import { prepareCandidateForm, submitCandidateForm, type CandidateDocuments, type CandidateProfile } from "./candidate-forms";
+import { prepareCandidateForm, submitCandidateForm, type CandidateDocuments, type CandidateFormResult, type CandidateProfile } from "./candidate-forms";
+import { runBrowserCandidateForm } from "./browser-form";
 import { authorisedAnswers, dailySubmissionUsage, getRecruitmentPolicy } from "./recruitment-policy";
 import { readinessAllowsSubmission } from "./application-status";
+import {
+  analyseVacancyGermanRequirement,
+  germanRequirementBlocksSubmission,
+  GERMAN_REQUIREMENT_UNRESOLVED,
+  MANDATORY_GERMAN_REQUIREMENT,
+  type GermanRequirementAssessment,
+} from "./language-requirements";
 import { getSetting } from "./settings";
 import { notify } from "./notify";
 import { assertPublicHttpUrl } from "./outbound-url";
@@ -49,16 +57,58 @@ export type SubmissionOutcome = {
   evidence: Record<string, unknown> | null;
 };
 
+/**
+ * The five operating states the owner must be able to tell apart. These are
+ * stored in `submission_evidence.outcomeClass` next to the legacy application
+ * status, so a technical failure is never presented as a routine approval.
+ */
+export type SubmissionOutcomeClass =
+  | "submitted_verified"
+  | "prepared_not_submitted"
+  | "blocked_external"
+  | "failed_technical"
+  | "outcome_uncertain";
+
+export function submissionOutcomeClass(
+  outcome: Pick<SubmissionOutcome, "status" | "httpStatus" | "evidence">,
+): SubmissionOutcomeClass {
+  if (outcome.status === "verified") return "submitted_verified";
+  if (outcome.status === "unverified") return "outcome_uncertain";
+  if (outcome.status === "failed") {
+    const ambiguous =
+      outcome.httpStatus === 408 ||
+      outcome.httpStatus === 429 ||
+      (outcome.httpStatus !== null && outcome.httpStatus >= 500);
+    return ambiguous ? "outcome_uncertain" : "failed_technical";
+  }
+  const declared = outcome.evidence?.outcomeClass;
+  if (
+    declared === "submitted_verified" ||
+    declared === "prepared_not_submitted" ||
+    declared === "blocked_external" ||
+    declared === "failed_technical" ||
+    declared === "outcome_uncertain"
+  ) {
+    return declared;
+  }
+  return outcome.evidence?.externalRequirement ? "blocked_external" : "prepared_not_submitted";
+}
+
 export type SubmissionJob = {
   id: string;
   title: string;
   company: string;
   url: string | null;
   application_url: string | null;
+  /** Provenance recorded by discovery: direct, ats, aggregator, unresolved. */
+  url_confidence?: string | null;
+  employer_url?: string | null;
   description: string | null;
   /** ATS identity when the vacancy came from a supported connector. */
   source?: string | null;
   external_id?: string | null;
+  /** Persisted discovery evidence for the hard German exclusion. */
+  german_requirement?: string | null;
 };
 
 export type SubmissionDocuments = {
@@ -118,6 +168,13 @@ export function candidateFormsEnabled(): boolean {
   return process.env.RECRUITMENT_CANDIDATE_FORMS !== "false";
 }
 
+/** The local Playwright executor handles dynamic forms unless explicitly disabled. */
+export function browserFormsEnabled(): boolean {
+  return candidateFormsEnabled() && process.env.RECRUITMENT_BROWSER_FORMS !== "false";
+}
+
+import { canonicalUrl, isAggregatorUrl } from "./job-identity";
+
 export function endpointFor(job: SubmissionJob): string | null {
   const template = submissionEndpointConfigured();
   if (!template) return null;
@@ -127,7 +184,65 @@ export function endpointFor(job: SubmissionJob): string | null {
     .replace(/\{company\}/g, encodeURIComponent(job.company));
 }
 
+/**
+ * The application destination must be an employer-controlled page.
+ *
+ * A board listing is a discovery source, not an application endpoint: posting
+ * an application to an aggregator is neither a real application nor evidence
+ * that the employer received anything. Until the employer URL is resolved the
+ * vacancy stays queued for a human, and it is never counted as submitted.
+ */
+export function applicationProvenanceBlocker(job: SubmissionJob): string | null {
+  const application = canonicalUrl(job.application_url);
+  if (application && isAggregatorUrl(application)) {
+    return "The stored application URL is an aggregator page; it is not the employer's application endpoint.";
+  }
+  if (!application) {
+    const confidence = job.url_confidence ?? null;
+    if (confidence === "aggregator" || confidence === "unresolved" || confidence === "missing") {
+      return `The employer application URL is ${confidence}; the listing URL is not submitted as an application.`;
+    }
+    if (isAggregatorUrl(job.url)) {
+      return "Only an aggregator listing is recorded; the employer application URL has not been resolved.";
+    }
+  }
+  return null;
+}
+
+export function applicationProvenance(job: SubmissionJob): Record<string, unknown> {
+  return {
+    listingUrl: job.url,
+    applicationUrl: job.application_url,
+    employerUrl: job.employer_url ?? null,
+    urlConfidence: job.url_confidence ?? (canonicalUrl(job.application_url) ? "unclassified" : "missing"),
+  };
+}
+
 /** Channels that require a human step are never automated. */
+/**
+ * Final pre-send language gate. A mandatory German requirement is not a channel
+ * problem: the vacancy is ineligible and must never reach the employer. An
+ * unresolved mention blocks the send without pretending German is optional.
+ */
+export function germanSubmissionAssessment(job: SubmissionJob): GermanRequirementAssessment {
+  const detected = analyseVacancyGermanRequirement(job.title, job.description);
+  if (job.german_requirement === "required" && detected.status !== "required") {
+    return {
+      ...detected,
+      status: "required",
+      evidence: detected.evidence.length > 0 ? detected.evidence : ["Persisted discovery language evidence: German required."],
+      detail: "A persisted discovery record marks German as mandatory.",
+      reasonCode: MANDATORY_GERMAN_REQUIREMENT,
+    };
+  }
+  return detected;
+}
+
+export function germanRequirementForSubmission(job: SubmissionJob): GermanRequirementAssessment | null {
+  const german = germanSubmissionAssessment(job);
+  return germanRequirementBlocksSubmission(german) ? german : null;
+}
+
 export function blockerForChannel(job: SubmissionJob): string | null {
   const text = `${job.description ?? ""}`;
   if (/captcha|i am not a robot|recaptcha|hcaptcha/i.test(text)) return "The employer's form uses a CAPTCHA, which is never bypassed.";
@@ -139,9 +254,20 @@ export function blockerForChannel(job: SubmissionJob): string | null {
   return null;
 }
 
+/** Pre-channel blockers that a human must satisfy externally, never by automation. */
+export function manualExternalRequirement(reason: string): string | null {
+  if (/captcha/i.test(reason)) return "captcha";
+  if (/multi[- ]factor|verification code/i.test(reason)) return "mfa";
+  if (/account login/i.test(reason)) return "account_login";
+  if (/fee|pay to apply|paid application/i.test(reason)) return "payment";
+  return null;
+}
+
 export function channelFor(job: SubmissionJob): { channel: SubmissionChannel; reason: string } {
   const blocker = blockerForChannel(job);
   if (blocker) return { channel: "manual", reason: blocker };
+  const provenanceBlocker = applicationProvenanceBlocker(job);
+  if (provenanceBlocker) return { channel: "manual", reason: provenanceBlocker };
   if (!job.application_url && !job.url) {
     return { channel: "manual", reason: "No application URL was captured for this vacancy." };
   }
@@ -522,6 +648,10 @@ function applyOutcome(input: {
 }): void {
   const { outcome, at } = input;
   const jobId = input.job.id;
+  const evidence = {
+    ...(outcome.evidence ?? {}),
+    outcomeClass: submissionOutcomeClass(outcome),
+  };
   if (outcome.status === "verified") {
     const followUp = new Date(Date.parse(at) + 14 * 86400_000).toISOString();
     run(
@@ -532,7 +662,7 @@ function applyOutcome(input: {
         at,
         outcome.reference ?? "Verified by employer endpoint",
         outcome.reference,
-        JSON.stringify(outcome.evidence ?? {}).slice(0, 12000),
+        JSON.stringify(evidence).slice(0, 12000),
         outcome.channel,
         outcome.channel,
         followUp,
@@ -568,13 +698,13 @@ function applyOutcome(input: {
     run(
       `UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified',
          submission_evidence = ?, method = ?, applied_channel = ?, run_id = COALESCE(run_id, ?), last_update = ? WHERE id = ?`,
-      [JSON.stringify(outcome.evidence ?? {}).slice(0, 12000), outcome.channel, outcome.channel, input.runId, at, input.applicationId],
+      [JSON.stringify(evidence).slice(0, 12000), outcome.channel, outcome.channel, input.runId, at, input.applicationId],
     );
     recordApplicationEvent({
       applicationId: input.applicationId,
       type: ambiguousFailure ? "submission.unknown" : "submission.unverified",
       message: outcome.detail,
-      meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus, retryBlocked: true },
+      meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus, retryBlocked: true, outcomeClass: evidence.outcomeClass },
     });
     notify({
       kind: "application_submission_unverified",
@@ -593,7 +723,7 @@ function applyOutcome(input: {
       safeFailure ? "submission_failed" : "human_intervention_required",
       safeFailure ? "failed" : "blocked",
       outcome.channel,
-      JSON.stringify(outcome.evidence ?? {}).slice(0, 12000),
+      JSON.stringify(evidence).slice(0, 12000),
       input.runId,
       at,
       input.applicationId,
@@ -603,7 +733,7 @@ function applyOutcome(input: {
     applicationId: input.applicationId,
     type: `submission.${outcome.status}`,
     message: outcome.detail,
-    meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus },
+    meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus, outcomeClass: evidence.outcomeClass },
   });
   if (safeFailure) {
     notify({
@@ -673,6 +803,54 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
     return outcome;
   }
 
+  // This runs before the duplicate/readiness claim and before any browser or
+  // HTTP channel, so a newly mandatory German wording cannot be submitted even
+  // if an older eligibility row still says eligible.
+  const german = germanRequirementForSubmission(input.job);
+  if (german) {
+    const required = german.status === "required";
+    const evidence = {
+      germanRequirement: german.status,
+      germanReasonCode: german.reasonCode,
+      germanEvidence: german.evidence,
+      eligibility: required ? "ineligible" : "needs_review",
+      outcomeClass: "blocked_external",
+    };
+    run(
+      `UPDATE jobs SET german_requirement = ?, language_evidence = ?, eligibility = ?, qualified = 0,
+         qualification_status = ?, eligibility_checked_at = ? WHERE id = ?`,
+      [
+        german.status,
+        JSON.stringify(german).slice(0, 8000),
+        required ? "ineligible" : "needs_review",
+        required ? "ineligible" : "needs_review",
+        at,
+        input.job.id,
+      ],
+    );
+    run(
+      "UPDATE applications SET status = ?, submission_status = 'blocked', submission_evidence = ?, last_update = ? WHERE id = ?",
+      [required ? "rejected" : "human_intervention_required", JSON.stringify(evidence).slice(0, 12000), at, input.applicationId],
+    );
+    recordApplicationEvent({
+      applicationId: input.applicationId,
+      type: "submission.language_exclusion",
+      message: german.detail,
+      meta: { ...evidence, reasonCode: german.reasonCode ?? (required ? MANDATORY_GERMAN_REQUIREMENT : GERMAN_REQUIREMENT_UNRESOLVED) },
+    });
+    return {
+      status: "blocked",
+      channel: "manual",
+      detail: required
+        ? `${MANDATORY_GERMAN_REQUIREMENT}: ${german.detail} The vacancy is ineligible and no employer was contacted.`
+        : `${GERMAN_REQUIREMENT_UNRESOLVED}: ${german.detail} The application was not sent.`,
+      httpStatus: null,
+      reference: null,
+      endpoint: null,
+      evidence,
+    };
+  }
+
   const duplicate = existingVerifiedSubmission(input.job.id);
   if (duplicate) {
     const outcome: SubmissionOutcome = {
@@ -731,6 +909,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
     prior ? { status: prior.status, httpStatus: prior.http_status, reference: prior.reference, error: prior.error } : null,
   );
   if (reconciliation.action === "blocked") {
+    const ambiguousPrior = reconciliation.evidence.reconciliation === "ambiguous";
     const outcome: SubmissionOutcome = {
       status: "blocked",
       channel: channelFor(input.job).channel,
@@ -738,7 +917,10 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       httpStatus: prior?.http_status ?? null,
       reference: prior?.reference ?? null,
       endpoint: null,
-      evidence: reconciliation.evidence,
+      evidence: {
+        ...reconciliation.evidence,
+        outcomeClass: ambiguousPrior ? "outcome_uncertain" : "prepared_not_submitted",
+      },
     };
     recordAttempt({
       applicationId: input.applicationId,
@@ -750,7 +932,24 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       error: reconciliation.reason,
       at,
     });
-    applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
+    // A refused blind retry must not overwrite an uncertain prior delivery with
+    // a human-intervention status: that would erase the only evidence of what
+    // may already have reached the employer.
+    if (!ambiguousPrior) {
+      applyOutcome({ ...input, outcome, at, cvDocumentId: input.documents.cvDocumentId, coverDocumentId: input.documents.coverDocumentId, runId: input.runId ?? null });
+    } else {
+      run(
+        `UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', last_update = ?
+         WHERE id = ? AND status != 'submitted'`,
+        [at, input.applicationId],
+      );
+      recordApplicationEvent({
+        applicationId: input.applicationId,
+        type: "submission.retry_blocked",
+        message: reconciliation.reason,
+        meta: { ...reconciliation.evidence, retryBlocked: true, outcomeClass: "outcome_uncertain" },
+      });
+    }
     return outcome;
   }
 
@@ -787,7 +986,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       httpStatus: null,
       reference: null,
       endpoint: null,
-      evidence: claim.evidence,
+      evidence: { ...(claim.evidence ?? {}), provenance: applicationProvenance(input.job) },
     };
     recordAttempt({
       applicationId: input.applicationId,
@@ -842,7 +1041,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       httpStatus: result.httpStatus,
       reference: result.reference,
       endpoint: result.endpoint,
-      evidence: result.evidence,
+      evidence: { ...result.evidence, provenance: applicationProvenance(input.job) },
     };
     recordAttempt({
       applicationId: input.applicationId,
@@ -892,25 +1091,39 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
         ? "No"
         : null,
     };
-    const plan = await prepareCandidateForm({
-      pageUrl: input.job.application_url ?? input.job.url ?? "",
+    const pageUrl = input.job.application_url ?? input.job.url ?? "";
+    const formInput = {
+      pageUrl,
       jobTitle: input.job.title,
       company: input.job.company,
       profile,
       documents: candidateDocuments,
       authorised: input.authorisedAnswers ?? authorisedAnswers(),
-    });
-    const result = plan.status === "ready"
-      ? await submitCandidateForm({ plan, documents: candidateDocuments })
-      : {
-          status: "blocked" as const,
-          detail: plan.detail,
-          httpStatus: null,
-          reference: null,
-          endpoint: plan.action,
-          finalUrl: plan.pageUrl,
-          evidence: { sent: false, blockers: plan.blockers, questions: plan.questions },
-        };
+    };
+    // Server-rendered HTML is cheapest and keeps the existing CSRF/cookie
+    // handling. Only a page with no static form (or a failed static read) is
+    // handed to the local browser, so a POST is never repeated across channels.
+    let plan = await prepareCandidateForm(formInput);
+    let result: CandidateFormResult;
+    let executor: "http" | "playwright" = "http";
+    if (plan.status === "ready") {
+      result = await submitCandidateForm({ plan, documents: candidateDocuments });
+    } else if ((plan.status === "unsupported" || plan.status === "failed") && browserFormsEnabled()) {
+      const browserRun = await runBrowserCandidateForm(formInput);
+      plan = browserRun.plan;
+      result = browserRun.result;
+      executor = "playwright";
+    } else {
+      result = {
+        status: "blocked",
+        detail: plan.detail,
+        httpStatus: null,
+        reference: null,
+        endpoint: plan.action,
+        finalUrl: plan.pageUrl,
+        evidence: { sent: false, blockers: plan.blockers, questions: plan.questions },
+      };
+    }
     recordCandidateInterventions({ applicationId: input.applicationId, jobId: input.job.id, plan, at });
     const status: SubmissionStatus =
       result.status === "verified"
@@ -920,6 +1133,12 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
           : result.status === "failed"
             ? "failed"
             : "blocked";
+    const externalRequirement =
+      (typeof result.evidence.externalRequirement === "string" ? result.evidence.externalRequirement : null) ??
+      (plan.status === "security" ? "security_challenge" : null) ??
+      (plan.questions.some((question) => question.action === "intervention" && question.category === "legal")
+        ? "legal_declaration"
+        : null);
     const outcome: SubmissionOutcome = {
       status,
       channel: "candidate_form",
@@ -929,11 +1148,14 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint: result.endpoint,
       evidence: {
         ...result.evidence,
+        executor,
+        externalRequirement,
         formStatus: plan.status,
         finalUrl: result.finalUrl,
         policyEngine: policy.engine,
       },
     };
+    outcome.evidence = { ...outcome.evidence, outcomeClass: submissionOutcomeClass(outcome) };
     const stoppedBeforeSend = plan.status !== "ready";
     recordAttempt({
       applicationId: input.applicationId,
@@ -974,8 +1196,9 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       httpStatus: null,
       reference: null,
       endpoint: null,
-      evidence: { reason, instant: at },
+      evidence: { reason, instant: at, externalRequirement: manualExternalRequirement(reason) },
     };
+    outcome.evidence = { ...outcome.evidence, outcomeClass: submissionOutcomeClass(outcome) };
     recordAttempt({
       applicationId: input.applicationId,
       jobId: input.job.id,

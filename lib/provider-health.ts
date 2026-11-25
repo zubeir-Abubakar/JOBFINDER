@@ -55,7 +55,8 @@ export type ProviderCooldown = {
   reason: string | null;
 };
 
-const QUOTA = /quota|resource[_ -]?exhausted|free tier|daily limit|billing|exceeded your current quota/i;
+const QUOTA =
+  /quota|resource[_ -]?exhausted|free[_ ]tier (?:quota )?(?:exhausted|limit reached)|daily limit|billing|exceeded your current quota/i;
 const RATE = /(?:^|\D)429(?:\D|$)|rate[\s-]?limit|too many requests/i;
 const COOLDOWN = /cooldown|cooling down|all models exhausted|rate-limited or on cooldown/i;
 const OVERLOADED = /overload|server busy|temporarily unavailable|service unavailable|\b529\b|\b503\b/i;
@@ -249,7 +250,14 @@ export function providerHealthSnapshot(now = Date.now()): ProviderCooldown[] {
         reason: row.last_error,
       };
     })
-    .filter((row) => row.status !== "healthy" || row.remainingMs > 0);
+    .filter(
+      (row) =>
+        row.status !== "healthy" &&
+        (row.remainingMs > 0 ||
+          row.status === "unavailable" ||
+          row.status === "authentication_failed" ||
+          row.status === "configuration_error"),
+    );
 }
 
 export function nextProviderRetryAt(now = Date.now()): string | null {

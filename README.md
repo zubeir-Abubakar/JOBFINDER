@@ -13,9 +13,9 @@ A working multi-agent recruitment operations platform for a single owner, built 
 - **Documents** — tailored CV and cover letter generated as real PDF (`pdf-lib`) and DOCX (`docx`) files using only verified profile facts; each package is versioned per vacancy and audited by the ATS Quality Control Agent (keyword coverage, structure, contact details, unsupported claims). Pinning, manual deletion and retention expiry all work.
 - **Applications** — one record per vacancy, all 13 requested statuses, CSV export, notes, submitted-only-with-confirmation enforcement, approval gate, document linkage and audit trail.
 - **Agents** — eight specialist agents with their own instructions, tools and output contracts. A sequential background runner (`lib/workflow.ts`) executes coordinator → research → analysis → CV → ATS gate → cover letter → application preparation → inbox tracking, one stage at a time, persisting every task. The dashboard shows per-agent status (`idle`, `waiting`, `working`, `thinking`, `completed`, `failed`, `paused`, `unavailable`), provider/model attribution, task history and working start/pause/resume/stop/retry controls. `unavailable` is computed from real dependencies; it is never written over an explicit pause.
-- **AI orchestration** — one shared provider service (`lib/providers.ts`) is used by every agent. FreeLLMAPI is primary; an enabled local Ollama instance is the fallback for recoverable rate limits, outages, network errors and timeouts. General calls use `OLLAMA_MODEL`; coding-specific calls use `OLLAMA_CODER_MODEL`. Configuration, authentication and malformed-request errors fail closed, with health checks, model verification, bounded retries, cooldown handling, usage tracking and provider attribution. Paid models are refused and the spending limit is CHF 0. If both providers fail, the workflow pauses and notifies the owner.
+- **AI orchestration** — one shared provider service (`lib/providers.ts`) is used by every agent. Owner-attested free-tier capacity from Gemini (`gemini-3.6-flash`) and FreeLLMAPI (one pinned model) is used first, with loopback Ollama (`llama3.2:3b`; coding work uses `qwen2.5-coder:1.5b`) as the local fallback. OpenRouter is an additional opt-in provider: only an exact catalogued `:free` text model is accepted, and the authenticated key plus zero pricing are checked before inference. An explicitly assigned OpenRouter agent fails closed rather than falling through to Ollama. External spend stays CHF 0.00. Chief's text responses can be spoken through OpenRouter's exact `heygen/heygen-voice-1-turbo:free` model, restricted to the `heygen` provider; that free model retires on 30 November 2026 and is never upgraded to the paid counterpart. Gemini Live (`gemini-3.8-live`) remains a separate voice path, and the browser's own voice is the clearly labelled final fallback. Authentication, malformed-request, model-policy and configuration errors fail closed. Health checks, free-tier state, bounded retries, usage tracking, cooldowns and actual provider/fallback attribution are persisted.
 - **Gmail** — OAuth 2.0 with state validation and AES-256-GCM encrypted tokens; syncs recruiter mail, classifies invitations/rejections/questions, matches them to applications, creates Gmail drafts and updates statuses. Sending only happens from an explicit approval button.
-- **AI assistant** — the Chief Coordinator handles conversation and workspace actions in two explicit paths. Conversational replies use the free provider service with a local fallback; workspace commands (search, list/filter vacancies, analyse, generate documents, review packages, show applications and recruiter messages, update preferences, pause/resume agents, reports, confirmed cleanup) execute deterministically against the database. Context from the current conversation is included, and destructive cleanup requires confirmation.
+- **AI assistant** — the Chief Coordinator handles conversation and workspace actions in two explicit paths. Conversational replies use the shared Gemini route with loopback Ollama fallback; workspace commands (search, list/filter vacancies, analyse, generate documents, review packages, show applications and recruiter messages, update preferences, pause/resume agents, reports, confirmed cleanup) execute deterministically against the database. Context from the current conversation is included, and destructive cleanup requires confirmation.
 - **Analytics** — daily/weekly/monthly discovery and application charts, funnel, status distribution, conversion rates, source and CV-version performance, all from live SQL, with date filtering and daily/weekly/monthly reports.
 - **Admin console** — system health, database statistics, storage usage, user management (create/disable/reset password), agent controls and JSON configuration, AI/API settings, email/Gmail OAuth settings, security policy, `VACUUM INTO` backups, retention management and audit logs.
 - **Security** — path-safe file storage (random names, downloads through an authenticated route), content-signature upload validation, no public CV URLs, encrypted MFA secrets, durable SQLite API counters, trusted-proxy IP handling, production-only HSTS, outbound URL filtering, loopback/token-gated health output, and audit logging of logins, uploads, deletions, submissions and configuration changes.
@@ -63,19 +63,19 @@ Data lives in `./data` (SQLite database, uploads, backups) and is git-ignored. B
 | SQLite → PostgreSQL | SQLite via Node's built-in `node:sqlite` | No native dependency, zero setup. All SQL is portable; the schema is in `lib/db.ts`. |
 | Gmail OAuth | OAuth routes + encrypted tokens + read/sync/draft/send-approval | Credentials come from the server environment; the redirect URI must be registered in Google Cloud. Tokens never reach the browser. |
 | Playwright application submission | Configured HTTP form endpoint plus ATS adapters with evidence capture | Employer portals may require logins/CAPTCHA/MFA; those are never automated. A configured form endpoint (`RECRUITMENT_SUBMISSION_ENDPOINT`) or an employer-issued ATS credential can submit; success without a confirmation reference is recorded as `submission_unverified`. No live endpoint or credential is configured by default. |
-| LLM provider | FreeLLMAPI primary → local Ollama fallback through one service | Deterministic scoring, matching and document facts stay authoritative. LLM output is used for planning, narrative and review notes, never invented facts. Paid models are blocked. Gemini/OpenRouter are not text fallbacks; Gemini is voice-only. |
+| LLM provider | Verified free-tier Gemini and FreeLLMAPI; loopback Ollama fallback; paid inference blocked | Deterministic scoring, matching and document facts stay authoritative. LLM output is used for planning, narrative and review notes, never invented facts. Each agent has a configured free-tier route: Ali and Amira prefer the pinned FreeLLMAPI model; Noor, Kali, Rayna, Kora, Saffa and Chief prefer free-tier Gemini. Exhaustion moves to the other verified free tier, then local Ollama; authentication and policy failures are never silently rerouted. |
 
 ## Local Ollama fallback
 
 `OLLAMA_ENABLED=true` enables the fallback. `OLLAMA_BASE_URL` defaults to `http://localhost:11434`; `OLLAMA_MODEL` handles general inference and `OLLAMA_CODER_MODEL` is used only when a call marks itself as coding-specific. The admin AI page probes `/api/tags`, shows both configured models and reports the exact `ollama pull <model>` command when one is missing. Models are never downloaded automatically.
 
-A localhost endpoint works only while `npm run dev` or `npm run start` and Ollama run on the same machine. A Vercel or other remote deployment cannot reach the operator's Mac at `localhost`; it needs a separately reachable, authenticated Ollama endpoint. Never expose port 11434 directly to the public internet. FreeLLMAPI remains primary, and a successful primary call clears any outage cooldown so routing returns to it automatically.
+A localhost endpoint works only while `npm run dev` or `npm run start` and Ollama run on the same machine. A Vercel or other remote deployment cannot reach the operator's Mac at `localhost`; it needs a separately reachable, authenticated Ollama endpoint. Never expose port 11434 directly to the public internet. Gemini remains primary. A recoverable Gemini route failure records the reason and may make exactly one Ollama attempt; a successful primary call clears the outage cooldown so routing returns to Gemini automatically. Authentication and configuration failures do not fall back.
 
 ## Implementation status
 
-**Implemented and tested** — persistent recruitment schedule (Monday–Saturday;
-main discovery at 10:00 Europe/Zurich and incremental discovery at 12:00, 14:00,
-16:00, 18:00 and 20:00) with DST handling, catch-up window and missed-run records;
+**Implemented and tested** — persistent recruitment schedule (one automated run
+per day, Monday–Sunday at 12:00 Europe/Zurich) with DST handling, a single
+catch-up window and missed-run records;
 the Chief Coordinator run with
 its ten-section report and agent assignments; deterministic eligibility rules;
 the 85% floor; tailored CV and cover-letter generation; the ATS/quality gate;
@@ -90,8 +90,8 @@ public feeds are configured, and a live discovery run has stored real vacancies.
 
 **Requires additional configuration** — `RECRUITMENT_SUBMISSION_ENDPOINT` (without
 it, every package is queued for a human and nothing is sent); a running host or
-host cron at each configured recruitment time (default 10:00, 12:00, 14:00,
-16:00, 18:00 and 20:00 Europe/Zurich, Monday–Saturday);
+host cron at the configured recruitment time (default 12:00 Europe/Zurich,
+Monday–Sunday);
 further board identifiers or career-page URLs
 to widen coverage; Gmail credentials for inbox tracking.
 
@@ -117,7 +117,7 @@ app/admin/            administrator console
 app/api/              authenticated document download + CSV export
 lib/db.ts             schema, seeding, sqlite helpers
 lib/agents.ts         coordinator, tasks, workflows, document packaging
-lib/providers.ts      shared FreeLLMAPI/Ollama routing, health, usage, budget
+lib/providers.ts      shared Gemini/Ollama routing, fallback, health, usage
 lib/workflow.ts       sequential background runner, pause/stop/resume, recovery
 lib/agent-definitions.ts  instructions, tools and output contracts for all eight agents
 lib/agent-identity.ts  central agent-ID to illustration mapping
@@ -136,9 +136,9 @@ lib/assistant.ts      coordinator command interpreter
 
 The Chief Coordinator owns a full recruitment run. It is started by a persistent,
 configurable schedule (`schedule_jobs` in SQLite), not by a browser tab or an
-in-memory timer. The default is **Monday–Saturday, main discovery at 10:00
-Europe/Zurich with incremental runs at 12:00, 14:00, 16:00, 18:00 and 20:00**; the
-main time and weekdays can be changed in **Settings → Scheduling**. The schedule,
+in-memory timer. The default is **exactly one automated run per day, Monday–Sunday
+at 12:00 Europe/Zurich**. There are no incremental follow-up runs; the time and
+weekdays can be changed in **Settings → Scheduling**. The schedule,
 every run, every agent assignment, every vacancy decision and every submission
 attempt are stored, so a restart does not lose them. Days that are not selected
 are true rest days: scheduled discovery, document generation and submission do
@@ -173,9 +173,9 @@ not run and consume no scheduled inference tokens.
   submission. Without it, packages are prepared and queued for a human; nothing
   is marked as submitted.
 - The scheduler runs inside this application. The Mac and the app/worker must be
-  running at each configured recruitment time (default 10:00, 12:00, 14:00,
-  16:00, 18:00 and 20:00 Europe/Zurich, Monday–Saturday). The database keeps the
-  schedule and records a missed run instead of silently skipping it. For a future
+  running at the configured recruitment time (default 12:00 Europe/Zurich,
+  Monday–Sunday). The database keeps the schedule and records a missed run
+  instead of silently skipping it; catch-up never adds a second run. For a future
   Vercel deployment the
   same tick is available at `GET/POST /api/cron/recruitment` (send
   `Authorization: Bearer $CRON_SECRET` when `CRON_SECRET` is set).

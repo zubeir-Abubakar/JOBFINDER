@@ -1,6 +1,7 @@
 import { one } from "./db";
 import { getSetting } from "./settings";
-import { freeLlmPolicyIssue, providerConfigured, providerStatusSnapshot } from "./providers";
+import { freeLlmConfigured, freeLlmPolicyIssue, providerConfigured, providerStatusSnapshot } from "./providers";
+import { zeroSpendSummary } from "./ai-spending-policy";
 
 export type AgentAvailability = {
   available: boolean;
@@ -8,9 +9,27 @@ export type AgentAvailability = {
   dependency: string | null;
   /** configuration = missing settings; health = configured but unreachable/rejected. */
   cause?: "configuration" | "health" | null;
+  /** The agent can do deterministic work, but an optional capability is restricted. */
+  restricted?: boolean;
+  restriction?: "ai_inference" | "email_access" | null;
 };
 
 const AVAILABLE: AgentAvailability = { available: true, reason: null, dependency: null };
+
+/** Deterministic work is available; only the AI-assisted parts are restricted. */
+function withAiRestriction(availability: AgentAvailability): AgentAvailability {
+  if (!availability.available || providerConfigured()) return availability;
+  const policy = freeLlmPolicyIssue();
+  return {
+    ...availability,
+    restricted: true,
+    restriction: "ai_inference",
+    dependency: "AI inference",
+    reason: policy
+      ? `No permitted AI model is selected. ${policy} Deterministic work remains available; AI-assisted output is blocked.`
+      : `${zeroSpendSummary()} No authorised local AI route is available. Deterministic work remains available; AI-assisted output is marked blocked.`,
+  };
+}
 
 function profileReady(): AgentAvailability {
   const row = one<{ full_name: string | null; skills: number; experiences: number }>(
@@ -42,23 +61,33 @@ function profileReady(): AgentAvailability {
  */
 export function agentAvailability(key: string): AgentAvailability {
   if (key === "coordinator") {
+    // The Coordinator's orchestration, discovery, eligibility, scoring and
+    // document rules are deterministic. Missing or blocked inference restricts
+    // only the AI-assisted parts; it must not take the Coordinator offline or
+    // make the whole workforce look unavailable.
     if (!providerConfigured()) {
       const policy = freeLlmPolicyIssue();
       return {
-        available: false,
-        dependency: "AI provider",
+        available: true,
+        restricted: true,
+        restriction: "ai_inference",
+        dependency: "AI inference",
         reason: policy
-          ? `No permitted AI model is selected. ${policy}`
-          : "No AI provider is configured. Set the FreeLLMAPI variables to enable the primary gateway, or set OLLAMA_ENABLED=true, OLLAMA_BASE_URL, OLLAMA_MODEL and OLLAMA_CODER_MODEL for local fallback.",
+          ? `No permitted AI model is selected. ${policy} Deterministic coordination remains available; AI-dependent work stays blocked.`
+          : freeLlmConfigured()
+            ? `${zeroSpendSummary()} External AI is blocked; deterministic coordination remains available. Enable loopback Ollama to restore AI-assisted work.`
+            : `${zeroSpendSummary()} No authorised local AI route is configured. Deterministic coordination remains available; AI-dependent work is marked blocked.`,
         cause: "configuration",
       };
     }
     const snapshot = providerStatusSnapshot();
     if (snapshot.available === false) {
       return {
-        available: false,
-        dependency: "AI provider",
-        reason: `AI providers are configured but unavailable: ${snapshot.detail}`,
+        available: true,
+        restricted: true,
+        restriction: "ai_inference",
+        dependency: "AI inference",
+        reason: `AI providers are configured but unavailable: ${snapshot.detail} Deterministic coordination remains available; AI-dependent work stays blocked.`,
         cause: "health",
       };
     }
@@ -75,28 +104,29 @@ export function agentAvailability(key: string): AgentAvailability {
 
   if (key === "email") {
     const email = getSetting<{ connected: boolean; account?: string }>("email", { connected: false });
+    // In-app tracking and the execution report remain possible without Gmail.
+    // Only mailbox scanning, drafts and approved sending are restricted.
     if (!email.connected) {
       return {
-        available: false,
-        reason: "Gmail is not connected. Connect it in Inbox before recruiter correspondence can be monitored.",
+        available: true,
+        restricted: true,
+        restriction: "email_access",
         dependency: "Gmail OAuth",
+        reason:
+          "Gmail is not connected. In-app tracking and report preparation remain available; mailbox scanning, drafts and sending are blocked until Gmail is connected.",
         cause: "configuration",
       };
     }
     const account = one<{ id: number }>("SELECT id FROM gmail_accounts LIMIT 1");
-    if (!account) {
+    if (!account || !process.env.APP_SECRET_KEY) {
       return {
-        available: false,
-        reason: "Gmail is marked connected but no stored OAuth account was found. Reconnect Gmail.",
-        dependency: "Gmail OAuth token",
-        cause: "configuration",
-      };
-    }
-    if (!process.env.APP_SECRET_KEY) {
-      return {
-        available: false,
-        reason: "APP_SECRET_KEY is not configured, so the stored Gmail OAuth token cannot be decrypted.",
-        dependency: "APP_SECRET_KEY",
+        available: true,
+        restricted: true,
+        restriction: "email_access",
+        dependency: account ? "APP_SECRET_KEY" : "Gmail OAuth token",
+        reason: account
+          ? "APP_SECRET_KEY is not configured, so mailbox access is blocked. In-app tracking and report preparation remain available."
+          : "Gmail is marked connected but no stored OAuth account was found. In-app tracking and report preparation remain available; reconnect Gmail to read or send mail.",
         cause: "configuration",
       };
     }
@@ -104,7 +134,7 @@ export function agentAvailability(key: string): AgentAvailability {
   }
 
   if (key === "analysis" || key === "cv" || key === "ats" || key === "cover") {
-    return profileReady();
+    return withAiRestriction(profileReady());
   }
 
   return AVAILABLE;

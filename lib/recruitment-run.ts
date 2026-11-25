@@ -13,9 +13,14 @@ import {
   type PackageOutcome,
 } from "./agents";
 import { assessEligibility, type EligibilityAssessment } from "./eligibility";
+import {
+  analyseVacancyGermanRequirement,
+  MANDATORY_GERMAN_REQUIREMENT,
+  GERMAN_REQUIREMENT_UNRESOLVED,
+} from "./language-requirements";
 import { discoverJobSources, sourceHealth, type DiscoveryResult, type SourceMetrics } from "./recruitment-discovery";
 import { evaluateReadiness, type ReadinessItem } from "./application-readiness";
-import { submitApplication, existingVerifiedSubmission, recoverStaleSubmissionClaims, type SubmissionInput, type SubmissionOutcome } from "./submission";
+import { submitApplication, existingVerifiedSubmission, recoverStaleSubmissionClaims, submissionOutcomeClass, type SubmissionInput, type SubmissionOutcome } from "./submission";
 import { QUALIFYING_MATCH_SCORE, effectiveMinMatchScore, qualifiesForAutoApply, autoApplyBlockers, type JobAnalysis } from "./scoring";
 import { getSetting } from "./settings";
 import { getProfileData } from "./profile";
@@ -29,13 +34,24 @@ import { notify } from "./notify";
 import { enqueueDocumentRecovery } from "./recruitment-recovery";
 import { audit } from "./audit";
 import { catchUpWindowHours, localClockTime, localDateKey, nextRecruitmentOccurrence, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIMEZONE, RECRUITMENT_WEEKDAYS, formatInZone } from "./recruitment-schedule";
+import { qualificationStatusFor } from "./job-identity";
 import { acquireRuntimeLock, refreshRuntimeLock, releaseRuntimeLock, runtimeLockActive } from "./runtime-state";
 import { recordApplicationEvent } from "./application-events";
 import { generateText, providerConfigured, scrubProviderError } from "./providers";
+import { AiSpendingPolicyError, zeroSpendSummary } from "./ai-spending-policy";
 import { buildExecutionManifest } from "./execution-manifest";
 import { verifyAndPersistVacancy, type VacancyVerification } from "./vacancy-verification";
 import { agentIdentity } from "./agent-identity";
 import { resolveCoverLetterRequirements } from "./cover-letter-requirements";
+import {
+  buildStagePlan,
+  checkpointFor,
+  decideStageRecovery,
+  deriveStageEvidence,
+  recordStage,
+  recordSubmissionCheckpoints,
+  type RecruitmentStage,
+} from "./recruitment-stages";
 
 /**
  * Chief Coordinator for the autonomous daily recruitment run.
@@ -202,7 +218,7 @@ function logAgent(input: {
   runId: string;
   agentKey: string;
   assignment: string;
-  status: "running" | "completed" | "failed" | "retried" | "reassigned" | "skipped";
+  status: "running" | "completed" | "failed" | "blocked" | "retried" | "reassigned" | "skipped";
   attempt?: number;
   output?: string | null;
   error?: string | null;
@@ -325,20 +341,57 @@ function closeOpenAssignments(runId: string, status: "completed" | "failed", not
 }
 
 /** An unavailable or paused agent is recorded; deterministic work still runs. */
-function attemptTask(agentKey: string, workflowId: string, title: string, detail: string): { taskId: string | null; warning: string | null } {
+function attemptTask(
+  agentKey: string,
+  workflowId: string,
+  title: string,
+  detail: string,
+  options: { dependsOn?: string[] } = {},
+): { taskId: string | null; warning: string | null } {
   try {
-    return { taskId: startTask(agentKey, workflowId, title, detail), warning: null };
+    return { taskId: startTask(agentKey, workflowId, title, detail, options), warning: null };
   } catch (error) {
     return { taskId: null, warning: error instanceof Error ? error.message : "The assigned agent is unavailable." };
   }
 }
 
+/**
+ * A stage must never take the whole run down.
+ *
+ * `completeTask()` deliberately refuses a task that is already failed or owned
+ * by another agent; that guard is correct and stays. What was missing is
+ * isolation: a stalled task recovered by the sweeper made this throw and the
+ * discovery results already stored were lost with the run. The rejection is
+ * recorded against the task and reported as a warning, while the run continues.
+ */
 function safeComplete(taskId: string | null, agentKey: string, output: string): void {
-  if (taskId) completeTask(taskId, agentKey, output);
+  if (!taskId) return;
+  try {
+    completeTask(taskId, agentKey, output);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Task completion was rejected.";
+    audit({
+      action: "recruitment.task_state_isolated",
+      entity: "task",
+      entityId: taskId,
+      detail: `${agentKey}: ${message}`,
+    });
+  }
 }
 
 function safeFail(taskId: string | null, agentKey: string, error: string): void {
-  if (taskId) failTask(taskId, agentKey, error);
+  if (!taskId) return;
+  try {
+    failTask(taskId, agentKey, error);
+  } catch (caught) {
+    const message = caught instanceof Error ? caught.message : "Task failure was rejected.";
+    audit({
+      action: "recruitment.task_state_isolated",
+      entity: "task",
+      entityId: taskId,
+      detail: `${agentKey}: ${message}`,
+    });
+  }
 }
 
 const COORDINATOR_SYSTEM =
@@ -349,6 +402,7 @@ const COORDINATOR_SYSTEM =
 
 type AiStepOutcome = {
   ok: boolean;
+  blocked: boolean;
   provider: string | null;
   model: string | null;
   text: string | null;
@@ -371,7 +425,14 @@ async function aiStep(input: {
   maxTokens: number;
 }): Promise<AiStepOutcome> {
   if (!providerConfigured()) {
-    return { ok: false, provider: null, model: null, text: null, error: "No AI provider is configured." };
+    return {
+      ok: false,
+      blocked: true,
+      provider: null,
+      model: null,
+      text: null,
+      error: zeroSpendSummary(),
+    };
   }
   try {
     const result = await generateText({
@@ -386,20 +447,22 @@ async function aiStep(input: {
       priority: 1,
       maxWaitMs: 120_000,
     });
-    if (input.taskId) {
-      run("UPDATE tasks SET provider = ?, model = ?, attempts = attempts + 1, execution_mode = 'ai', ai_outcome = 'ok' WHERE id = ?", [
-        result.provider,
-        result.model,
-        input.taskId,
-      ]);
-    }
-    return { ok: true, provider: result.provider, model: result.model, text: result.text.trim(), error: null };
+    // recordUsage() owns the task link, attempts, provider/model and AI mode.
+    return { ok: true, blocked: false, provider: result.provider, model: result.model, text: result.text.trim(), error: null };
   } catch (error) {
+    const blocked = error instanceof AiSpendingPolicyError;
     const message = scrubProviderError(error instanceof Error ? error.message : "AI inference failed.");
     if (input.taskId) {
-      run("UPDATE tasks SET attempts = attempts + 1, execution_mode = 'ai', ai_outcome = 'failed' WHERE id = ?", [input.taskId]);
+      run(
+        `UPDATE tasks SET ai_outcome = ?, state_reason = ?,
+           execution_mode = CASE WHEN EXISTS (
+             SELECT 1 FROM provider_usage WHERE task_id = ? AND agent_key = ? AND source = 'task'
+           ) THEN 'ai' ELSE 'deterministic' END
+         WHERE id = ?`,
+        [blocked ? "blocked" : "failed", message, input.taskId, input.agentKey, input.taskId],
+      );
     }
-    return { ok: false, provider: null, model: null, text: null, error: message };
+    return { ok: false, blocked, provider: null, model: null, text: null, error: message };
   }
 }
 
@@ -445,15 +508,120 @@ type JobRowLite = {
   company_domain: string | null;
   expiry_at: string | null;
   requirements: string | null;
+  vacancy_status: string | null;
+  vacancy_verified_at: string | null;
+  url_confidence: string | null;
+  employer_url: string | null;
+  german_requirement: string | null;
+  language_evidence: string | null;
 };
 
 function jobLite(id: string): JobRowLite | null {
   return one<JobRowLite>(     `SELECT id, title, company, location, remote, url, application_url, description, employment_type, published_at,
             match_score, analysis, eligibility, eligibility_notes, run_id, qualified, source, external_id, company_domain, expiry_at,
-            requirements
+            requirements, vacancy_status, vacancy_verified_at, url_confidence, employer_url,
+            german_requirement, language_evidence
      FROM jobs WHERE id = ?`,
     [id],
   );
+}
+
+/**
+ * Re-apply the hard German exclusion to every stored vacancy. Discovery and
+ * re-listing enforce it at insertion; this sweep covers rows created before the
+ * rule existed and survives restarts and requalification. It also resolves an
+ * ambiguous mention to `needs_review`, so a stale eligible row is downgraded.
+ */
+export function enforceStoredGermanExclusion(now: Date = new Date()): number {
+  const rows = all<{
+    id: string;
+    title: string;
+    description: string | null;
+    eligibility: string | null;
+    german_requirement: string | null;
+  }>("SELECT id, title, description, eligibility, german_requirement FROM jobs");
+  let changed = 0;
+  for (const row of rows) {
+    const german = analyseVacancyGermanRequirement(row.title, row.description);
+    if (german.status === "required") {
+      run(
+        `UPDATE jobs SET german_requirement = 'required', language_evidence = ?,
+           eligibility = 'ineligible', qualified = 0, qualification_status = 'ineligible',
+           eligibility_notes = ?, eligibility_checked_at = ?,
+           status = CASE WHEN status = 'applied' THEN status ELSE 'rejected' END
+         WHERE id = ?`,
+        [
+          JSON.stringify(german).slice(0, 8000),
+          JSON.stringify({
+            status: "ineligible",
+            blockers: [`${MANDATORY_GERMAN_REQUIREMENT}: ${german.detail}`],
+            germanStatus: german.status,
+            germanEvidence: german.evidence,
+            reasonCode: german.reasonCode,
+            checkedAt: now.toISOString(),
+          }).slice(0, 12000),
+          now.toISOString(),
+          row.id,
+        ],
+      );
+      // A dependent application may have been prepared by an earlier run. It is
+      // no longer eligible, so it must not remain ready for submission or in a
+      // manual-approval queue. Historical submitted outcomes are never
+      // overwritten.
+      run(
+        `UPDATE applications SET status = 'rejected', submission_status = 'blocked',
+           submission_evidence = ?, last_update = ?
+         WHERE job_id = ? AND status NOT IN ('submitted','acknowledged','interview_invited')`,
+        [
+          JSON.stringify({
+            outcomeClass: "blocked_external",
+            reasonCode: MANDATORY_GERMAN_REQUIREMENT,
+            germanStatus: german.status,
+            germanEvidence: german.evidence,
+            detail: german.detail,
+          }).slice(0, 12000),
+          now.toISOString(),
+          row.id,
+        ],
+      );
+      changed += 1;
+      continue;
+    }
+    if (german.status === "ambiguous" || german.status === "unknown") {
+      run(
+        `UPDATE jobs SET german_requirement = ?, language_evidence = ?,
+           eligibility = CASE WHEN eligibility = 'eligible' THEN 'needs_review' ELSE eligibility END,
+           qualified = 0,
+           qualification_status = CASE WHEN qualification_status = 'qualified' THEN 'needs_review' ELSE qualification_status END,
+           eligibility_notes = ?, eligibility_checked_at = ?
+         WHERE id = ?`,
+        [
+          german.status,
+          JSON.stringify(german).slice(0, 8000),
+          JSON.stringify({
+            status: "needs_review",
+            reasons: [german.detail],
+            germanStatus: german.status,
+            germanEvidence: german.evidence,
+            reasonCode: GERMAN_REQUIREMENT_UNRESOLVED,
+            checkedAt: now.toISOString(),
+          }).slice(0, 12000),
+          now.toISOString(),
+          row.id,
+        ],
+      );
+      changed += 1;
+      continue;
+    }
+    if (row.german_requirement !== german.status) {
+      run("UPDATE jobs SET german_requirement = ?, language_evidence = ? WHERE id = ?", [
+        german.status,
+        JSON.stringify(german).slice(0, 8000),
+        row.id,
+      ]);
+    }
+  }
+  return changed;
 }
 
 function parseAnalysis(value: string | null): JobAnalysis | null {
@@ -617,6 +785,7 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
   const profile = getProfileData();
   const sourceText = verifiedEvidenceText(profile);
   const documentFor = (id: string | null) => {
+    // (unchanged helper body follows)
     if (!id) return null;
     const row = one<{ text_content: string | null; quality_status: string | null; quality_score: number | null; relative_path: string }>(
       "SELECT text_content, quality_status, quality_score, relative_path FROM documents WHERE id = ? AND deleted_at IS NULL",
@@ -645,6 +814,9 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
       description: job.description,
       eligibility: job.eligibility,
       eligibilityNotes: job.eligibility_notes,
+      vacancyStatus: job.vacancy_status,
+      vacancyVerifiedAt: job.vacancy_verified_at,
+      urlConfidence: job.url_confidence,
       matchScore: job.match_score,
       analysis: parseAnalysis(job.analysis),
       coverLetterRequirements: resolveCoverLetterRequirements({
@@ -696,6 +868,11 @@ function generationPreflight(jobId: string): { ok: boolean; reasons: string[] } 
   const job = jobLite(jobId);
   if (!job) return { ok: false, reasons: ["The vacancy no longer exists."] };
   const reasons: string[] = [];
+  if (job.german_requirement === "required") {
+    reasons.push(`${MANDATORY_GERMAN_REQUIREMENT}: the vacancy requires German.`);
+  } else if (job.german_requirement === "ambiguous" || job.german_requirement === "unknown") {
+    reasons.push(`${GERMAN_REQUIREMENT_UNRESOLVED}: the German requirement is unresolved.`);
+  }
   if (job.eligibility !== "eligible") reasons.push(`Eligibility is ${job.eligibility ?? "not assessed"}.`);
   if (job.match_score === null || job.match_score < qualifyingThreshold()) {
     reasons.push(`Match score ${job.match_score ?? "unknown"}% is below ${qualifyingThreshold()}%.`);
@@ -712,8 +889,11 @@ function generationPreflight(jobId: string): { ok: boolean; reasons: string[] } 
   if (coverLetter.supportingDocuments.length > 0) {
     reasons.push(`The vacancy requests supporting document(s) that the package does not create: ${coverLetter.supportingDocuments.join(", ")}.`);
   }
-  if (!job.published_at) reasons.push("The publication date is missing, so freshness cannot be verified.");
-  else if (Date.now() - Date.parse(job.published_at) > 7 * 86_400_000) reasons.push("The vacancy is older than seven days.");
+  // Publication age is not evidence that a vacancy is closed. Currentness is
+  // decided by the live vacancy verification that runs before this preflight.
+  if (job.vacancy_status && job.vacancy_status !== "open") {
+    reasons.push(`The live vacancy check recorded ${job.vacancy_status}.`);
+  }
   const profile = getProfileData();
   if (!profile.profile.full_name?.trim() || !profile.profile.email?.trim()) reasons.push("The verified profile is incomplete.");
   const master = profile.profile.source_cv_id
@@ -774,6 +954,8 @@ export async function executeRun(
     discoveryScope?: "full" | "incremental";
     /** Scoring and reporting only; documents and submissions are skipped. */
     discoveryOnly?: boolean;
+    /** Reconstruct from persisted checkpoints and reuse completed outputs. */
+    resume?: boolean;
   } = {},
 ): Promise<RunOutcome> {
   const runRow = runById(runId);
@@ -828,6 +1010,9 @@ export async function executeRun(
   // Recover abandoned `submitting` leases before this run reads any readiness or
   // duplicate state. The recovered outcome is unverified, never successful.
   recoverStaleSubmissionClaims(now);
+  // The language rule is re-applied before any scoring, package or submission,
+  // including on vacancies stored by earlier runs.
+  enforceStoredGermanExclusion(now);
   const warnings: string[] = [];
   const failures: string[] = [];
   let allSourcesFailed = false;
@@ -861,10 +1046,17 @@ export async function executeRun(
   let runStatus: RunState = "failed";
 
   try {
-    pushState(runId, "starting", `${agentIdentity("coordinator").name} created the daily recruitment run.`);
-    run("UPDATE recruitment_runs SET started_at = ? WHERE id = ?", [now.toISOString(), runId]);
-    workflowId = createWorkflow("autonomous_recruitment", `Daily autonomous recruitment · ${runRow.run_key}`, userId);
-    run("UPDATE recruitment_runs SET workflow_id = ? WHERE id = ?", [workflowId, runId]);
+    pushState(runId, "starting", `${agentIdentity("coordinator").name} ${options.resume ? "resumed" : "created"} the daily recruitment run.`);
+    run("UPDATE recruitment_runs SET started_at = COALESCE(started_at, ?) WHERE id = ?", [now.toISOString(), runId]);
+    // A restart must continue the existing workflow and task ledger. Replacing
+    // it would orphan completed tasks and make the run look like new work.
+    workflowId = runRow.workflow_id;
+    if (workflowId) {
+      run("UPDATE workflows SET status = 'running', finished_at = NULL WHERE id = ?", [workflowId]);
+    } else {
+      workflowId = createWorkflow("autonomous_recruitment", `Daily autonomous recruitment · ${runRow.run_key}`, userId);
+      run("UPDATE recruitment_runs SET workflow_id = ? WHERE id = ?", [workflowId, runId]);
+    }
 
     const plan = attemptTask("coordinator", workflowId, "Create the daily recruitment run", "Assign discovery, eligibility, scoring, documents, quality and submission");
     logAgent({ runId, agentKey: "coordinator", assignment: "Create the daily recruitment run and assign specialists", status: "completed", output: `Run ${runRow.run_key} started. Threshold ${threshold}%.` });
@@ -873,13 +1065,34 @@ export async function executeRun(
 
     /* 1. Discovery */
     pushState(runId, "searching", "Career research is searching Ashby boards, employer pages and the job feed.");
-    const researchTask = attemptTask("research", workflowId, "Search configured sources for QA vacancies", `${pages} page(s) · Ashby · employer career pages · Arbeitnow`);
+    const discoveryCheckpoint = checkpointFor(runId, "", "discovery");
+    const persistedDiscoveryJobIds = all<{ id: string }>("SELECT id FROM jobs WHERE run_id = ? ORDER BY discovered_at", [runId]).map((row) => row.id);
+    const reuseDiscovery = options.resume === true && discoveryCheckpoint?.status === "completed" && persistedDiscoveryJobIds.length >= 0;
+    const researchTask = reuseDiscovery
+      ? { taskId: null, warning: null }
+      : attemptTask("research", workflowId, "Search configured sources for QA vacancies", `${pages} page(s) · Ashby · employer career pages · Arbeitnow`, {
+          dependsOn: plan.taskId ? [plan.taskId] : [],
+        });
     logAgent({ runId, agentKey: "research", assignment: "Discover QA vacancies across all configured sources", status: "running" });
     let discovery: DiscoveryResult;
     try {
-      discovery = deps.discover
-        ? await deps.discover({ runId, pages, scope: discoveryScope })
-        : await discoverJobSources({ runId, pages, scope: discoveryScope });
+      discovery = reuseDiscovery
+        ? {
+            discovered: persistedDiscoveryJobIds.length,
+            inserted: persistedDiscoveryJobIds.length,
+            duplicates: runRow.jobs_duplicates,
+            updated: runRow.jobs_updated,
+            filtered: runRow.jobs_filtered,
+            jobIds: persistedDiscoveryJobIds,
+            sources: [],
+            warnings: ["Discovery was not repeated: the completed checkpoint and persisted vacancies were reused."],
+            scope: discoveryScope,
+            since: runRow.discovery_since,
+            discoveryState: "ok",
+          }
+        : deps.discover
+          ? await deps.discover({ runId, pages, scope: discoveryScope })
+          : await discoverJobSources({ runId, pages, scope: discoveryScope });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Discovery failed.";
       allSourcesFailed = true;
@@ -924,6 +1137,16 @@ export async function executeRun(
     const failedSources = checkedSources.filter((source) => (source.responses ?? 0) === 0);
     const partialSources = succeededSources.filter((source) => Boolean(source.error));
     allSourcesFailed = discovery.allSourcesFailed ?? (checkedSources.length > 0 && succeededSources.length === 0);
+    recordStage({
+      runId,
+      stage: "discovery",
+      status: allSourcesFailed ? "failed" : "completed",
+      outputRefs: { jobIds: [...new Set(discovery.jobIds)] },
+      evidence: { inserted: discovery.inserted, updated: discovery.updated, duplicates: discovery.duplicates, filtered: discovery.filtered },
+      reason: allSourcesFailed ? "All configured sources failed." : null,
+      errorClass: allSourcesFailed ? "provider_unavailable" : null,
+      now,
+    });
     const discoveryState =
       discovery.discoveryState ??
       (checkedSources.length === 0
@@ -963,7 +1186,9 @@ export async function executeRun(
 
     /* 2. Eligibility and scoring */
     pushState(runId, "analysing", "Eligibility and evidence-based scoring are running for every discovered vacancy.");
-    const analysisTask = attemptTask("analysis", workflowId, "Assess eligibility and score vacancies", "Swiss residency · sponsorship · languages · weighted match");
+    const analysisTask = attemptTask("analysis", workflowId, "Assess eligibility and score vacancies", "Swiss residency · sponsorship · languages · weighted match", {
+      dependsOn: researchTask.taskId ? [researchTask.taskId] : [],
+    });
     logAgent({ runId, agentKey: "analysis", assignment: "Assess eligibility and score every discovered vacancy", status: "running" });
     let eligibleCount = 0;
     const qualifiedJobs: Array<{ id: string; score: number }> = [];
@@ -973,6 +1198,12 @@ export async function executeRun(
     for (const jobId of discoveredJobIds) {
       const job = jobLite(jobId);
       if (!job) continue;
+      const eligibilityDone = options.resume === true && checkpointFor(runId, jobId, "eligibility")?.status === "completed";
+      if (eligibilityDone && job.eligibility) {
+        if (job.eligibility === "eligible") eligibleCount += 1;
+        if (Number(job.qualified) === 1) qualifiedJobs.push({ id: jobId, score: job.match_score ?? 0 });
+        continue;
+      }
       const eligibility = assessEligibility(
         {
           title: job.title,
@@ -984,6 +1215,8 @@ export async function executeRun(
           url: job.url,
           published_at: job.published_at,
           employment_type: job.employment_type,
+          german_requirement: job.german_requirement,
+          language_evidence: job.language_evidence,
         },
         getProfileData(),
         now,
@@ -996,8 +1229,19 @@ export async function executeRun(
       // earlier discovery. The report and the submission verification both read
       // the run's jobs through this link.
       run("UPDATE jobs SET run_id = COALESCE(NULLIF(run_id, ''), ?) WHERE id = ?", [runId, jobId]);
+      // The internal qualification outcome is stored explicitly. The legacy
+      // `status` bucket remains for compatibility, but it is never an employer
+      // decision and the UI labels it as an internal selection result.
+      const qualificationStatus = qualificationStatusFor({
+        eligible: eligibility.status,
+        score,
+        threshold,
+        qualified: autoApply,
+        hardBlocker: Boolean(analysis && autoApplyBlockers(analysis).length > 0),
+      });
       run(
         `UPDATE jobs SET eligibility = ?, eligibility_notes = ?, eligibility_checked_at = ?, qualified = ?,
+           qualification_status = ?,
            status = CASE WHEN status IN ('applied','rejected') THEN status WHEN ? = 1 THEN 'shortlisted' ELSE 'rejected' END
          WHERE id = ?`,
         [
@@ -1005,10 +1249,20 @@ export async function executeRun(
           JSON.stringify(eligibility).slice(0, 12000),
           eligibility.checkedAt,
           autoApply ? 1 : 0,
+          qualificationStatus,
           autoApply ? 1 : 0,
           jobId,
         ],
       );
+      recordStage({
+        runId,
+        jobId,
+        stage: "eligibility",
+        status: "completed",
+        outputRefs: { jobId, eligibility: eligibility.status, matchScore: score, qualified: autoApply },
+        evidence: { eligibilityNotes: eligibility.reasons.slice(0, 4), analysis: Boolean(analysis) },
+        now,
+      });
       if (autoApply) qualifiedJobs.push({ id: jobId, score });
       else {
         const reason =
@@ -1087,6 +1341,8 @@ export async function executeRun(
         attempts: source.attempts,
         durationMs: source.durationMs,
         status: source.status,
+        rejectionReasons: source.rejectionReasons,
+        rejectedSamples: source.rejectedSamples,
       });
     }
     const assessed = all<{ source: string; eligibility: string | null; qualified: number }>(
@@ -1115,13 +1371,13 @@ export async function executeRun(
         runId,
         agentKey: "analysis",
         assignment: "Review the assessed vacancies with the configured model",
-        status: "skipped",
-        output: "No AI provider is configured. Deterministic eligibility and scoring ran without model inference.",
+        status: "blocked",
+        output: zeroSpendSummary(),
         executionMode: "deterministic",
         finishedAt: nowIso(),
       });
       warnings.push(
-        "AI match evaluation was skipped because no AI provider is configured. Deterministic eligibility and scoring remain authoritative.",
+        `${zeroSpendSummary()} AI match evaluation was skipped; deterministic eligibility and scoring remain authoritative.`,
       );
     } else {
       for (const jobId of discoveredJobIds.slice(0, 5)) {
@@ -1155,19 +1411,27 @@ export async function executeRun(
           runId,
           agentKey: "analysis",
           assignment: `AI review of ${job.title} at ${job.company}`,
-          status: result.ok ? "completed" : "failed",
+          status: result.ok ? "completed" : result.blocked ? "blocked" : "failed",
           output: result.ok ? result.text : null,
           error: result.ok ? null : result.error,
           decision: result.ok
             ? "Advisory assessment only; the stored score and eligibility are unchanged."
-            : "Deterministic scoring used; the AI assessment failed.",
+            : result.blocked
+              ? "Deterministic scoring used; the advisory AI route was unavailable, so no AI assessment was transmitted."
+              : "Deterministic scoring used; the AI assessment failed.",
           executionMode: result.ok ? "ai" : "deterministic",
           provider: result.provider,
           model: result.model,
           startedAt: started,
           finishedAt: nowIso(),
         });
-        if (!result.ok) warnings.push(`AI match evaluation for ${job.title} at ${job.company} failed: ${result.error}`);
+        if (!result.ok) {
+          warnings.push(
+            result.blocked
+              ? `AI match evaluation for ${job.title} at ${job.company} was blocked before transmission: ${result.error}`
+              : `AI match evaluation for ${job.title} at ${job.company} failed: ${result.error}`,
+          );
+        }
       }
     }
 
@@ -1212,7 +1476,7 @@ export async function executeRun(
         runId,
         agentKey: "coordinator",
         assignment: "Review the run and decide the next actions",
-        status: result.ok ? "completed" : "failed",
+        status: result.ok ? "completed" : result.blocked ? "blocked" : "failed",
         output: supported
           ? result.text
           : result.ok
@@ -1223,7 +1487,9 @@ export async function executeRun(
           ? result.text
           : result.ok
             ? "AI advisory withheld; deterministic rules retained authority."
-            : "AI review unavailable; deterministic rules retained authority.",
+            : result.blocked
+              ? "AI review was blocked before transmission; deterministic rules retained authority."
+              : "AI review unavailable; deterministic rules retained authority.",
         executionMode: result.ok ? "ai" : "deterministic",
         provider: result.provider,
         model: result.model,
@@ -1231,9 +1497,11 @@ export async function executeRun(
         finishedAt: nowIso(),
       });
       if (!result.ok) {
-        const reviewFailure = `Coordinator AI review failed: ${result.error}`;
+        const reviewFailure = result.blocked
+          ? `Coordinator AI review was blocked before transmission: ${result.error}`
+          : `Coordinator AI review failed: ${result.error}`;
         warnings.push(reviewFailure);
-        failures.push(reviewFailure);
+        if (!result.blocked) failures.push(reviewFailure);
       }
     }
 
@@ -1245,13 +1513,34 @@ export async function executeRun(
       );
     }
     let prepared = 0;
+    const packagesByJob = new Map<string, PackageOutcome>();
     if (!discoveryOnly && selected.length > 0) {
       pushState(runId, "preparing_applications", `Preparing a tailored CV and cover letter for ${selected.length} qualifying vacanc${selected.length === 1 ? "y" : "ies"}.`);
       for (const item of selected) {
         const job = jobLite(item.id);
         if (!job) continue;
-        const vacancyCheck = await verifyVacancyForRun(item.id, deps, deps.now ?? now);
-        if (!vacancyCheck || vacancyCheck.status !== "open") {
+        const validationDecision = options.resume
+          ? decideStageRecovery({ runId, jobId: item.id, stage: "vacancy_validation", now, leaseActive: false })
+          : null;
+        const reuseVacancyEvidence =
+          validationDecision?.action === "complete" || validationDecision?.action === "reuse";
+        const vacancyCheck = reuseVacancyEvidence
+          ? null
+          : await verifyVacancyForRun(item.id, deps, deps.now ?? now);
+        if (!reuseVacancyEvidence) {
+          recordStage({
+            runId,
+            jobId: item.id,
+            stage: "vacancy_validation",
+            status: vacancyCheck?.status === "open" ? "completed" : "failed",
+            outputRefs: vacancyCheck?.status === "open" ? { jobId: item.id, vacancyStatus: "open" } : {},
+            evidence: { vacancyStatus: vacancyCheck?.status ?? null },
+            reason: vacancyCheck?.status === "open" ? null : vacancyCheck?.reason ?? "Vacancy verification failed.",
+            errorClass: vacancyCheck?.status === "open" ? null : "validation",
+            now,
+          });
+        }
+        if (!reuseVacancyEvidence && (!vacancyCheck || vacancyCheck.status !== "open")) {
           const reason = vacancyCheck?.reason ?? "The vacancy could not be found for final verification.";
           warnings.push(`Final vacancy verification blocked ${job.title} at ${job.company}: ${reason}`);
           logAgent({
@@ -1264,6 +1553,17 @@ export async function executeRun(
             finishedAt: nowIso(),
           });
           continue;
+        }
+        if (reuseVacancyEvidence) {
+          logAgent({
+            runId,
+            agentKey: "ats",
+            assignment: `Final vacancy verification for ${job.title}`,
+            status: "completed",
+            output: "The persisted open-vacancy checkpoint was reused; the external check was not repeated.",
+            decision: "Completed evidence was preserved across the restart.",
+            finishedAt: nowIso(),
+          });
         }
         const preflight = generationPreflight(item.id);
         if (!preflight.ok) {
@@ -1280,11 +1580,39 @@ export async function executeRun(
           continue;
         }
         let pkg: PackageOutcome | null = null;
+        const packageDecision = options.resume
+          ? decideStageRecovery({ runId, jobId: item.id, stage: "package_assembly", now, leaseActive: false })
+          : null;
+        if (packageDecision?.action === "complete" || packageDecision?.action === "reuse") {
+          pkg = {
+            ok: true,
+            message: "Persisted application package reused; no document was regenerated.",
+            applicationId: String(packageDecision.outputRefs.applicationId ?? ""),
+            cvDocumentId: String(packageDecision.outputRefs.cvDocumentId ?? ""),
+            coverDocumentId: String(packageDecision.outputRefs.coverDocumentId ?? ""),
+            warnings: [],
+          };
+          logAgent({
+            runId,
+            agentKey: "cv",
+            assignment: `Create tailored CV for ${job.title}`,
+            status: "completed",
+            output: "The persisted, validated document package was reused after restart.",
+            decision: "Completed document and package outputs were preserved.",
+            finishedAt: nowIso(),
+          });
+        }
         let lastError: string | null = null;
         for (let attempt = 1; attempt <= 2 && !(pkg && pkg.ok); attempt += 1) {
           const started = nowIso();
           try {
-            pkg = deps.prepare ? await deps.prepare(item.id, workflowId) : await generateApplicationPackage(userId, item.id, { workflowId });
+            pkg = deps.prepare
+              ? await deps.prepare(item.id, workflowId)
+              : await generateApplicationPackage(userId, item.id, {
+                  workflowId,
+                  resumeStage: options.resume ? "reuse" : undefined,
+                  dependsOn: analysisTask.taskId ? [analysisTask.taskId] : [],
+                });
             if (!pkg.ok) lastError = pkg.message;
           } catch (error) {
             lastError = error instanceof Error ? error.message : "Document generation failed.";
@@ -1314,11 +1642,14 @@ export async function executeRun(
           continue;
         }
         prepared += 1;
+        packagesByJob.set(item.id, pkg);
         run("UPDATE jobs SET document_state = 'prepared' WHERE id = ?", [item.id]);
         if (pkg.applicationId) {
-          run("UPDATE applications SET run_id = ?, status = 'quality_check', last_update = ? WHERE id = ?", [runId, nowIso(), pkg.applicationId]);
+          run("UPDATE applications SET run_id = ?, status = CASE WHEN status IN ('submitted','acknowledged','interview_invited','interview_completed','offer_received') THEN status ELSE 'quality_check' END, last_update = ? WHERE id = ?", [runId, nowIso(), pkg.applicationId]);
           run("UPDATE documents SET run_id = ? WHERE job_id = ? AND deleted_at IS NULL AND kind IN ('tailored_cv','cover_letter')", [runId, item.id]);
-          recordApplicationEvent({ applicationId: pkg.applicationId, type: "documents.prepared", message: "Tailored CV and cover letter prepared by the document agents.", meta: { ats: pkg.atsScore ?? null } });
+          if (!packageDecision || (packageDecision.action !== "complete" && packageDecision.action !== "reuse")) {
+            recordApplicationEvent({ applicationId: pkg.applicationId, type: "documents.prepared", message: "Tailored CV and cover letter prepared by the document agents.", meta: { ats: pkg.atsScore ?? null } });
+          }
         }
       }
     }
@@ -1327,6 +1658,7 @@ export async function executeRun(
     /* 4. Quality gate */
     pushState(runId, "quality_checking", "The ATS agent is independently checking each application package.");
     const ready: Array<{ applicationId: string; jobId: string; job: JobLiteForDocs }> = [];
+    const qualityTasksByJob = new Map<string, string>();
     for (const item of discoveryOnly ? [] : selected) {
       const job = jobLite(item.id);
       if (!job) continue;
@@ -1335,12 +1667,86 @@ export async function executeRun(
         logAgent({ runId, agentKey: "ats", assignment: `Quality check ${job.title}`, status: "failed", error: "No application record was created.", decision: "Coordinator queued the vacancy for human intervention." });
         continue;
       }
+      const pkg = packagesByJob.get(item.id);
+      const packageGate = attemptTask(
+        "ats",
+        workflowId,
+        `Independently validate ${job.title} application package`,
+        "Kali validates the complete CV and cover-letter package after Amira.",
+        {
+          dependsOn: [pkg?.cvTaskId, pkg?.coverTaskId].filter((id): id is string => Boolean(id)),
+        },
+      );
+      if (packageGate.warning) warnings.push(packageGate.warning);
+      if (packageGate.taskId) qualityTasksByJob.set(item.id, packageGate.taskId);
+      const readinessCheckpoint = checkpointFor(runId, item.id, "readiness");
+      const readinessEvidence = deriveStageEvidence(runId, item.id, "readiness");
+      const reuseReadiness =
+        options.resume === true &&
+        readinessCheckpoint?.status === "completed" &&
+        readinessEvidence.state === "complete";
+      if (reuseReadiness) {
+        run(
+          "UPDATE applications SET status = CASE WHEN status IN ('submitted','acknowledged','interview_invited','interview_completed','offer_received') THEN status ELSE 'ready_to_submit' END, last_update = ? WHERE id = ?",
+          [nowIso(), app.id],
+        );
+        if (packageGate.taskId) {
+          completeTask(
+            packageGate.taskId,
+            "ats",
+            "The persisted readiness and complete package evidence were reused; the gate was not bypassed.",
+          );
+        }
+        logAgent({
+          runId,
+          agentKey: "ats",
+          assignment: `Quality check ${job.title}`,
+          status: "completed",
+          output: "The persisted readiness state was reused; the package was not regenerated.",
+          decision: "The completed readiness output survived the restart.",
+          finishedAt: nowIso(),
+        });
+        ready.push({ applicationId: app.id, jobId: item.id, job });
+        continue;
+      }
       const readiness = assessSubmissionReadiness(app.id);
+      recordStage({
+        runId,
+        jobId: item.id,
+        stage: "readiness",
+        status: readiness.ready ? "completed" : readiness.state === "quality_review_required" ? "waiting" : "failed",
+        outputRefs: readiness.ready ? { applicationId: app.id, readinessState: readiness.state } : {},
+        evidence: { readinessState: readiness.state, reasons: readiness.reasons.slice(0, 5) },
+        reason: readiness.ready ? null : readiness.reasons[0] ?? "Readiness did not pass.",
+        errorClass: readiness.ready ? null : "validation",
+        now,
+      });
       if (readiness.ready) {
-        run("UPDATE applications SET status = 'ready_to_submit', last_update = ? WHERE id = ?", [nowIso(), app.id]);
+        run(
+          "UPDATE applications SET status = CASE WHEN status IN ('submitted','acknowledged','interview_invited','interview_completed','offer_received') THEN status ELSE 'ready_to_submit' END, last_update = ? WHERE id = ?",
+          [nowIso(), app.id],
+        );
+        if (packageGate.taskId) {
+          completeTask(
+            packageGate.taskId,
+            "ats",
+            "Independent package gate passed: CV, cover letter, eligibility, duplicates and readiness evidence all passed.",
+            false,
+            { outputRefs: { applicationId: app.id, readinessState: readiness.state } },
+          );
+        }
         logAgent({ runId, agentKey: "ats", assignment: `Quality check ${job.title}`, status: "completed", output: "All mandatory fields, documents, quality evidence, eligibility and duplicate checks passed.", finishedAt: nowIso() });
         ready.push({ applicationId: app.id, jobId: item.id, job });
       } else if (readiness.state === "quality_review_required") {
+        if (packageGate.taskId) {
+          failTask(
+            packageGate.taskId,
+            "ats",
+            `Independent package gate requires review: ${readiness.reasons.join(" ")}`,
+            "validation",
+            { outputRefs: { applicationId: app.id, readinessState: readiness.state } },
+          );
+        }
         run("UPDATE applications SET status = 'quality_review_required', last_update = ? WHERE id = ?", [nowIso(), app.id]);
         recordApplicationEvent({ applicationId: app.id, type: "quality.review", message: readiness.reasons.join(" ") });
         logAgent({
@@ -1365,6 +1771,15 @@ export async function executeRun(
         // gate and must not create an approval queue item.
         run("UPDATE applications SET status = 'ready_to_submit', last_update = ? WHERE id = ?", [nowIso(), app.id]);
         recordApplicationEvent({ applicationId: app.id, type: "quality.ready", message: readiness.reasons.join(" ") });
+        if (packageGate.taskId) {
+          completeTask(
+            packageGate.taskId,
+            "ats",
+            `Independent package gate passed; automatic submission is paused by policy: ${readiness.reasons.join(" ")}`,
+            false,
+            { outputRefs: { applicationId: app.id, readinessState: readiness.state } },
+          );
+        }
         logAgent({
           runId,
           agentKey: "ats",
@@ -1375,6 +1790,15 @@ export async function executeRun(
           finishedAt: nowIso(),
         });
       } else {
+        if (packageGate.taskId) {
+          failTask(
+            packageGate.taskId,
+            "ats",
+            `Independent package gate blocked the application: ${readiness.reasons.join(" ")}`,
+            "validation",
+            { outputRefs: { applicationId: app.id, readinessState: readiness.state } },
+          );
+        }
         run("UPDATE applications SET status = 'human_intervention_required', last_update = ? WHERE id = ?", [nowIso(), app.id]);
         recordApplicationEvent({ applicationId: app.id, type: "quality.blocked", message: readiness.reasons.join(" ") });
         logAgent({
@@ -1401,6 +1825,7 @@ export async function executeRun(
     let unverified = 0;
     let intervention = 0;
     let simulated = 0;
+    const submissionTasks: string[] = [];
     if (ready.length > 0) {        pushState(
         runId,
         "submitting",
@@ -1411,11 +1836,85 @@ export async function executeRun(
             : "Submitting qualified applications through the verified candidate channel without per-application approval.",
       );
       for (const item of ready) {
+        const submitTask = attemptTask(
+          "application",
+          workflowId,
+          `Submit ${item.job.title} at ${item.job.company}`,
+          "Noor submits only after Kali's persisted package gate and verifies employer confirmation.",
+          { dependsOn: qualityTasksByJob.get(item.jobId) ? [qualityTasksByJob.get(item.jobId)!] : [] },
+        );
+        if (submitTask.taskId) submissionTasks.push(submitTask.taskId);
+        if (submitTask.warning) warnings.push(submitTask.warning);
+        const finishSubmissionTask = (status: "completed" | "failed", output: string, errorClass?: "validation" | "submission_ambiguous" | "blocked") => {
+          if (!submitTask.taskId) return;
+          if (status === "completed") completeTask(submitTask.taskId, "application", output);
+          else failTask(submitTask.taskId, "application", output, errorClass ?? "validation");
+        };
+        // Submission is irreversible. A restart must inspect the persisted
+        // employer outcome before even entering the send function: a verified
+        // attempt is reused, and an ambiguous or failed attempt is reconciled or
+        // stopped instead of being retried blind.
+        const employerEvidence = deriveStageEvidence(runId, item.jobId, "employer_submission");
+        if (employerEvidence.state === "complete") {
+          submitted += 1;
+          recordSubmissionCheckpoints(runId, item.jobId, now);
+          finishSubmissionTask("completed", "The persisted verified employer submission was reused; no second request was sent.");
+          logAgent({
+            runId,
+            agentKey: "application",
+            assignment: `Submit ${item.job.title}`,
+            status: "completed",
+            output: "The persisted verified employer submission was reused; no second request was sent.",
+            decision: "Verified submission evidence survived the restart.",
+            finishedAt: nowIso(),
+          });
+          continue;
+        }
+        if (employerEvidence.state === "ambiguous") {
+          unverified += 1;
+          run(
+            "UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', last_update = ? WHERE id = ? AND status != 'submitted'",
+            [nowIso(), item.applicationId],
+          );
+          recordSubmissionCheckpoints(runId, item.jobId, now);
+          finishSubmissionTask("failed", employerEvidence.reason ?? "The employer submission outcome is ambiguous.", "submission_ambiguous");
+          logAgent({
+            runId,
+            agentKey: "application",
+            assignment: `Submit ${item.job.title}`,
+            status: "failed",
+            error: employerEvidence.reason,
+            decision: "Submission outcome is ambiguous; no retry was attempted without employer reconciliation.",
+            finishedAt: nowIso(),
+          });
+          notify({
+            kind: "application_submission_unverified",
+            dedupeKey: `submission_ambiguous_checkpoint:${runId}:${item.jobId}`,
+            subject: `Submission needs reconciliation: ${item.job.title}`,
+            body: `${item.job.company} may already have received this application. ${employerEvidence.reason} It was not resubmitted automatically.`,
+          });
+          continue;
+        }
+        if (employerEvidence.state === "failed") {
+          intervention += 1;
+          recordSubmissionCheckpoints(runId, item.jobId, now);
+          finishSubmissionTask("failed", employerEvidence.reason ?? "The prior employer response was terminal.", "blocked");
+          logAgent({
+            runId,
+            agentKey: "application",
+            assignment: `Submit ${item.job.title}`,
+            status: "skipped",
+            error: employerEvidence.reason,
+            decision: "The prior employer response was terminal; the application was not automatically retried.",
+            finishedAt: nowIso(),
+          });
+          continue;
+        }
         const usage = dailySubmissionUsage(deps.now ?? now);
         if (usage.remaining <= 0) {
-          warnings.push(
-            `Daily submission limit reached; ${item.job.title} at ${item.job.company} remains ready for the next day.`,
-          );
+          const limitMessage = `Daily submission limit reached; ${item.job.title} at ${item.job.company} remains ready for the next day.`;
+          warnings.push(limitMessage);
+          finishSubmissionTask("completed", limitMessage);
           break;
         }
         const finalVacancyCheck = await verifyVacancyForRun(item.jobId, deps, deps.now ?? now);
@@ -1425,6 +1924,7 @@ export async function executeRun(
           warnings.push(`Submission blocked for ${item.job.title} at ${item.job.company}: final vacancy verification failed — ${reason}`);
           run("UPDATE applications SET status = 'human_intervention_required', last_update = ? WHERE id = ?", [nowIso(), item.applicationId]);
           recordApplicationEvent({ applicationId: item.applicationId, type: "vacancy.blocked", message: reason });
+          finishSubmissionTask("failed", `The live vacancy could not be verified: ${reason}`, "validation");
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: reason, decision: "No application was sent because the live vacancy could not be verified.", finishedAt: nowIso() });
           continue;
         }
@@ -1432,6 +1932,7 @@ export async function executeRun(
         if (!input) {
           intervention += 1;
           warnings.push(`Application ${item.applicationId} could not be assembled for submission.`);
+          finishSubmissionTask("failed", "The application package could not be assembled for submission.", "validation");
           continue;
         }
         if (!submissionAllowed || dryRun) {
@@ -1446,6 +1947,7 @@ export async function executeRun(
             [nowIso(), item.applicationId],
           );
           recordApplicationEvent({ applicationId: item.applicationId, type: "submission.simulated", message: reason });
+          finishSubmissionTask("completed", `${reason} No application was sent.`);
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", output: reason, decision: "The package reached the submission stage without per-application approval; no application was sent only because automatic submission is paused.", finishedAt: nowIso() });
           if (!dryRun) {
             notify({
@@ -1475,6 +1977,7 @@ export async function executeRun(
           // safe state is unknown rather than a definite failure. It is never
           // retried without employer confirmation.
           run("UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', last_update = ? WHERE id = ?", [nowIso(), item.applicationId]);
+          finishSubmissionTask("failed", `Submission outcome is unknown: ${message}`, "submission_ambiguous");
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: message, decision: "Submission outcome is unknown; the coordinator did not retry it blindly.", finishedAt: nowIso() });
           notify({
             kind: "application_submission_unverified",
@@ -1485,11 +1988,14 @@ export async function executeRun(
           intervention += 1;
           continue;
         }
+        recordSubmissionCheckpoints(runId, item.jobId, now);
         if (outcome.status === "verified") {
           submitted += 1;
+          finishSubmissionTask("completed", outcome.detail);
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "completed", output: outcome.detail, decision: "Coordinator verified the employer reference before counting it.", finishedAt: nowIso() });
         } else if (outcome.status === "unverified") {
           unverified += 1;
+          finishSubmissionTask("failed", `Submission was not verified: ${outcome.detail}`, "submission_ambiguous");
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: outcome.detail, decision: "Not counted as submitted: no employer reference was returned.", finishedAt: nowIso() });
           notify({
             kind: "application_submission_unverified",
@@ -1497,8 +2003,16 @@ export async function executeRun(
             subject: `Submission unverified: ${item.job.title}`,
             body: `${item.job.company} did not return a confirmation reference. ${outcome.detail} It is not counted as submitted and must not be retried blindly.`,
           });
+        } else if (submissionOutcomeClass(outcome) === "failed_technical") {
+          // A broken form or unavailable local browser is not an approval
+          // request. Record it as a technical failure so it cannot be mistaken
+          // for a package awaiting the owner's decision or a delivered form.
+          failures.push(`Submission for ${item.job.title}: ${outcome.detail}`);
+          finishSubmissionTask("failed", `Technical submission failure: ${outcome.detail}`, "validation");
+          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: outcome.detail, decision: "Technical submission failure; nothing was recorded as submitted and no approval gate was created.", finishedAt: nowIso() });
         } else {
           intervention += 1;
+          finishSubmissionTask("failed", `Submission needs intervention: ${outcome.detail}`, "blocked");
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", error: outcome.detail, decision: "Queued for human intervention; nothing was recorded as submitted.", finishedAt: nowIso() });
           notify({
             kind: "application_intervention",
@@ -1641,6 +2155,13 @@ export async function executeRun(
     // The Email & Tracking Agent's run-scoped job is to prepare the execution
     // report and hand it to the existing durable outbox. Delivery acceptance is
     // tracked separately; no Gmail success is claimed by this row.
+    const trackingTask = attemptTask(
+      "email",
+      workflowId,
+      "Track outcomes and prepare the administrator report",
+      "Rayna tracks persisted submission outcomes and prepares report evidence.",
+    );
+    if (trackingTask.warning) warnings.push(trackingTask.warning);
     logAgent({
       runId,
       agentKey: "email",
@@ -1653,6 +2174,15 @@ export async function executeRun(
 
     const finalReport = buildRunReport(runId, { warnings, failures });
     run("UPDATE recruitment_runs SET report = ? WHERE id = ?", [finalReport, runId]);
+    if (trackingTask.taskId) {
+      completeTask(
+        trackingTask.taskId,
+        "email",
+        `Tracked ${submitted} verified submission(s), ${unverified} unverified outcome(s) and ${intervention} intervention(s); the consolidated report and outbox notification were recorded without claiming an employer response.`,
+        false,
+        { outputRefs: { submitted, unverified, intervention, failures: failures.length, warnings: warnings.length } },
+      );
+    }
     finishWorkflow(workflowId, runStatus === "failed" ? "failed" : "completed", finalReport.split("\n")[1] ?? "Daily recruitment run completed.");
     // A discovery-only run does not consume the daily schedule slot.
     if (!discoveryOnly && runRow.trigger !== "manual") {
@@ -1753,9 +2283,44 @@ export async function executeRun(
   }
 }
 
+/**
+ * Resume an interrupted/failed run through the same durable workflow. The
+ * caller does not need to know the failed stage: the checkpoint ledger decides
+ * what is reusable, and the package layer reuses a validated document package
+ * instead of creating a second one.
+ */
+export async function resumeRecruitmentRun(
+  runId: string,
+  options: {
+    userId?: string;
+    pageBudget?: number;
+    maxApplications?: number;
+    now?: Date;
+    deps?: RunDeps;
+    discoveryScope?: "full" | "incremental";
+    discoveryOnly?: boolean;
+  } = {},
+): Promise<RunOutcome> {
+  const runRow = runById(runId);
+  if (!runRow) throw new Error("Recruitment run not found.");
+  if (runtimeLockActive(`recruitment:run:${runId}`, options.now ?? new Date())) {
+    throw new Error("The run still has an active worker lease; it cannot be resumed concurrently.");
+  }
+  const plan = buildStagePlan({ runId, now: options.now });
+  pushState(
+    runId,
+    "starting",
+    plan.currentStage
+      ? `Restart resumed at persisted stage ${plan.currentStage}; completed outputs are reused.`
+      : "Restart resumed from persisted checkpoints; completed outputs are reused.",
+  );
+  return executeRun(runId, { ...options, resume: true });
+}
+
 type JobLiteForDocs = {
   title: string; company: string; url: string | null; application_url: string | null; description: string | null;
   source?: string | null; external_id?: string | null;
+  url_confidence?: string | null; employer_url?: string | null;
 };
 
 async function verifyVacancyForRun(
@@ -1767,6 +2332,16 @@ async function verifyVacancyForRun(
   if (!job) return null;
   if (dependencies.verifyVacancy) {
     const result = await dependencies.verifyVacancy(jobId);
+    // The injected verifier is used by fixtures and by the acceptance run; its
+    // verdict must still reach the row, otherwise the generation preflight sees
+    // the discovery default ("new") and skips a vacancy that was just verified.
+    if (result && (result.status === "open" || result.status === "closed")) {
+      run("UPDATE jobs SET vacancy_status = ?, vacancy_verified_at = ? WHERE id = ?", [
+        result.status,
+        now.toISOString(),
+        jobId,
+      ]);
+    }
     return result;
   }
   return verifyAndPersistVacancy(
@@ -1843,6 +2418,8 @@ async function submissionInputFor(
       company: job.company,
       url: job.url,
       application_url: job.application_url,
+      url_confidence: job.url_confidence ?? null,
+      employer_url: job.employer_url ?? null,
       description: job.description,
       source: job.source ?? null,
       external_id: job.external_id ?? null,
@@ -1985,7 +2562,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
         (failedSources.length > 0
           ? ` ${failedSources.length} source endpoint(s) failed: ${failedSources.map((check) => `${check.source_key} (${check.error ?? "unknown error"})`).join("; ")}.`
           : " No configured source failed.") +
-        " The 85% threshold and the freshness rule were not lowered, and no vacancy was invented."
+        " The 85% threshold was not lowered, publication age alone never rejects a listing, and no vacancy was invented."
       );
     }
     const ineligible = rejected.filter((job) => job.eligibility && job.eligibility !== "eligible").length;
@@ -1994,7 +2571,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
     return (
       `${jobs.length} vacancy(ies) assessed; ${ineligible} were ineligible and ${below} were eligible but below the ${qualifyingThreshold()}% threshold or failed a mandatory rule.` +
       (blockers.length ? ` Main reasons: ${blockers.join(" | ").replace(/\.$/, "")}.` : "") +
-      " The threshold and freshness rules were not lowered."
+      " The threshold was not lowered, and publication age alone does not reject an otherwise current vacancy."
     );
   };
 
@@ -2096,6 +2673,41 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   }
   lines.push("");
   lines.push("## 9. Agent failures and recovery actions");
+  const delegatedTasks = all<{
+    id: string;
+    agent_key: string;
+    title: string;
+    status: string;
+    error: string | null;
+    recovery_state: string | null;
+    error_class: string | null;
+    retry_count: number;
+  }>(
+    "SELECT id, agent_key, title, status, error, recovery_state, error_class, retry_count FROM tasks WHERE run_id = ? ORDER BY created_at",
+    [runId],
+  );
+  const participating = [...new Set(delegatedTasks.map((task) => task.agent_key))];
+  const notAssigned = ["coordinator", "research", "analysis", "cv", "ats", "cover", "application", "email"].filter(
+    (key) => !participating.includes(key),
+  );
+  const recoveringTasks = delegatedTasks.filter(
+    (task) => /retry|resum|recover/i.test(task.recovery_state ?? "") || task.status === "retry_scheduled",
+  );
+  lines.push(
+    `Delegated tasks: ${delegatedTasks.length}; completed ${delegatedTasks.filter((task) => task.status === "completed").length}; failed ${delegatedTasks.filter((task) => task.status === "failed").length}; recovering ${recoveringTasks.length}.`,
+  );
+  lines.push(`Participating agents: ${participating.length ? participating.join(", ") : "none"}.`);
+  lines.push(`Not assigned in this run: ${notAssigned.length ? notAssigned.join(", ") : "none"}.`);
+  lines.push(
+    `Applications: ${runRow.applications_submitted} submitted with employer evidence, ${runRow.applications_unverified} unverified, ${runRow.applications_intervention} requiring intervention.`,
+  );
+  if (recoveringTasks.length > 0) {
+    for (const task of recoveringTasks) {
+      lines.push(`- RECOVERY · ${task.agent_key} · ${task.title} · ${task.recovery_state ?? task.status} · retry ${task.retry_count}`);
+    }
+  } else {
+    lines.push("No task entered recovery in this run.");
+  }
   const problems = agents.filter((agent) => ["failed", "retried", "skipped"].includes(agent.status));
   if (problems.length === 0) lines.push("No agent failed or was skipped.");
   for (const agent of problems) lines.push(`- ${agent.agent_key} · ${agent.assignment} · ${agent.status} (attempt ${agent.attempt})${agent.error ? `: ${agent.error}` : ""}`);
@@ -2190,7 +2802,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   lines.push(`- Automatic submission: ${livePolicy.active ? "active" : livePolicy.activatedAt ? "paused or disabled" : "not activated — simulation only"}.`);
   lines.push(`- Minimum match: ${livePolicy.minMatchScore}% (floor enforced; never lowered by this run).`);
   lines.push(`- Daily cap: ${livePolicy.maxSubmissionsPerDay} verified submission(s); ${liveUsage.verified} used before this report, ${liveUsage.remaining} remaining today (${localDateKey(new Date())}, ${RECRUITMENT_TIMEZONE}).`);
-  lines.push(`- Freshness: ${livePolicy.freshnessDays} days; verified/open only; duplicate applications blocked; no per-application approval.`);
+  lines.push(`- Currentness: live vacancy verification required; publication age alone never rejects; duplicate applications blocked; no per-application approval.`);
   lines.push(`- Simulated packages: ${runRow.applications_simulated}; unverified: ${runRow.applications_unverified}; open questions: ${interventions.length}.`);
   if (schedule?.enabled === 1 && heartbeatAge !== null && heartbeatAge > 150) {
     lines.push(

@@ -12,6 +12,7 @@ import { UserAvatar } from "@/components/UserAvatar";
 import { MfaSettings } from "@/components/MfaSettings";
 import { avatarUrlFor } from "@/lib/account";
 import { updateAccountNameAction, uploadAccountAvatarAction, removeAccountAvatarAction } from "@/lib/actions/account";
+import { configuredTextProvider, providerStatusSnapshot } from "@/lib/providers";
 import {
   saveProfessionalPreferencesAction,
   saveAutomationAction,
@@ -43,7 +44,15 @@ export default async function SettingsPage({
   const profile = getProfileData();
   const settings = getSettings();
   const prefs = profile.preferences;
-  const ai = settings.ai ?? {};
+  const aiRoute = configuredTextProvider();
+  const aiRuntime = providerStatusSnapshot();
+  const fallbackLabel = !aiRuntime.fallbackEnabled
+    ? "not configured"
+    : aiRuntime.fallbackAvailable === true
+      ? "ready"
+      : aiRuntime.fallbackAvailable === false
+        ? "unavailable"
+        : "awaiting health check";
   const security = settings.security ?? { session_days: 7, remember_days: 30, max_login_attempts: 8 };
   const emailConfig = settings.email ?? { connected: false, provider: "gmail", sender: "", account: "" };
   const emailTest =
@@ -184,6 +193,26 @@ export default async function SettingsPage({
         </div>
       </section>
 
+      <section className="card mb-4" id="ai-routing">
+        <div className="card-head">
+          <div>
+            <h2>AI runtime</h2>
+            <p className="card-sub">Effective provider routing from the running server. Credentials are never shown.</p>
+          </div>
+          <span className={`badge ${aiRuntime.fallbackEnabled ? "badge-good" : "badge-neutral"}`}>
+            {fallbackLabel === "ready" ? "local fallback ready" : fallbackLabel}
+          </span>
+        </div>
+        <div className="card-body grid g2 text-[12px]" style={{ gap: 10 }}>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Primary text route</span><span>{aiRoute.provider ?? "none"} · <span className="num">{aiRoute.model ?? "not set"}</span></span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Local fallback</span><span>{aiRuntime.fallbackEnabled ? `loopback Ollama · ${aiRuntime.fallbackModel ?? "not set"}` : "disabled or not loopback"}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Fallback health</span><span>{fallbackLabel}</span></div>
+          <div className="between"><span style={{ color: "var(--muted)" }}>Fallback triggers</span><span>timeout, rate limit, unavailable model or provider outage</span></div>
+          <div className="between" style={{ gridColumn: "1 / -1" }}><span style={{ color: "var(--muted)" }}>Fail closed</span><span>authentication, malformed request and policy failures are never sent to another provider</span></div>
+          <p className="hint" style={{ gridColumn: "1 / -1" }}>{aiRoute.detail}</p>
+        </div>
+      </section>
+
       <section className="card mb-4" id="automation">
         <div className="card-head">
           <div>
@@ -203,7 +232,7 @@ export default async function SettingsPage({
             </div>
             <div>
               <label className="label" htmlFor="max_applications_per_day">Maximum applications per day</label>
-              <input id="max_applications_per_day" name="max_applications_per_day" type="number" min={1} max={10} className="input" defaultValue={settings.max_applications_per_day ?? 5} />
+              <input id="max_applications_per_day" name="max_applications_per_day" type="number" min={1} max={3} className="input" defaultValue={settings.max_applications_per_day ?? 3} />
             </div>
             <div>
               <label className="label" htmlFor="search_frequency">Search frequency</label>
@@ -220,7 +249,7 @@ export default async function SettingsPage({
             </label>
             <div className="alert alert-info" style={{ gridColumn: "1 / -1" }}>
               A candidate-facing form can be completed only when every answer is in your verified profile. CAPTCHAs, MFA, logins, payments and legal declarations are never
-              bypassed; an unknown essential answer queues the application. No application is counted as submitted without employer confirmation. AI provider: {ai.provider ?? "rules"} · {ai.model ?? "at-rules-v1"}.
+              bypassed; an unknown essential answer queues the application. No application is counted as submitted without employer confirmation. AI provider: {aiRoute.provider ?? "deterministic rules"} · {aiRoute.model ?? "rules"}.
             </div>
             <div className="flex items-end">
               <SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save automation</SubmitButton>
@@ -280,7 +309,7 @@ export default async function SettingsPage({
                 </div>
               </div>
               <p className="hint" data-testid="recruitment-next-run">
-                Main discovery at {recruitmentSchedule.slotTimes[0]}; incremental discovery at {recruitmentSchedule.incrementalTimes.join(", ")} {recruitmentSchedule.timezone}. Next run: {formatInZone(recruitmentSchedule.nextRunAt, recruitmentSchedule.timezone)} ({recruitmentSchedule.nextRunMode ?? "none"}). On unselected days no scheduled discovery, document generation or inference runs; manual requests still work.
+                One automated run per day at {recruitmentSchedule.time} {recruitmentSchedule.timezone} ({recruitmentSchedule.weekdayLabels.join(", ")}). Next run: {formatInZone(recruitmentSchedule.nextRunAt, recruitmentSchedule.timezone)}. On unselected days no scheduled discovery, document generation or inference runs; manual requests still work.
               </p>
               <div><SubmitButton className="btn btn-primary" pendingLabel="Saving…">Save recruitment schedule</SubmitButton></div>
             </div>

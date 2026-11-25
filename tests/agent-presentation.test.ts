@@ -54,6 +54,25 @@ test("availability distinguishes offline, degraded and unavailable", () => {
   );
 });
 
+test("restricted AI keeps the agent operational and labels the limitation", () => {
+  const view = agentPresentation({
+    enabled: true,
+    status: "idle",
+    currentTask: null,
+    availability: {
+      available: true,
+      restricted: true,
+      restriction: "ai_inference",
+      reason: "External AI is blocked by the CHF 0.00 policy.",
+      dependency: "AI inference",
+      cause: "configuration",
+    },
+  });
+  assert.equal(view.availability.state, "degraded");
+  assert.match(view.availability.label, /Operational · AI restricted/);
+  assert.equal(view.task.state, "idle");
+});
+
 test("active task states remain distinct from availability", () => {
   assert.equal(agentPresentation({ enabled: true, status: "working", currentTask: "Scoring", availability: available }).task.state, "running");
   assert.equal(agentPresentation({ enabled: true, status: "thinking", currentTask: "Scoring", availability: available }).task.state, "thinking");

@@ -37,6 +37,13 @@ test("deterministic work is visibly distinguishable from model work", () => {
   const failed = taskExecutionMeta({ execution_mode: "ai", ai_outcome: "failed" });
   assert.equal(failed.aiFailed, true);
   assert.match(failed.label, /AI failed/);
+
+  const blocked = taskExecutionMeta({ execution_mode: "ai", ai_outcome: "blocked" });
+  assert.equal(blocked.aiBacked, false);
+  assert.equal(blocked.aiFailed, false);
+  assert.equal(blocked.aiBlocked, true);
+  assert.match(blocked.label, /AI blocked/);
+  assert.match(blocked.detail, /before transmission/);
 });
 
 test("a completed agent task never implies a submitted application", () => {

@@ -1,4 +1,10 @@
 import type { ProfileData } from "./profile";
+import {
+  analyseVacancyGermanRequirement,
+  MANDATORY_GERMAN_REQUIREMENT,
+  type GermanRequirementAssessment,
+  type GermanRequirementStatus,
+} from "./language-requirements";
 
 /**
  * Deterministic eligibility rules for a vacancy.
@@ -16,6 +22,11 @@ export type EligibilityAssessment = {
   swissResidency: "yes" | "no" | "unclear";
   sponsorshipRequired: "no" | "yes" | "unclear";
   germanRequired: boolean;
+  /** resolved German requirement, including its evidence */
+  germanStatus: GermanRequirementStatus;
+  germanEvidence: string[];
+  germanLevel: string | null;
+  germanReasonCode: string | null;
   frenchRequired: boolean;
   applicationOpen: boolean;
   reasons: string[];
@@ -36,18 +47,31 @@ export type EligibilityJob = {
   url?: string | null;
   published_at?: string | null;
   employment_type?: string | null;
+  /** Persisted discovery evidence, including structured source languages. */
+  german_requirement?: string | null;
+  language_evidence?: string | null;
 };
 
-const SWISS = /(switzerland|schweiz|suisse|svizzera|swiss|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.?\s*gallen|lugano|fribourg|vaud|ticino|neuch|bienne|olten|aarau|schaffhausen|sion|chur)/i;
+const SWISS =
+  /(switzerland|schweiz|suisse|svizzera|swiss|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.?\s*gallen|lugano|fribourg|vaud|ticino|neuch|bienne|biel|thun|olten|aarau|schaffhausen|sion|chur|emmen|bonaduz|altdorf|nidau|sarnen|bellach|puidoux|burgdorf|d[üu]bendorf|manno|reinach|d[äa]llikon|kreuzlingen|moosseedorf|zollikofen|wohlen)/i;
 // "Remote" on its own is not residency eligibility: a posting must explicitly
 // accept Europe/EEA/global applicants, which is the distinction the brief calls out.
 const EUROPE_OPEN = /\b(eu\/efta|european union|europe|eea|emea|dach|worldwide|anywhere|global(?:ly)?|international)\b/i;
+const REGION_SCOPE = /\b(switzerland|swiss|europe|european union|eu|eea|emea|dach|worldwide|anywhere|global(?:ly)?)\b/i;
+// Only an explicit remote/work-from statement tied to a region proves that a
+// vacancy is open to Swiss-based applicants. A marketing line such as "100
+// million downloads worldwide" is not residency evidence.
+const REMOTE_SCOPE =
+  /\b(?:remote|work from home|home[- ]office|telecommut\w*|distributed)\b[^.\n]{0,90}\b(?:switzerland|swiss|europe|european union|eu|eea|emea|dach|worldwide|anywhere|global(?:ly)?)\b|\b(?:open|available|eligible|accepts?)\b[^.\n]{0,80}\b(?:candidates?|applicants?|residents?)?\b[^.\n]{0,40}\b(?:switzerland|swiss|europe|european union|eu|eea|emea|dach)\b/i;
+const FOREIGN_ONSITE =
+  /\b(?:fully onsite|fully on-site|fully office|office[- ]based|based at our office|work from (?:our|the) office)\b/i;
+const FOREIGN_ONSITE_CITY =
+  /\b(?:fully onsite|fully on-site|fully office|office[- ]based|based at our office|work from (?:our|the) office)\b[^.\n]{0,100}\b(?:in|at)\s+(?:our\s+)?(?:office\s+in\s+)?(?:lisbon|berlin|london|paris|madrid|rome|dublin|barcelona|amsterdam|copenhagen|stockholm|munich|san francisco|new york|boston|austin|toronto|warsaw|krakow|prague|budapest|bucharest|sofia|athens|milan|brussels|vienna)\b/i;
 const SWISS_RESIDENTS = /\b(swiss (?:residents?|based|candidates?)|residents? of switzerland|based in switzerland|switzerland[- ]based|eligible to work in switzerland)\b/i;
 const CITIZENSHIP_ONLY = /\b(swiss (?:or eu|or eea) (?:citizens?|nationals?)|eu\/efta (?:citizens?|nationals?)|citizenship (?:is )?required|passport (?:is )?required|only (?:swiss|eu) (?:citizens?|nationals?))\b/i;
 const NO_SPONSORSHIP = /\b(no (?:visa )?sponsorship|without (?:visa )?sponsorship|sponsorship (?:is )?not (?:available|offered)|cannot sponsor|unable to sponsor)\b/i;
 const RESTRICTED_COUNTRY =
   /\b(?:(?:must|need to|required to) (?:be )?(?:based|reside|live|located) in|(?:restricted|limited|open only) to (?:candidates|applicants|residents)?\s*(?:based |residing |living )?in) ([a-z ,/&-]{3,60})\b/i;
-const GERMAN_LANGUAGE = /\b(german|deutsch)\b/i;
 const FRENCH_LANGUAGE = /\b(french|français|francais)\b/i;
 const REQUIRED_SIGNAL =
   /\b(fluent|fluency|fließend|fliessend|native|mother tongue|muttersprache|required|mandatory|must|zwingend|minimum|ideally|[abc][12])\b/i;
@@ -103,15 +127,24 @@ export function assessEligibility(job: EligibilityJob, profile: ProfileData, now
   // employer's marketing copy (e.g. "live in 38 markets including Switzerland").
   // The description is only used when the posting states no usable location.
   const locationStated = Boolean(job.location && !/^\s*(not specified|unknown|n\/a)\s*$/i.test(job.location));
-  if (SWISS.test(locationText) || (!remote && !locationStated && swissInDescription)) {
+  const explicitForeignOnsite =
+    FOREIGN_ONSITE.test(description) &&
+    (FOREIGN_ONSITE_CITY.test(description) || (locationStated && !SWISS.test(locationText)));
+  if (explicitForeignOnsite) {
+    swissResidency = "no";
+    reasons.push(
+      "The description says the work is onsite outside Switzerland; a remote flag or a different location label does not override that evidence.",
+    );
+    blockers.push("The posting describes an on-site role outside Switzerland.");
+  } else if (SWISS.test(locationText) || (!remote && !locationStated && swissInDescription)) {
     swissResidency = "yes";
     reasons.push(`Location evidence: ${job.location || "Swiss posting"}.`);
   } else if (remote && explicitlySwissResidents) {
     swissResidency = "yes";
     reasons.push("Remote posting explicitly accepts Swiss residents.");
-  } else if (remote && EUROPE_OPEN.test(combined)) {
+  } else if (remote && (REGION_SCOPE.test(locationText) || REMOTE_SCOPE.test(description))) {
     swissResidency = "yes";
-    reasons.push("Remote posting is open to Europe/EEA/global applicants, which includes Switzerland.");
+    reasons.push("Remote posting explicitly includes Switzerland, Europe, EMEA/DACH or a global work scope.");
   } else if (remote) {
     const restriction = combined.match(RESTRICTED_COUNTRY);
     if (restriction) {
@@ -148,16 +181,30 @@ export function assessEligibility(job: EligibilityJob, profile: ProfileData, now
     blockers.push("The professional profile does not record Swiss work authorisation.");
   }
 
-  // 4. Languages. German is excluded unless the employer marks it optional;
-  //    French at B2 and above is acceptable.
-  const german = languageMandatory(combined, GERMAN_LANGUAGE);
+  // 4. Languages. There is no acceptable German level: any mandatory German
+  //    mention disqualifies the vacancy, independent of the profile. A bare or
+  //    soft German mention is unresolved, so it is never auto-submitted.
+  const detected = analyseVacancyGermanRequirement(job.title, job.description);
+  const storedGerman = job.german_requirement === "required";
+  const german: GermanRequirementAssessment =
+    storedGerman && detected.status !== "required"
+      ? {
+          ...detected,
+          status: "required",
+          detail: "A persisted discovery record marks German as mandatory.",
+          evidence: detected.evidence.length > 0 ? detected.evidence : ["Persisted discovery language evidence: German required."],
+          reasonCode: MANDATORY_GERMAN_REQUIREMENT,
+        }
+      : detected;
   const french = languageMandatory(combined, FRENCH_LANGUAGE);
   const frenchLevel = profile.languageEntries.find((entry) => /french|français|francais/i.test(entry.name))?.level ?? null;
   const frenchOk = frenchLevel ? /^(b2|c1|c2|native|fluent)$/i.test(frenchLevel) : false;
-  if (german.required) {
-    blockers.push(`German${german.level ? ` ${german.level}` : ""} is mandatory and is not among the verified languages.`);
-  } else if (GERMAN_LANGUAGE.test(combined)) {
-    reasons.push("German is mentioned but not as a mandatory requirement.");
+  if (german.status === "required") {
+    blockers.push(`${MANDATORY_GERMAN_REQUIREMENT}: ${german.detail}`);
+  } else if (german.status === "ambiguous" || german.status === "unknown") {
+    reasons.push(german.detail);
+  } else if (german.status === "optional") {
+    reasons.push(german.detail);
   }
   if (french.required && !frenchOk) {
     blockers.push(`French${french.level ? ` ${french.level}` : ""} is required but the profile does not evidence B2 or higher.`);
@@ -187,14 +234,25 @@ export function assessEligibility(job: EligibilityJob, profile: ProfileData, now
   const hardBlockers = blockers.filter((blocker) => !/^The professional profile does not record Swiss work authorisation/.test(blocker));
   let status: EligibilityStatus;
   if (hardBlockers.length > 0) status = "ineligible";
-  else if (swissResidency === "unclear" || !applicationUrl || !applicationOpen) status = "needs_review";
-  else status = "eligible";
+  else if (
+    german.status === "ambiguous" ||
+    german.status === "unknown" ||
+    swissResidency === "unclear" ||
+    !applicationUrl ||
+    !applicationOpen
+  ) {
+    status = "needs_review";
+  } else status = "eligible";
 
   return {
     status,
     swissResidency,
     sponsorshipRequired,
-    germanRequired: german.required,
+    germanRequired: german.status === "required",
+    germanStatus: german.status,
+    germanEvidence: german.evidence,
+    germanLevel: german.level,
+    germanReasonCode: german.reasonCode,
     frenchRequired: french.required,
     applicationOpen,
     reasons,
@@ -202,13 +260,16 @@ export function assessEligibility(job: EligibilityJob, profile: ProfileData, now
     workAuthorisationNote: permitEvidenced
       ? `Swiss Permit B${permitValidUntil ? ` (valid until ${permitValidUntil})` : ""}; no employer sponsorship required.`
       : "Work authorisation is not recorded in the verified profile.",
-    languagesNote: german.required
-      ? "German is mandatory."
-      : french.required
-        ? `French is required${frenchLevel ? `; profile level ${frenchLevel}` : ""}.`
-        : "No mandatory German or French requirement detected.",
+    languagesNote:
+      german.status === "required"
+        ? "German is mandatory; the vacancy is ineligible."
+        : german.status === "ambiguous" || german.status === "unknown"
+          ? "The German requirement is unresolved; automatic submission is blocked."
+          : french.required
+            ? `French is required${frenchLevel ? `; profile level ${frenchLevel}` : ""}.`
+            : "No mandatory German or French requirement detected.",
     checkedAt: now.toISOString(),
-    engine: "eligibility-rules-v1",
+    engine: "eligibility-rules-v2",
   };
 }
 

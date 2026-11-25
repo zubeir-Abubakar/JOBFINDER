@@ -55,6 +55,7 @@ export function AppShell({
 }) {
   const pathname = usePathname();
   const [open, setOpen] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
   const nav = variant === "admin" ? adminNav : ownerNav;
   const home = variant === "admin" ? "/admin" : "/dashboard";
   const navActive = (href: string) =>
@@ -64,6 +65,24 @@ export function AppShell({
   useEffect(() => {
     setOpen(false);
   }, [pathname]);
+
+  // Restore the operator's sidebar preference after mount so server and client
+  // markup stay identical. Storage failures leave the expanded sidebar usable.
+  useEffect(() => {
+    try {
+      setCollapsed(window.localStorage.getItem("atw:sidebar-collapsed") === "1");
+    } catch {}
+  }, []);
+
+  function toggleSidebar() {
+    setCollapsed((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem("atw:sidebar-collapsed", next ? "1" : "0");
+      } catch {}
+      return next;
+    });
+  }
 
   useEffect(() => {
     if (!open) return;
@@ -79,7 +98,7 @@ export function AppShell({
   }, [open]);
 
   return (
-    <div className="shell">
+    <div className={`shell ${collapsed ? "sidebar-collapsed" : ""}`}>
       {open ? (
         <button
           aria-label="Close navigation"
@@ -90,11 +109,25 @@ export function AppShell({
       <aside id="app-navigation" className={`sidebar ${open ? "open" : ""}`}>
         <div className="sidebar-brand-row">
           <Brand href={home} />
-          <div className="sidebar-brand-actions mobile-only">
-            <ThemeToggle compact />
-            <button type="button" className="drawer-close" onClick={() => setOpen(false)} aria-label="Close navigation">
-              ✕
+          <div className="sidebar-brand-actions">
+            <button
+              type="button"
+              className="sidebar-collapse-toggle"
+              onClick={toggleSidebar}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+              aria-expanded={!collapsed}
+              title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <span className={`sidebar-collapse-glyph ${collapsed ? "is-collapsed" : ""}`}>
+                <Icon name="chevron" size={15} />
+              </span>
             </button>
+            <span className="mobile-only sidebar-mobile-actions">
+              <ThemeToggle compact />
+              <button type="button" className="drawer-close" onClick={() => setOpen(false)} aria-label="Close navigation">
+                ✕
+              </button>
+            </span>
           </div>
         </div>
         <nav aria-label="Primary navigation" className="flex flex-col gap-0.5 overflow-y-auto">
@@ -110,15 +143,16 @@ export function AppShell({
                 onClick={() => setOpen(false)}
                 className={`nav-link ${navActive(item.href) ? "active" : ""}`}
                 aria-current={navActive(item.href) ? "page" : undefined}
+                title={item.label}
               >
                 <Icon name={item.icon!} />
-                {item.label}
+                <span className="nav-label">{item.label}</span>
               </Link>
             ),
           )}
           {variant === "app" && user.role === "admin" ? (
-            <Link href="/admin" className={`nav-link ${pathname.startsWith("/admin") ? "active" : ""}`} onClick={() => setOpen(false)} aria-current={pathname.startsWith("/admin") ? "page" : undefined}>
-              <Icon name="admin" /> Admin console
+            <Link href="/admin" className={`nav-link ${pathname.startsWith("/admin") ? "active" : ""}`} onClick={() => setOpen(false)} aria-current={pathname.startsWith("/admin") ? "page" : undefined} title="Admin console">
+              <Icon name="admin" /> <span className="nav-label">Admin console</span>
             </Link>
           ) : null}
         </nav>
@@ -126,7 +160,7 @@ export function AppShell({
           <div className="card-quiet p-3">
             <div className="flex items-center gap-2">
               <UserAvatar name={user.name} src={user.avatarUrl} size={30} />
-              <div className="min-w-0">
+              <div className="min-w-0 sidebar-profile-copy">
                 <div className="truncate text-[12.5px] font-semibold">{user.name}</div>
                 <div className="truncate text-[11px]" style={{ color: "var(--muted)" }}>
                   {user.role === "admin" ? "Administrator" : "Account owner"}
@@ -134,12 +168,12 @@ export function AppShell({
               </div>
             </div>
             <form action={logoutAction} className="mt-2.5">
-              <button type="submit" className="btn btn-sm w-full justify-start">
-                <Icon name="logout" /> Sign out
+              <button type="submit" className="btn btn-sm w-full justify-start" title="Sign out">
+                <Icon name="logout" /> <span className="nav-label">Sign out</span>
               </button>
             </form>
           </div>
-          <p className="mt-3 px-1 text-[10.5px] leading-relaxed" style={{ color: "var(--muted)" }}>
+          <p className="mt-3 px-1 text-[10.5px] leading-relaxed sidebar-foot" style={{ color: "var(--muted)" }}>
             {variant === "admin" ? "Restricted console — admin role only." : "Private workspace. CV data never goes public."}
           </p>
         </div>

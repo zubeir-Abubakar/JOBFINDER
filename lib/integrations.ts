@@ -136,7 +136,8 @@ function candidateFormView(): IntegrationView {
       },
     ],
     capabilities: [
-      "Normal candidate forms only",
+      "Server-rendered and JavaScript-rendered candidate forms",
+      "Local Playwright fallback for dynamic forms",
       "Verified-profile answers and uploaded CV/cover letter",
       "Unknown consequential questions queue for human input",
     ],
@@ -144,7 +145,7 @@ function candidateFormView(): IntegrationView {
     lastSuccessAt: current?.status === "success" ? current.checkedAt : null,
     operational: false,
     operationalDetail: enabled
-      ? "Implemented and mock-tested only. It is not marked operational until a permitted live form returns employer evidence."
+      ? "Implemented and proven with controlled local ATS fixtures, including JavaScript-rendered forms. It is not marked operational until a permitted live form returns employer evidence."
       : "Disabled by RECRUITMENT_CANDIDATE_FORMS=false.",
     missing: enabled ? ["No live end-to-end submission has been verified in this deployment."] : ["The candidate-form adapter is disabled."],
     testable: false,

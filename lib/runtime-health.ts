@@ -7,8 +7,10 @@ import {
   runtimeInstanceId,
   runtimeLockSnapshot,
   runtimeWorkerSnapshot,
+  WORKER_STALE_AFTER_MS,
   type RuntimeWorkerView,
 } from "./runtime-state";
+import { executiveBriefScheduleSnapshot } from "./executive-brief";
 import { notificationQueueSnapshot } from "./notify";
 import { recoverySnapshot } from "./recruitment-recovery";
 import { aiQueueSnapshot } from "./ai-queue";
@@ -37,6 +39,10 @@ export type RuntimeHealth = {
     lastTickAt: string | null;
     worker: RuntimeWorkerView | null;
     lock: ReturnType<typeof runtimeLockSnapshot>[number] | null;
+  };
+  executiveBrief: ReturnType<typeof executiveBriefScheduleSnapshot> & {
+    heartbeatAgeSeconds: number | null;
+    stale: boolean;
   };
   workers: RuntimeWorkerView[];
   locks: ReturnType<typeof runtimeLockSnapshot>;
@@ -108,6 +114,16 @@ export function operationalHealthSnapshot(now: Date = new Date()): RuntimeHealth
   }
 
   const scheduler = scheduleSnapshot(now);
+  const executiveBriefSnapshot = executiveBriefScheduleSnapshot(now);
+  const briefCheckedAt = Date.parse(executiveBriefSnapshot.last_checked_at ?? "");
+  const executiveBriefAgeSeconds = Number.isFinite(briefCheckedAt)
+    ? Math.max(0, Math.round((now.getTime() - briefCheckedAt) / 1000))
+    : null;
+  const executiveBrief = {
+    ...executiveBriefSnapshot,
+    heartbeatAgeSeconds: executiveBriefAgeSeconds,
+    stale: executiveBriefAgeSeconds === null || executiveBriefAgeSeconds * 1000 > WORKER_STALE_AFTER_MS,
+  };
   const workers = runtimeWorkerSnapshot(now);
   const locks = runtimeLockSnapshot(now);
   const schedulerWorker = workers.find((worker) => worker.name === "recruitment_scheduler") ?? null;
@@ -155,9 +171,44 @@ export function operationalHealthSnapshot(now: Date = new Date()): RuntimeHealth
         ? `Uploads directory mode ${uploadMode} is accessible outside the service user. Expected 0700.`
         : null;
 
+  // A queue worker is required only when its durable queue has work waiting.
+  // An idle queue is allowed to be dormant: its enqueue path starts it again.
+  // This keeps an empty advisory queue or an empty outbox from presenting the
+  // whole deterministic application as degraded.
+  const queueWork: Record<string, number> = {
+    ai_queue:
+      Number(ai.counts.queued ?? 0) +
+      Number(ai.counts.processing ?? 0) +
+      Number(ai.counts.rate_limited ?? 0),
+    document_recovery:
+      Number(recovery.counts.pending ?? 0) +
+      Number(recovery.counts.processing ?? 0) +
+      Number(recovery.counts.retry_scheduled ?? 0),
+    notification_outbox:
+      Number(notifications.counts.pending ?? 0) +
+      Number(notifications.counts.sending ?? 0) +
+      Number(notifications.counts.retry_scheduled ?? 0),
+  };
+  const queueWorkerProblem = Object.entries(queueWork).some(([name, pending]) => {
+    if (pending <= 0) return false;
+    const worker = workers.find((candidate) => candidate.name === name);
+    return !worker || worker.effectiveStatus !== "running";
+  });
+  const dormantWorkers = workers.filter(
+    (worker) =>
+      worker.name !== "temp_cleanup" &&
+      worker.name !== "recruitment_scheduler" &&
+      worker.effectiveStatus !== "running" &&
+      Number(queueWork[worker.name] ?? 0) === 0,
+  );
+  const executiveBriefProblem =
+    executiveBrief.enabled === 1 &&
+    executiveBrief.due &&
+    schedulerWorker?.effectiveStatus !== "running";
   const workerProblem =
-    workers.some((worker) => worker.name !== "temp_cleanup" && worker.effectiveStatus !== "running") ||
-    (scheduler.enabled && schedulerWorker?.effectiveStatus !== "running");
+    (scheduler.enabled && schedulerWorker?.effectiveStatus !== "running") ||
+    executiveBriefProblem ||
+    queueWorkerProblem;
   const status: RuntimeHealth["status"] = !ok
     ? "down"
     : workerProblem || permissionWarning
@@ -166,8 +217,12 @@ export function operationalHealthSnapshot(now: Date = new Date()): RuntimeHealth
   const detail = !ok
     ? `SQLite health check returned ${integrity}.`
     : workerProblem
-      ? "One or more background workers are stopped or stale; inspect the worker list."
-      : permissionWarning ?? "Database, scheduler and background workers are healthy.";
+      ? "A required background worker is stopped or stale; inspect the worker list."
+      : permissionWarning
+        ? permissionWarning
+        : dormantWorkers.length > 0
+          ? `Scheduler and required workers are running. Idle queue workers are dormant with no pending work: ${dormantWorkers.map((worker) => `${worker.name} (${worker.effectiveStatus})`).join(", ")}. Idle queues do not degrade deterministic operations.`
+          : "Database, scheduler and background workers are healthy.";
 
   return {
     checkedAt,
@@ -188,6 +243,7 @@ export function operationalHealthSnapshot(now: Date = new Date()): RuntimeHealth
       worker: schedulerWorker,
       lock: schedulerLock,
     },
+    executiveBrief,
     workers,
     locks,
     instanceId: runtimeInstanceId(),

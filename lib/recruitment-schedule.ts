@@ -4,19 +4,23 @@ import { nowIso, one, run } from "./db";
  * Persistent weekly schedules for autonomous recruitment and the daily report.
  *
  * The clock is the wall clock in Europe/Zurich, not UTC and not the host's
- * timezone, so a 09:00 run stays at 09:00 local time across the CET/CEST
+ * timezone, so the 12:00 run stays at 12:00 local time across the CET/CEST
  * switch. State lives in SQLite (`schedule_jobs`), so a restart cannot forget
  * the next execution; an in-memory timer only decides when to ask the database
  * again.
+ *
+ * Exactly one automated recruitment run is scheduled per calendar day. The
+ * former +2/+4/+6/+8/+10 h incremental discoveries are retired.
  *
  * Weekdays use ISO numbering (1 = Monday … 7 = Sunday). Configured weekdays are
  * persisted as JSON so they can be changed without a code change.
  */
 
 export const RECRUITMENT_TIMEZONE = "Europe/Zurich";
-export const RECRUITMENT_TIME = "10:00";
-export const RECRUITMENT_WEEKDAYS = [1, 2, 3, 4, 5, 6];
-export const INCREMENTAL_DISCOVERY_OFFSET_HOURS = [2, 4, 6, 8, 10] as const;
+/** The single daily automated run: 12:00 noon local time. */
+export const RECRUITMENT_TIME = "12:00";
+/** Monday–Sunday: one run every calendar day. */
+export const RECRUITMENT_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7];
 export const RECRUITMENT_SCHEDULE_KEY = "daily_recruitment";
 export const REPORT_TIME = "16:00";
 export const REPORT_WEEKDAYS = [1, 2, 3, 4, 5];
@@ -266,24 +270,16 @@ export function nextDailyRun(now: Date, options: { time?: string; timeZone?: str
 }
 
 /**
- * The main discovery is the configured start time. Five incremental
- * discoveries follow at +2h, +4h, +6h, +8h and +10h. With the required 10:00
- * start this is exactly 12:00, 14:00, 16:00, 18:00 and 20:00. Times that would
- * cross local midnight are omitted rather than silently moving to another day.
+ * Exactly one automated run per calendar day: the configured start time.
+ * There are no incremental follow-up slots, so no day can contain more than
+ * this single full discovery.
  */
 export function recruitmentRunTimes(mainTime = RECRUITMENT_TIME): Array<{ time: string; mode: RecruitmentRunMode }> {
   const main = parseClockTime(mainTime);
-  const slots: Array<{ time: string; mode: RecruitmentRunMode }> = [];
-  for (const [index, offset] of [0, ...INCREMENTAL_DISCOVERY_OFFSET_HOURS].entries()) {
-    const totalMinutes = main.hour * 60 + main.minute + offset * 60;
-    if (totalMinutes >= 24 * 60) continue;
-    const time = `${String(Math.floor(totalMinutes / 60)).padStart(2, "0")}:${String(totalMinutes % 60).padStart(2, "0")}`;
-    slots.push({ time, mode: index === 0 ? "full" : "incremental" });
-  }
-  return slots;
+  return [{ time: `${String(main.hour).padStart(2, "0")}:${String(main.minute).padStart(2, "0")}`, mode: "full" }];
 }
 
-/** Next main or incremental occurrence, strictly after `now`. */
+/** The next daily occurrence, strictly after `now`. */
 export function nextRecruitmentOccurrence(
   now: Date,
   options: { time?: string; timeZone?: string; weekdays?: number[] } = {},
@@ -339,7 +335,40 @@ function nextRunFor(row: Pick<ScheduleRow, "time" | "timezone" | "weekdays">, no
   return nextScheduledRun(now, { time: row.time, timeZone: row.timezone, weekdays }).toISOString();
 }
 
+/**
+ * One-time correction of the legacy 10:00 Monday–Saturday row to the permanent
+ * single-daily-run configuration: 12:00 Europe/Zurich, every calendar day.
+ *
+ * The match is deliberately narrow (the exact legacy clock and weekday set), so
+ * the correction is idempotent and can never overwrite a clock the owner edits
+ * afterwards. Only the `daily_recruitment` row is touched; run history, the
+ * report schedule and every other table are left alone.
+ */
+function enforceSingleDailySchedule(now: Date): void {
+  const existing = readRow(RECRUITMENT_SCHEDULE_KEY);
+  if (!existing) return;
+  const legacyClock = existing.time === "10:00" && existing.timezone === RECRUITMENT_TIMEZONE;
+  const legacyDays = parseWeekdays(existing.weekdays).join(",") === "1,2,3,4,5,6";
+  if (legacyClock && legacyDays) {
+    const next = nextRecruitmentOccurrence(now, { time: RECRUITMENT_TIME, weekdays: RECRUITMENT_WEEKDAYS });
+    run(
+      "UPDATE schedule_jobs SET time = ?, timezone = ?, weekdays = ?, next_run_at = ?, updated_at = ? WHERE key = ?",
+      [RECRUITMENT_TIME, RECRUITMENT_TIMEZONE, JSON.stringify(RECRUITMENT_WEEKDAYS), next.scheduledFor, nowIso(), RECRUITMENT_SCHEDULE_KEY],
+    );
+    return;
+  }
+  // Repair a missing next occurrence without changing the owner's clock.
+  if (existing.enabled === 1 && !existing.next_run_at) {
+    run("UPDATE schedule_jobs SET next_run_at = ?, updated_at = ? WHERE key = ?", [
+      nextRunFor(existing, now, RECRUITMENT_SCHEDULE_KEY),
+      nowIso(),
+      RECRUITMENT_SCHEDULE_KEY,
+    ]);
+  }
+}
+
 export function ensureSchedule(now: Date = new Date()): ScheduleRow {
+  enforceSingleDailySchedule(now);
   const existing = readRow(RECRUITMENT_SCHEDULE_KEY);
   if (existing) return existing;
   const next = nextRecruitmentOccurrence(now, { time: RECRUITMENT_TIME, weekdays: RECRUITMENT_WEEKDAYS });
@@ -494,8 +523,9 @@ export type ScheduleSnapshot = {
   weekdays: number[];
   weekdayLabels: string[];
   runsToday: boolean;
-  /** Main run followed by the persisted incremental slots. */
+  /** The single daily run time. */
   slotTimes: string[];
+  /** Always empty: incremental slots are retired. Kept for snapshot consumers. */
   incrementalTimes: string[];
   nextRunAt: string | null;
   nextRunMode: RecruitmentRunMode | null;

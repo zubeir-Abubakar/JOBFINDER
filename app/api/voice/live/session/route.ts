@@ -69,7 +69,11 @@ export async function POST(request: Request) {
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Live voice could not start.";
-    return Response.json({ error: message, code: "LIVE_UNAVAILABLE" }, { status: 502 });
+    const blocked = /zero-spend|blocked/i.test(message);
+    return Response.json(
+      { error: message, code: blocked ? "LIVE_BLOCKED_BY_POLICY" : "LIVE_UNAVAILABLE", fallback: "text" },
+      { status: blocked ? 503 : 502 },
+    );
   }
 }
 
@@ -78,12 +82,18 @@ export async function GET() {
   const user = await currentUser();
   if (!user) return Response.json({ error: "Unauthorised" }, { status: 401 });
   const config = liveVoiceConfig();
+  const coordinator = effectiveVoiceProfileForAgent("coordinator");
   return Response.json(
     {
       configured: config.configured,
+      blockedByPolicy: config.blockedByPolicy,
+      freeTierState: config.freeTierState,
+      freeTierDetail: config.freeTierDetail,
+      paidFallback: "never",
+      chiefVoice: { agentKey: "coordinator", voiceId: coordinator.voiceId, voiceName: coordinator.voiceName },
       missing: config.missing,
       model: config.model,
-      voice: effectiveVoiceProfileForAgent("coordinator").voiceName,
+      voice: coordinator.voiceName,
       voices: ["coordinator", "research", "analysis", "cv", "ats", "cover", "application", "email"].map((key) => {
         const profile = effectiveVoiceProfileForAgent(key);
         return { agentKey: key, voiceId: profile.voiceId, voiceName: profile.voiceName };

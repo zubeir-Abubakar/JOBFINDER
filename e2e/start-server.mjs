@@ -208,7 +208,7 @@ const child = spawn(process.execPath, [nextBin, "start", "-H", "127.0.0.1", "-p"
     FREELLMAPI_ALLOWED_MODELS: "e2e-model",
     OLLAMA_ENABLED: "false",
     OPENROUTER_ENABLED: "false",
-    AI_PRIMARY_PROVIDER: "freellmapi",
+    AI_PRIMARY_PROVIDER: process.env.E2E_AI_PRIMARY_PROVIDER ?? "freellmapi",
     // Synthetic OAuth configuration exercises status/redaction without ever
     // contacting Google. The value is asserted absent from rendered pages.
     GOOGLE_CLIENT_ID: "e2e-google-client.apps.googleusercontent.com",

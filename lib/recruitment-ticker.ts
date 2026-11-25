@@ -21,8 +21,9 @@ import { recoverStalledTasks } from "./task-recovery";
  * route, so the same rules apply locally and in a future hosted deployment.
  *
  * - the persisted weekday set decides whether today is an active day,
- * - one durable run per main/incremental occurrence (unique run key),
- * - catch-up inside the configured window,
+ * - exactly one durable run per calendar day: the single 12:00 occurrence
+ *   (unique run key `#full-1200`), with no incremental follow-ups,
+ * - catch-up is limited to that one occurrence inside the configured window,
  * - an explicit "missed" record once that window has passed, never a silent skip,
  * - never two runs at once,
  * - a rest day performs no discovery, no model call and no token spend.
@@ -168,6 +169,8 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
       const missedId = `run_${randomId()}`;
       const reason = `The scheduled run at ${formatInZone(scheduledAt)} was missed by more than ${catchUpWindowHours()} hour(s). The host or application was not running. It was not silently executed late.`;
       const missedScope = snapshot.nextRunMode ?? "full";
+      // One slot per day means this can only ever record the single missed
+      // occurrence; recordScheduleRun below rolls next_run_at to tomorrow.
       run(
         `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, failures, warnings, error, report, created_at, finished_at, discovery_scope)
          VALUES (?, ?, ?, 'catch_up', 'failed', ?, 0, 0, ?, ?, ?, ?, ?)`,

@@ -110,7 +110,7 @@ function hasValidatedCv(jobId: string): boolean {
     one<{ id: string }>(
       `SELECT id FROM documents
        WHERE job_id = ? AND kind = 'tailored_cv' AND mime = 'application/pdf'
-         AND deleted_at IS NULL AND quality_status = 'passed'
+         AND deleted_at IS NULL AND quality_status = 'passed' AND size_bytes > 0
        ORDER BY created_at DESC LIMIT 1`,
       [jobId],
     ),
@@ -130,23 +130,77 @@ function ownerId(): string {
   return one<{ id: string }>("SELECT id FROM users ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, created_at LIMIT 1")?.id ?? "";
 }
 
-function completeRecovery(row: RecoveryRow, pkg: PackageOutcome): void {
-  const at = nowIso();
-  run("UPDATE recruitment_recovery SET status = 'completed', finished_at = ?, last_error = NULL WHERE id = ?", [at, row.id]);
-  if (row.job_id) run("UPDATE jobs SET document_state = 'prepared' WHERE id = ?", [row.job_id]);
-  if (pkg.applicationId) {
-    run("UPDATE applications SET run_id = ?, status = 'quality_check', last_update = ? WHERE id = ?", [row.run_id, at, pkg.applicationId]);
-    run("UPDATE documents SET run_id = ? WHERE job_id = ? AND deleted_at IS NULL AND kind IN ('tailored_cv','cover_letter')", [row.run_id, row.job_id]);
+type ValidatedRecoveryPackage = { applicationId: string; cvDocumentId: string; coverDocumentId: string };
+
+/** Do not complete a recovery on a package that is not actually linked and validated. */
+function validateRecoveredPackage(pkg: PackageOutcome): ValidatedRecoveryPackage {
+  if (!pkg.ok || !pkg.applicationId) {
+    throw new Error("Document retry did not produce a linked application package.");
   }
+  const app = one<{
+    id: string;
+    status: string;
+    cv_document_id: string | null;
+    cover_letter_id: string | null;
+  }>("SELECT id, status, cv_document_id, cover_letter_id FROM applications WHERE id = ?", [pkg.applicationId]);
+  if (!app) throw new Error("Document retry returned an application that does not exist.");
+  if (["submitted", "acknowledged", "interview_invited", "interview_completed", "offer_received"].includes(app.status)) {
+    throw new Error("Document retry cannot overwrite an application that has already been submitted.");
+  }
+  if (!app.cv_document_id || !app.cover_letter_id) {
+    throw new Error("Document retry did not link both a CV and a cover letter to the application.");
+  }
+  if (app.cv_document_id === app.cover_letter_id) {
+    throw new Error("The application links the same document as both CV and cover letter.");
+  }
+  const docs = all<{ id: string; kind: string; quality_status: string | null; size_bytes: number }>(
+    "SELECT id, kind, quality_status, size_bytes FROM documents WHERE id IN (?, ?) AND deleted_at IS NULL",
+    [app.cv_document_id, app.cover_letter_id],
+  );
+  const cv = docs.find((doc) => doc.id === app.cv_document_id && doc.kind === "tailored_cv");
+  const cover = docs.find((doc) => doc.id === app.cover_letter_id && doc.kind === "cover_letter");
+  if (!cv || !cover) throw new Error("The linked CV or cover-letter record is missing.");
+  if (!["passed", "warning"].includes(cv.quality_status ?? "") || !["passed", "warning"].includes(cover.quality_status ?? "")) {
+    throw new Error("The linked CV or cover letter has not passed its document-quality gate.");
+  }
+  if (Number(cv.size_bytes) <= 0 || Number(cover.size_bytes) <= 0) {
+    throw new Error("The linked CV or cover letter has no rendered file.");
+  }
+  return { applicationId: app.id, cvDocumentId: cv.id, coverDocumentId: cover.id };
+}
+
+function completeRecovery(row: RecoveryRow, validated: ValidatedRecoveryPackage): void {
+  const at = nowIso();
+  run(
+    "UPDATE recruitment_recovery SET status = 'completed', application_id = ?, finished_at = ?, available_at = ?, last_error = NULL WHERE id = ?",
+    [validated.applicationId, at, at, row.id],
+  );
+  if (row.job_id) {
+    run("UPDATE jobs SET document_state = 'prepared', status = CASE WHEN status = 'rejected' THEN status ELSE 'documents' END WHERE id = ?", [row.job_id]);
+    run(
+      "UPDATE documents SET status = 'ready', run_id = ? WHERE id IN (?, ?) AND deleted_at IS NULL AND quality_status IN ('passed','warning')",
+      [row.run_id, validated.cvDocumentId, validated.coverDocumentId],
+    );
+  }
+  run("UPDATE applications SET run_id = ?, status = 'quality_check', last_update = ? WHERE id = ?", [row.run_id, at, validated.applicationId]);
   run("UPDATE recruitment_runs SET packages_prepared = packages_prepared + 1 WHERE id = ?", [row.run_id]);
   const job = row.job_id
     ? one<{ title: string; company: string }>("SELECT title, company FROM jobs WHERE id = ?", [row.job_id])
     : null;
+  const previousFailure = row.last_error ? ` Previous failure retained in task history: ${row.last_error.slice(0, 300)}` : "";
   run(
     `INSERT INTO recruitment_run_agents
        (run_id, agent_key, assignment, status, attempt, output, coordinator_decision, execution_mode, provider, model, started_at, finished_at, created_at)
-     VALUES (?, 'cv', ?, 'completed', ?, 'Documents resumed from the last successful discovery checkpoint; discovery was not repeated.', 'Recovered automatically after provider availability returned.', 'ai', NULL, NULL, ?, ?, ?)`,
-    [row.run_id, `Recover documents for ${job?.title ?? "vacancy"}${job?.company ? ` at ${job.company}` : ""}`, row.attempts + 1, row.started_at ?? at, at, at],
+     VALUES (?, 'cover', ?, 'completed', ?, ?, 'Recovered only the failed document stage; the validated CV was reused and nothing was submitted.', 'deterministic', NULL, NULL, ?, ?, ?)`,
+    [
+      row.run_id,
+      `Recover cover letter for ${job?.title ?? "vacancy"}${job?.company ? ` at ${job.company}` : ""}`,
+      row.attempts + 1,
+      `Cover letter recovered and linked to application ${validated.applicationId}. Readiness still requires the normal ATS/submission checks.${previousFailure}`,
+      row.started_at ?? at,
+      at,
+      at,
+    ],
   );
   notify({
     kind: "documents_ready",
@@ -180,6 +234,16 @@ export async function processRecoveryQueue(options: {
   let retryScheduled = 0;
   let waitingIntervention = 0;
   try {
+    // A worker can die after claiming a row but before finishing its package.
+    // Requeue only a genuinely stale claim; a live worker in another process
+    // keeps its lease and is never duplicated.
+    run(
+      `UPDATE recruitment_recovery
+       SET status = 'retry_scheduled', available_at = ?,
+           last_error = COALESCE(last_error, 'Interrupted by a stale worker lease; requeued.')
+       WHERE status = 'processing' AND started_at < ?`,
+      [now.toISOString(), new Date(now.getTime() - 5 * 60_000).toISOString()],
+    );
     for (let i = 0; i < Math.max(1, Math.min(10, options.limit ?? 5)); i += 1) {
       const row = one<RecoveryRow>(
         "SELECT * FROM recruitment_recovery WHERE status IN ('pending','retry_scheduled') AND available_at <= ? ORDER BY available_at LIMIT 1",
@@ -187,10 +251,11 @@ export async function processRecoveryQueue(options: {
       );
       if (!row) break;
       const claimed = getDb()
-        .prepare("UPDATE recruitment_recovery SET status = 'processing', attempts = attempts + 1, started_at = COALESCE(started_at, ?) WHERE id = ? AND status IN ('pending','retry_scheduled')")
-        .run(nowIso(), row.id);
+        .prepare("UPDATE recruitment_recovery SET status = 'processing', attempts = attempts + 1, started_at = ? WHERE id = ? AND status IN ('pending','retry_scheduled')")
+        .run(now.toISOString(), row.id);
       if (Number(claimed.changes) !== 1) continue;
       attempted += 1;
+      heartbeatRuntimeWorker("document_recovery", "Processing a durable document recovery");
       const attempts = row.attempts + 1;
       const runRow = one<{ workflow_id: string | null; status: string }>("SELECT workflow_id, status FROM recruitment_runs WHERE id = ?", [row.run_id]);
       if (!row.job_id || !runRow) {
@@ -201,7 +266,10 @@ export async function processRecoveryQueue(options: {
       if (app && documentsPassed(row.job_id) && ["quality_check", "quality_review_required", "ready_to_submit", "human_intervention_required"].includes(
         one<{ status: string }>("SELECT status FROM applications WHERE id = ?", [app.id])?.status ?? "",
       )) {
-        completeRecovery(row, { ok: true, message: "Existing validated documents retained.", applicationId: app.id, warnings: [] });
+        completeRecovery(
+          row,
+          validateRecoveredPackage({ ok: true, message: "Existing validated documents retained.", applicationId: app.id, warnings: [] }),
+        );
         completed += 1;
         continue;
       }
@@ -212,7 +280,7 @@ export async function processRecoveryQueue(options: {
         const resumeStage = hasValidatedCv(row.job_id) ? "cover_only" : undefined;
         const pkg = await prepare(row.job_id, runRow.workflow_id, resumeStage);
         if (!pkg.ok) throw new Error(pkg.message);
-        completeRecovery(row, pkg);
+        completeRecovery(row, validateRecoveredPackage(pkg));
         completed += 1;
       } catch (error) {
         const message = (error instanceof Error ? error.message : "Document retry failed.").slice(0, 1200);

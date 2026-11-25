@@ -205,3 +205,35 @@ test("cover-only recovery reuses the validated CV and records its dependency cha
   const app = db.one<{ cv_document_id: string }>("SELECT cv_document_id FROM applications WHERE job_id = 'job_phase2_one'");
   assert.equal(app?.cv_document_id, latest.id);
 });
+
+test("a failed cover-letter retry automatically preserves the validated CV", async () => {
+  const cvBefore = db.one<{ id: string; version: string }>(
+    "SELECT id, version FROM documents WHERE job_id = 'job_phase2_one' AND kind = 'tailored_cv' AND mime = 'application/pdf' AND quality_status = 'passed' ORDER BY created_at DESC LIMIT 1",
+  );
+  assert.ok(cvBefore);
+  const cvCount = db.one<{ c: number }>(
+    "SELECT COUNT(*) AS c FROM documents WHERE job_id = 'job_phase2_one' AND kind = 'tailored_cv' AND mime = 'application/pdf'",
+  )?.c;
+  db.run(
+    "UPDATE documents SET quality_status = 'failed', quality_score = 0 WHERE job_id = 'job_phase2_one' AND kind = 'cover_letter'",
+  );
+  db.run("UPDATE applications SET cover_letter_id = NULL WHERE job_id = 'job_phase2_one'");
+
+  // No explicit resumeStage: the package must detect the validated CV and retry
+  // only Amira's cover-letter stage.
+  const result = await agents.generateApplicationPackage("system", "job_phase2_one", { workflowId });
+  assert.equal(result.ok, true, result.message);
+  assert.equal(result.cvDocumentId, cvBefore!.id, "the passed CV is reused, not regenerated");
+  assert.equal(
+    db.one<{ c: number }>(
+      "SELECT COUNT(*) AS c FROM documents WHERE job_id = 'job_phase2_one' AND kind = 'tailored_cv' AND mime = 'application/pdf'",
+    )?.c,
+    cvCount,
+    "no duplicate CV was created by the cover-letter retry",
+  );
+  const cover = db.one<{ quality_status: string; quality_score: number }>(
+    "SELECT quality_status, quality_score FROM documents WHERE job_id = 'job_phase2_one' AND kind = 'cover_letter' AND mime = 'application/pdf' ORDER BY created_at DESC LIMIT 1",
+  );
+  assert.equal(cover?.quality_status, "passed");
+  assert.ok((cover?.quality_score ?? 0) >= 90);
+});

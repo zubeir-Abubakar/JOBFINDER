@@ -135,7 +135,7 @@ db.run(
 );
 db.run(
   `INSERT INTO schedule_jobs (key, label, time, timezone, enabled, next_run_at, updated_at)
-   VALUES ('daily_recruitment','Daily autonomous recruitment','10:00','Europe/Zurich',1,?,?)`,
+   VALUES ('daily_recruitment','Daily autonomous recruitment','12:00','Europe/Zurich',1,?,?)`,
   [completedAt, at],
 );
 
@@ -308,6 +308,9 @@ test("the Europe/Zurich weekly report schedule advances once per selected day an
   const tick = await brief.tickExecutiveBriefSchedule(new Date("2026-11-20T16:01:00+01:00"));
   assert.equal(tick.status, "duplicate", "the already queued 20 Nov brief is not sent twice");
   assert.equal(tick.nextRunAt, "2026-11-23T15:00:00.000Z", "Saturday and Sunday are not report days");
+  const duplicateState = brief.executiveBriefScheduleSnapshot(new Date("2026-11-20T16:01:00+01:00"));
+  assert.equal(duplicateState.last_checked_at, "2026-11-20T15:01:00.000Z", "the scheduler tick is persisted even when the occurrence is already handled");
+  assert.equal(duplicateState.last_scheduled_for, "2026-11-20T15:00:00.000Z", "the handled occurrence is recorded explicitly");
 
   const saturday = await brief.tickExecutiveBriefSchedule(new Date("2026-11-21T16:01:00+01:00"));
   assert.equal(saturday.status, "not_scheduled_today");
@@ -325,6 +328,37 @@ test("the Europe/Zurich weekly report schedule advances once per selected day an
     timeZone: "Europe/Zurich",
   });
   assert.equal(dst.toISOString(), "2026-10-25T15:00:00.000Z");
+});
+
+test("a missed brief occurrence is reconciled once without a catch-up storm", async () => {
+  const missedFor = "2026-12-01T15:00:00.000Z";
+  const at = new Date("2026-12-01T22:00:00.000Z");
+  db.run(
+    `UPDATE schedule_jobs
+     SET enabled = 1, time = '16:00', timezone = 'Europe/Zurich', weekdays = '[1,2,3,4,5]',
+         next_run_at = ?, last_status = NULL, last_error = NULL, last_checked_at = NULL,
+         last_scheduled_for = NULL, updated_at = ?
+     WHERE key = 'daily_executive_brief'`,
+    [missedFor, at.toISOString()],
+  );
+  const outboxBefore = db.one<{ c: number }>(
+    "SELECT COUNT(*) AS c FROM notification_outbox WHERE report_id LIKE 'brief:%'",
+  )?.c ?? 0;
+
+  const first = await brief.tickExecutiveBriefSchedule(at);
+  assert.equal(first.status, "missed");
+  const afterMiss = brief.executiveBriefScheduleSnapshot(at);
+  assert.equal(afterMiss.last_checked_at, at.toISOString());
+  assert.equal(afterMiss.last_scheduled_for, missedFor);
+  assert.equal(afterMiss.next_run_at, "2026-12-02T15:00:00.000Z");
+
+  const second = await brief.tickExecutiveBriefSchedule(new Date(at.getTime() + 60_000));
+  assert.equal(second.status, "not_due", "reconciliation advances the clock instead of replaying the missed occurrence");
+  assert.equal(
+    db.one<{ c: number }>("SELECT COUNT(*) AS c FROM notification_outbox WHERE report_id LIKE 'brief:%'")?.c ?? 0,
+    outboxBefore,
+    "a missed occurrence must not create a late report or a catch-up burst",
+  );
 });
 
 test("a failed brief delivery is retried through the durable outbox", async () => {

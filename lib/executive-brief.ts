@@ -1156,13 +1156,16 @@ export type ExecutiveBriefSchedule = {
   weekdays: string | null;
   next_run_at: string | null;
   last_run_at: string | null;
+  last_run_id: string | null;
   last_status: string | null;
   last_error: string | null;
+  last_checked_at: string | null;
+  last_scheduled_for: string | null;
 };
 
 export function ensureExecutiveBriefSchedule(now: Date = new Date()): ExecutiveBriefSchedule {
   const existing = one<ExecutiveBriefSchedule>(
-    "SELECT key, label, time, timezone, enabled, weekdays, next_run_at, last_run_at, last_status, last_error FROM schedule_jobs WHERE key = ?",
+    "SELECT key, label, time, timezone, enabled, weekdays, next_run_at, last_run_at, last_run_id, last_status, last_error, last_checked_at, last_scheduled_for FROM schedule_jobs WHERE key = ?",
     [EXECUTIVE_BRIEF_SCHEDULE_KEY],
   );
   if (existing) return { ...existing, weekdays: existing.weekdays ?? JSON.stringify(EXECUTIVE_BRIEF_WEEKDAYS) };
@@ -1179,7 +1182,7 @@ export function ensureExecutiveBriefSchedule(now: Date = new Date()): ExecutiveB
     ],
   );
   const created = one<ExecutiveBriefSchedule>(
-    "SELECT key, label, time, timezone, enabled, weekdays, next_run_at, last_run_at, last_status, last_error FROM schedule_jobs WHERE key = ?",
+    "SELECT key, label, time, timezone, enabled, weekdays, next_run_at, last_run_at, last_run_id, last_status, last_error, last_checked_at, last_scheduled_for FROM schedule_jobs WHERE key = ?",
     [EXECUTIVE_BRIEF_SCHEDULE_KEY],
   );
   if (!created) throw new Error("The executive brief schedule could not be created.");
@@ -1213,14 +1216,21 @@ function markBriefSchedule(input: {
   status: string;
   error?: string | null;
   nextRunAt: string;
+  runId?: string | null;
+  scheduledFor?: string | null;
 }): void {
   run(
-    "UPDATE schedule_jobs SET last_run_at = ?, last_status = ?, last_error = ?, next_run_at = ?, updated_at = ? WHERE key = ?",
+    `UPDATE schedule_jobs SET last_run_at = ?, last_run_id = COALESCE(?, last_run_id),
+       last_status = ?, last_error = ?, next_run_at = ?, last_checked_at = ?, last_scheduled_for = COALESCE(?, last_scheduled_for), updated_at = ?
+     WHERE key = ?`,
     [
       input.now.toISOString(),
+      input.runId ?? null,
       input.status,
       input.error ?? null,
       input.nextRunAt,
+      input.now.toISOString(),
+      input.scheduledFor ?? null,
       nowIso(),
       EXECUTIVE_BRIEF_SCHEDULE_KEY,
     ],
@@ -1236,6 +1246,11 @@ export async function tickExecutiveBriefSchedule(now: Date = new Date()): Promis
   nextRunAt: string | null;
   detail: string;
 }> {
+  run("UPDATE schedule_jobs SET last_checked_at = ?, updated_at = ? WHERE key = ?", [
+    now.toISOString(),
+    nowIso(),
+    EXECUTIVE_BRIEF_SCHEDULE_KEY,
+  ]);
   const schedule = executiveBriefScheduleSnapshot(now);
   if (schedule.enabled !== 1) {
     return { status: "disabled", nextRunAt: schedule.next_run_at, detail: "The executive brief schedule is disabled." };
@@ -1257,6 +1272,7 @@ export async function tickExecutiveBriefSchedule(now: Date = new Date()): Promis
       status: "missed",
       error: "The scheduled brief was more than the catch-up window late and was not sent as a current brief.",
       nextRunAt: next,
+      scheduledFor: schedule.next_run_at,
     });
     return {
       status: "missed",
@@ -1272,6 +1288,8 @@ export async function tickExecutiveBriefSchedule(now: Date = new Date()): Promis
       status: result.status,
       error: ["failed", "blocked", "no_recipient"].includes(result.status) ? result.detail : null,
       nextRunAt: next,
+      runId: result.reportId,
+      scheduledFor: schedule.next_run_at,
     });
     return { status: result.status, nextRunAt: next, detail: result.detail };
   } catch (error) {
@@ -1453,7 +1471,7 @@ export async function sendDailyExecutiveBrief(options: {
 /**
  * Explicit immediate send. Generates the current brief, validates Gmail
  * readiness, processes the dedicated outbox row and returns the persisted
- * evidence state. It never waits for the 17:00 schedule and never sends twice
+ * evidence state. It never waits for the 16:00 schedule and never sends twice
  * unless the caller explicitly requests a resend of a terminal failure.
  */
 export async function sendExecutiveBriefNow(options: {

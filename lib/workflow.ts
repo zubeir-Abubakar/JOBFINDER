@@ -184,8 +184,9 @@ async function runRecruitment(userId: string, workflowId: string, pages: number,
   try {
     run("UPDATE workflows SET status = 'running', error = NULL WHERE id = ?", [workflowId]);
 
-    // 1. Chief Coordinator plans the run. If every provider is down the workflow
-    // pauses instead of silently pretending the agents executed.
+    // 1. Chief Coordinator plans the run deterministically. Missing AI may
+    // restrict advisory wording, but it must not stop coordination or cause a
+    // plan to be presented as model output.
     const planTask = startTask("coordinator", workflowId, "Plan recruitment workflow", "Assign research, analysis, documents and tracking");
     // Operational plans are deterministic. A generative model may phrase a plan
     // as an invented role or task, so it is never used as the source of workflow

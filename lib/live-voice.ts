@@ -9,6 +9,14 @@ import {
   type LiveConnectConfig,
 } from "@google/genai";
 import { all, one } from "./db";
+import { authorizeAiRequest, evaluateAiPolicy, markPolicyNetworkTransmitted } from "./ai-spending-policy";
+import {
+  geminiLiveFreeTierStatus,
+  geminiLiveOwnerAttestationEnabled,
+  recordGeminiLiveFailure,
+  recordGeminiLiveSuccess,
+  type FreeTierState,
+} from "./free-tier";
 import { randomId } from "./security";
 import { setSetting } from "./settings";
 import { agentDefinition, type AgentKey } from "./agent-definitions";
@@ -50,6 +58,9 @@ const SPECIALIST_KEYS = LIVE_AGENT_KEYS.filter((key) => key !== "coordinator");
 
 export type LiveVoiceConfig = {
   configured: boolean;
+  blockedByPolicy: boolean;
+  freeTierState: FreeTierState;
+  freeTierDetail: string;
   model: string;
   voice: LiveVoiceName;
   apiVersion: string;
@@ -71,7 +82,18 @@ export function liveVoiceConfig(): LiveVoiceConfig {
   const model = (process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live").trim() || "gemini-3.8-live";
   const voice = normaliseVoice(process.env.GEMINI_LIVE_VOICE ?? "Charon");
   const apiVersion = (process.env.GEMINI_LIVE_API_VERSION ?? "v1beta").trim() || "v1beta";
-  return { configured: missing.length === 0, model, voice, apiVersion, missing };
+  const decision = evaluateAiPolicy({ provider: "gemini-live", model });
+  const freeTier = geminiLiveFreeTierStatus();
+  return {
+    configured: missing.length === 0,
+    blockedByPolicy: !decision.allowed,
+    freeTierState: freeTier.state,
+    freeTierDetail: freeTier.detail,
+    model,
+    voice,
+    apiVersion,
+    missing,
+  };
 }
 
 export function normaliseVoice(value: string): LiveVoiceName {
@@ -458,6 +480,68 @@ export type LiveSession = {
   greeting: boolean;
 };
 
+/**
+ * Read-only provider preflight for the opt-in owner-attested Live path.
+ *
+ * It proves that the configured key can reach the exact Live model and that
+ * the model supports BidiGenerateContent. It does not infer billing status and
+ * it does not send prompt or microphone content.
+ */
+async function preflightGeminiLiveKeyAndModel(
+  key: string,
+  model: string,
+  apiVersion: string,
+): Promise<void> {
+  const url = `https://generativelanguage.googleapis.com/${apiVersion}/models/${encodeURIComponent(model)}`;
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      headers: { "x-goog-api-key": key },
+      signal: AbortSignal.timeout(10_000),
+      cache: "no-store",
+    });
+  } catch (error) {
+    throw new LiveVoiceError(
+      `Gemini Live preflight blocked the session: ${scrubLiveMessage(error instanceof Error ? error.message : "network error")}`,
+      503,
+    );
+  }
+  const raw = await response.text();
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    parsed = null;
+  }
+  const payload =
+    parsed && typeof parsed === "object"
+      ? (parsed as { name?: unknown; supportedGenerationMethods?: unknown; error?: { message?: unknown } })
+      : null;
+  if (!response.ok) {
+    const message =
+      typeof payload?.error?.message === "string" ? payload.error.message : `HTTP ${response.status}`;
+    throw new LiveVoiceError(
+      `Gemini Live preflight blocked the session (${response.status}): ${scrubLiveMessage(message)}`,
+      503,
+    );
+  }
+  if (!payload || payload.name !== `models/${model}`) {
+    throw new LiveVoiceError(
+      `Gemini Live preflight returned ${String(payload?.name ?? "no model")}, not models/${model}.`,
+      503,
+    );
+  }
+  const methods = Array.isArray(payload.supportedGenerationMethods)
+    ? payload.supportedGenerationMethods.filter((value): value is string => typeof value === "string")
+    : [];
+  if (!methods.includes("bidiGenerateContent")) {
+    throw new LiveVoiceError(
+      `Gemini Live preflight found ${model}, but it does not advertise bidiGenerateContent.`,
+      503,
+    );
+  }
+}
+
 export async function createLiveSession(input: {
   userId: string;
   agentKey: AgentKey;
@@ -471,6 +555,20 @@ export async function createLiveSession(input: {
       `Live voice is not configured. Add ${config.missing.join(", ")} to the server environment. No paid fallback was attempted.`,
     );
   }
+  const decision = authorizeAiRequest({
+    provider: "gemini-live",
+    model: config.model,
+    agentKey: input.agentKey,
+    sessionId: input.sessionId,
+    operation: "voice.live_session",
+    source: "assistant",
+  });
+  if (!decision.allowed) {
+    throw new LiveVoiceError(
+      `${decision.block_reason ?? "Live voice is not authorised."} Text interaction remains available.`,
+      503,
+    );
+  }
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new LiveVoiceError("Live voice is not configured.");
   const profile = effectiveVoiceProfileForAgent(input.agentKey);
@@ -482,6 +580,10 @@ export async function createLiveSession(input: {
 
   let tokenName = "";
   try {
+    markPolicyNetworkTransmitted(decision.correlation_id);
+    if (geminiLiveOwnerAttestationEnabled()) {
+      await preflightGeminiLiveKeyAndModel(key, config.model, config.apiVersion);
+    }
     const ai = new GoogleGenAI({ apiKey: key, apiVersion: config.apiVersion });
     const token = await ai.authTokens.create({
       config: {
@@ -495,8 +597,11 @@ export async function createLiveSession(input: {
       },
     });
     tokenName = token.name ?? "";
+    recordGeminiLiveSuccess(config.model);
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown token error";
+    recordGeminiLiveFailure({ model: config.model, message });
+    if (error instanceof LiveVoiceError) throw error;
     throw new LiveVoiceError(`Gemini Live authentication failed. ${scrubLiveMessage(message)}`, 502);
   }
   if (!tokenName) throw new LiveVoiceError("Gemini Live did not return an ephemeral token.", 502);

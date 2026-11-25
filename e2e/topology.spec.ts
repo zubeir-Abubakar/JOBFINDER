@@ -236,11 +236,24 @@ test("renders exactly the eight real agents, real portraits, real states and one
   await expect(runPanel).toContainText(/searching/i);
   await expect(runPanel).toContainText("14");
   await expect(runPanel).toContainText("3");
+  await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Assigned" }).locator("strong")).toHaveText("5");
   await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Completed" }).locator("strong")).toHaveText("2");
-  await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Running" }).locator("strong")).toHaveText("1");
-  await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Waiting" }).locator("strong")).toHaveText("2");
+  await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "In progress" }).locator("strong")).toHaveText("1");
+  await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Waiting" }).locator("strong")).toHaveText("1");
+  await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Recovering" }).locator("strong")).toHaveText("0");
   await expect(runPanel.locator(".topology-run-counts > div").filter({ hasText: "Failed" }).locator("strong")).toHaveText("1");
   expect(await runPanel.innerText()).not.toMatch(/%/);
+
+  await expect(page.locator('.topology-edge[data-agent-key="research"]')).toHaveAttribute("data-connection-phase", "assignment");
+  await expect(page.locator('.topology-edge[data-agent-key="research"]')).toHaveAttribute(
+    "marker-end",
+    "url(#topology-arrow-live)",
+  );
+  await expect(page.locator('.topology-edge[data-agent-key="cv"]')).toHaveAttribute("data-connection-phase", "result");
+  await expect(page.locator('.topology-edge[data-agent-key="cv"]')).toHaveAttribute("data-direction", "agent-to-chief");
+  await expect(page.locator('.topology-edge[data-agent-key="analysis"]')).toHaveAttribute("data-connection-phase", "waiting");
+  await expect(page.locator('.topology-edge[data-agent-key="ats"]')).toHaveAttribute("data-connection-phase", "failed");
+  await expect(page.locator('.topology-edge[data-agent-key="cover"]')).toHaveAttribute("data-connection-phase", "none");
 
   await expect(page.locator(".topology-event")).toHaveCount(5);
   const timeline = page.getByRole("region", { name: "Live activity timeline" });
@@ -273,6 +286,10 @@ test("filters by real states and opens the persisted agent detail drawer", async
 
   await page.locator('[data-filter="completed"]').click();
   await expect(page.getByTestId("topology-agent-cv")).toBeVisible();
+
+  await page.locator('[data-filter="recovering"]').click();
+  await expect(page.locator('.topology-specialists [data-testid^="topology-agent-"]')).toHaveCount(0);
+  await expect(page.getByTestId("topology-agent-coordinator")).toBeVisible();
 
   await page.locator('[data-filter="failed"]').click();
   await expect(page.getByTestId("topology-agent-ats")).toBeVisible();

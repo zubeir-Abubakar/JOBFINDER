@@ -45,7 +45,7 @@ test("pausing automatic submission never restores a per-application approval gat
   policy.saveRecruitmentPolicy({
     autonomousSubmission: false,
     minMatchScore: 85,
-    maxSubmissionsPerDay: 5,
+    maxSubmissionsPerDay: 3,
   });
   assert.equal(settings.getSetting("approval_mode", true), false);
   assert.equal(settings.getSetting("autonomous_submission", true), false);

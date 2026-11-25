@@ -34,7 +34,8 @@ import {
 import { getSetting } from "./settings";
 import { notify } from "./notify";
 import { audit } from "./audit";
-import { generateText, scrubProviderError } from "./providers";
+import { generateText, providerConfigured, scrubProviderError } from "./providers";
+import { AiSpendingPolicyError } from "./ai-spending-policy";
 import { enqueueAiJob, isQueueableAiError } from "./ai-queue";
 import { agentDefinition } from "./agent-definitions";
 import { agentIdentity } from "./agent-identity";
@@ -49,6 +50,7 @@ import {
 import { agentAvailability } from "./agent-availability";
 import { emitWorkflowEvent } from "./events";
 import { resolveCoverLetterRequirements } from "./cover-letter-requirements";
+import { recordStage, type RecruitmentStage } from "./recruitment-stages";
 
 export type WorkflowOutcome = {
   workflowId: string;
@@ -90,6 +92,8 @@ export type StartTaskOptions = {
   dependsOn?: string[];
   inputRefs?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
+  /** Explicit run link; otherwise it is resolved from the workflow. */
+  runId?: string | null;
 };
 
 /** Thrown after the blocked task record has been persisted. */
@@ -100,6 +104,49 @@ export class TaskBlockedError extends Error {
     this.name = "TaskBlockedError";
     this.taskId = taskId;
   }
+}
+
+/** A task may only be completed or failed by the specialist that owns it. */
+export class TaskOwnershipError extends Error {
+  readonly taskId: string;
+  readonly owner: string;
+  constructor(taskId: string, owner: string, message: string) {
+    super(message);
+    this.name = "TaskOwnershipError";
+    this.taskId = taskId;
+    this.owner = owner;
+  }
+}
+
+const ACTIVE_TASK_STATES = new Set([
+  "running",
+  "working",
+  "thinking",
+  "waiting_provider",
+  "retry_scheduled",
+]);
+
+function assertTaskOwner(taskId: string, agentKey: string, operation: "complete" | "fail") {
+  const task = one<{ agent_key: string; status: string; workflow_id: string | null }>(
+    "SELECT agent_key, status, workflow_id FROM tasks WHERE id = ?",
+    [taskId],
+  );
+  if (!task) throw new TaskOwnershipError(taskId, "", `Task ${taskId} does not exist; ${operation} was refused.`);
+  if (task.agent_key !== agentKey) {
+    throw new TaskOwnershipError(
+      taskId,
+      task.agent_key,
+      `Task ${taskId} belongs to ${agentIdentity(task.agent_key).name}; ${agentIdentity(agentKey).name} cannot ${operation} another agent's task.`,
+    );
+  }
+  if (!ACTIVE_TASK_STATES.has(task.status)) {
+    throw new TaskOwnershipError(
+      taskId,
+      task.agent_key,
+      `Task ${taskId} is ${task.status}; ${agentIdentity(agentKey).name} cannot ${operation} a task that is not active.`,
+    );
+  }
+  return task;
 }
 
 function runIdForWorkflow(workflowId: string): string | null {
@@ -126,6 +173,7 @@ export function startTask(
   const taskType = options.taskType ?? taskTypeFor(agentKey, title);
   const dependsOn = dependencyJson(options.dependsOn);
   const inputRefs = options.inputRefs ? JSON.stringify(options.inputRefs) : null;
+  const effectiveRunId = options.runId ?? runIdForWorkflow(workflowId);
   const readiness = dependencyReadiness(options.dependsOn ?? []);
 
   if (!readiness.ready) {
@@ -137,7 +185,7 @@ export function startTask(
       [
         id,
         workflowId,
-        runIdForWorkflow(workflowId),
+        effectiveRunId,
         agentKey,
         title,
         detail,
@@ -258,13 +306,14 @@ export function completeTask(
   requiresInput = false,
   metadata: { outputRefs?: Record<string, unknown> | null; recoveryState?: string | null } = {},
 ): void {
+  assertTaskOwner(taskId, agentKey, "complete");
   run(
     `UPDATE tasks
      SET status = 'completed', output = ?, requires_input = ?, finished_at = ?,
          heartbeat_at = NULL, error = NULL, error_class = NULL,
          output_refs = COALESCE(?, output_refs),
          recovery_state = COALESCE(?, recovery_state)
-     WHERE id = ?`,
+     WHERE id = ? AND agent_key = ? AND status IN ('running','working','thinking','waiting_provider','retry_scheduled')`,
     [
       output,
       v(requiresInput),
@@ -272,6 +321,7 @@ export function completeTask(
       metadata.outputRefs ? JSON.stringify(metadata.outputRefs) : null,
       metadata.recoveryState ?? null,
       taskId,
+      agentKey,
     ],
   );
   const completedTask = one<{ workflow_id: string | null }>("SELECT workflow_id FROM tasks WHERE id = ?", [taskId]);
@@ -300,11 +350,27 @@ export function completeTask(
   }
 }
 
-export function failTask(taskId: string, agentKey: string, error: string, errorClass?: TaskErrorClass): void {
+export function failTask(
+  taskId: string,
+  agentKey: string,
+  error: string,
+  errorClass?: TaskErrorClass,
+  metadata: { outputRefs?: Record<string, unknown> | null } = {},
+): void {
+  assertTaskOwner(taskId, agentKey, "fail");
   const failedTask = one<{ workflow_id: string | null }>("SELECT workflow_id FROM tasks WHERE id = ?", [taskId]);
   run(
-    "UPDATE tasks SET status = 'failed', error = ?, error_class = ?, recovery_state = 'failed', heartbeat_at = NULL, finished_at = ? WHERE id = ?",
-    [error, errorClass ?? classifyTaskError(error), nowIso(), taskId],
+    `UPDATE tasks SET status = 'failed', error = ?, error_class = ?, recovery_state = 'failed',
+       heartbeat_at = NULL, finished_at = ?, output_refs = COALESCE(?, output_refs)
+     WHERE id = ? AND agent_key = ? AND status IN ('running','working','thinking','waiting_provider','retry_scheduled')`,
+    [
+      error,
+      errorClass ?? classifyTaskError(error),
+      nowIso(),
+      metadata.outputRefs ? JSON.stringify(metadata.outputRefs) : null,
+      taskId,
+      agentKey,
+    ],
   );
   if (failedTask?.workflow_id) {
     emitWorkflowEvent({ workflowId: failedTask.workflow_id, type: "agent.failed", agentKey, message: `${agentIdentity(agentKey).shortName} failed: ${error.slice(0, 300)}`, meta: { taskId } });
@@ -541,6 +607,14 @@ export function analyseSingleJob(jobId: string): JobAnalysis | null {
 
 /* ------------------------------- documents ------------------------------- */
 
+function nextDocumentVersion(jobId: string): string {
+  const row = one<{ c: number }>(
+    "SELECT COUNT(DISTINCT version) AS c FROM documents WHERE job_id = ? AND deleted_at IS NULL",
+    [jobId],
+  );
+  return `${(Number(row?.c) || 0) + 1}.0`;
+}
+
 type RenderedArtifact = { pdfBuffer: Buffer; docxBuffer: Buffer; text: string; pages: number };
 
 async function renderArtifact(model: DocModel): Promise<RenderedArtifact> {
@@ -633,14 +707,26 @@ async function agentNote(
       temperature: 0.15,
       technical,
     });
-    run(
-      "UPDATE tasks SET provider = ?, model = ?, attempts = attempts + 1, execution_mode = 'ai', ai_outcome = 'ok' WHERE id = ?",
-      [result.provider, result.model, taskId],
-    );
+    // recordUsage() has already persisted this call's task link, attempts and
+    // actual provider/model. Do not increment a second time here.
     const text = result.text.replace(/\s+/g, " ").slice(0, 420);
     return { ok: true, note: `${result.provider}/${result.model}: ${text}`, text, provider: result.provider, model: result.model };
   } catch (error) {
-    // Optional advisory work is queued when the gateway is cooling down or
+    // A policy block is terminal. It must never be queued for a later retry,
+    // because that would transmit the same unverified external request later.
+    // With no authorised route at all, the work is blocked, not pending: there
+    // is nothing that could make an untransmitted request become sendable.
+    if (error instanceof AiSpendingPolicyError || !providerConfigured()) {
+      const reason = error instanceof Error
+        ? scrubProviderError(error.message)
+        : "No authorised AI route is configured; the advisory step is blocked.";
+      run(
+        "UPDATE tasks SET execution_mode = 'deterministic', ai_outcome = 'blocked', state_reason = ? WHERE id = ?",
+        [reason, taskId],
+      );
+      return { ok: false, reason };
+    }
+    // Optional advisory work is queued when the local route is cooling down or
     // unreachable. The deterministic task is not failed, and no work is
     // discarded; the queue keeps the task id for telemetry.
     if (isQueueableAiError(error)) {
@@ -677,7 +763,7 @@ async function agentNote(
     }
     // A non-retryable inference failure is recorded as such; it is never
     // silently treated as model output. The task still completes deterministically.
-    run("UPDATE tasks SET attempts = attempts + 1, execution_mode = 'ai', ai_outcome = 'failed' WHERE id = ?", [taskId]);
+    run("UPDATE tasks SET ai_outcome = 'failed' WHERE id = ?", [taskId]);
     return { ok: false, reason: scrubProviderError(error instanceof Error ? error.message : "AI draft failed") };
   } finally {
     markAgentWorking(agentKey);
@@ -731,6 +817,9 @@ export type PackageOutcome = {
   readinessState?: string;
   cvDocumentId?: string;
   coverDocumentId?: string;
+  /** Persisted task ids let Chief create a real package gate dependency. */
+  cvTaskId?: string | null;
+  coverTaskId?: string | null;
   warnings: string[];
 };
 
@@ -738,8 +827,43 @@ export type PackageOutcome = {
 export async function generateApplicationPackage(
   userId: string,
   jobId: string,
-  options: { workflowId?: string; notes?: Record<string, string>; resumeStage?: "cover_only" } = {},
+  options: {
+    workflowId?: string;
+    notes?: Record<string, string>;
+    resumeStage?: "cover_only" | "reuse";
+    runId?: string | null;
+    /** The completed analysis task that authorises document generation. */
+    dependsOn?: string[];
+  } = {},
 ): Promise<PackageOutcome> {
+  let resumeStage = options.resumeStage;
+  const recruitmentRunId = options.runId ?? one<{ id: string }>(
+    "SELECT id FROM recruitment_runs WHERE workflow_id = ? ORDER BY created_at DESC LIMIT 1",
+    [options.workflowId ?? ""],
+  )?.id ?? null;
+  const markStage = (
+    stage: RecruitmentStage,
+    input: {
+      status: "completed" | "failed" | "blocked";
+      outputRefs?: Record<string, unknown>;
+      evidence?: Record<string, unknown>;
+      reason?: string | null;
+      errorClass?: string | null;
+    },
+  ) => {
+    if (!recruitmentRunId) return;
+    recordStage({
+      runId: recruitmentRunId,
+      jobId: jobId,
+      stage,
+      status: input.status,
+      outputRefs: input.outputRefs ?? null,
+      evidence: input.evidence ?? null,
+      reason: input.reason ?? null,
+      errorClass: input.errorClass ?? null,
+      decision: input.status === "completed" ? "complete" : "retry",
+    });
+  };
   const job = one<JobRow>("SELECT * FROM jobs WHERE id = ?", [jobId]);
   if (!job) return { ok: false, message: "Vacancy not found.", warnings: [] };
   if (!agentEnabled("cv") || !agentEnabled("cover")) {
@@ -749,6 +873,86 @@ export async function generateApplicationPackage(
   const profile = getProfileData();
   if (!profile.profile.full_name || profile.skills.length === 0) {
     return { ok: false, message: "The master profile is incomplete. Add your name and skills first.", warnings: [] };
+  }
+
+  if (resumeStage === "reuse") {
+    const existing = one<{
+      id: string;
+      cv_document_id: string | null;
+      cover_letter_id: string | null;
+      readiness: string | null;
+    }>("SELECT id, cv_document_id, cover_letter_id, readiness FROM applications WHERE job_id = ?", [jobId]);
+    const validDocument = (id: string | null) =>
+      id
+        ? one<{ id: string; ats_score: number | null }>(
+            "SELECT id, ats_score FROM documents WHERE id = ? AND deleted_at IS NULL AND quality_status = 'passed' AND size_bytes > 0",
+            [id],
+          )
+        : null;
+    const cv = validDocument(existing?.cv_document_id ?? null);
+    const cover = validDocument(existing?.cover_letter_id ?? null);
+    if (cv && cover) {
+      let readinessState: string | undefined;
+      try {
+        readinessState = (JSON.parse(existing?.readiness ?? "{}") as { state?: string }).state;
+      } catch {
+        readinessState = undefined;
+      }
+      let applicationId = existing?.id ?? null;
+      if (!applicationId) {
+        // The documents completed but the worker stopped before assembling the
+        // application row. Reuse both validated files and create only the
+        // missing package link; do not regenerate a second CV/cover pair.
+        applicationId = `app_${randomId()}`;
+        run(
+          `INSERT INTO applications (id, job_id, status, cv_document_id, cover_letter_id, method, last_update, created_at)
+           VALUES (?, ?, 'quality_check', ?, ?, 'employer_portal', ?, ?)`,
+          [applicationId, job.id, cv.id, cover.id, nowIso(), nowIso()],
+        );
+      }
+      markStage("package_assembly", {
+        status: "completed",
+        outputRefs: { applicationId, cvDocumentId: cv.id, coverDocumentId: cover.id },
+        evidence: { reusedExistingPackage: true, applicationRecordCreated: !existing },
+      });
+      return {
+        ok: true,
+        message: existing
+          ? "Existing validated application package retained; no document was regenerated."
+          : "Validated documents were reused and the missing application package record was assembled.",
+        applicationId,
+        atsScore: cv.ats_score ?? undefined,
+        readinessState,
+        cvDocumentId: cv.id,
+        coverDocumentId: cover.id,
+        warnings: [],
+      };
+    }
+    // A valid CV can still be reused when only the cover letter is missing or
+    // failed. Otherwise fall through to the full package path.
+    if (existing && cv && !cover) resumeStage = "cover_only";
+  }
+
+  // Every retry after a cover-letter failure must preserve a CV that already
+  // passed its own quality gate. This applies even when a caller omitted the
+  // explicit resume stage, so a repeated run cannot regenerate the CV or create
+  // a second validated CV.
+  if (!resumeStage) {
+    const validCv = one<{ id: string }>(
+      `SELECT id FROM documents
+       WHERE job_id = ? AND kind = 'tailored_cv' AND mime = 'application/pdf'
+         AND deleted_at IS NULL AND quality_status = 'passed' AND size_bytes > 0
+       ORDER BY created_at DESC LIMIT 1`,
+      [job.id],
+    );
+    const validCover = one<{ id: string }>(
+      `SELECT id FROM documents
+       WHERE job_id = ? AND kind = 'cover_letter' AND mime = 'application/pdf'
+         AND deleted_at IS NULL AND quality_status = 'passed' AND size_bytes > 0
+       ORDER BY created_at DESC LIMIT 1`,
+      [job.id],
+    );
+    if (validCv && !validCover) resumeStage = "cover_only";
   }
 
   const workflowId = options.workflowId ?? createWorkflow("documents", `Application package · ${job.company}`, userId);
@@ -768,7 +972,7 @@ export async function generateApplicationPackage(
   let cvTask: string | null = null;
   let reusedValidCv = false;
 
-  if (options.resumeStage === "cover_only") {
+  if (resumeStage === "cover_only") {
     const reusable = one<{
       id: string;
       version: string;
@@ -792,7 +996,14 @@ export async function generateApplicationPackage(
             "SELECT id FROM documents WHERE job_id = ? AND version = ? AND kind = 'tailored_cv' AND mime LIKE '%wordprocessing%' AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
             [job.id, reusable.version],
           );
-          version = reusable.version;
+          // A failed cover letter for the reused CV version is historical
+          // evidence. Give the retry its own version instead of colliding with
+          // the failed PDF/DOCX pair.
+          const existingCover = one<{ id: string }>(
+            "SELECT id FROM documents WHERE job_id = ? AND kind = 'cover_letter' AND version = ? AND deleted_at IS NULL LIMIT 1",
+            [job.id, reusable.version],
+          );
+          version = existingCover ? nextDocumentVersion(job.id) : reusable.version;
           cvDocs = { pdfId: reusable.id, docxId: docx?.id ?? "" };
           cvQuality = quality;
           cvAts = ats;
@@ -806,10 +1017,7 @@ export async function generateApplicationPackage(
     }
   }
 
-  if (!version) {
-    const versionRow = one<{ c: number }>("SELECT COUNT(DISTINCT version) AS c FROM documents WHERE job_id = ?", [job.id]);
-    version = `${(versionRow?.c ?? 0) + 1}.0`;
-  }
+  if (!version) version = nextDocumentVersion(job.id);
 
   const master = await loadMasterCv(profile);
   if (master.roles.length === 0) {
@@ -831,6 +1039,7 @@ export async function generateApplicationPackage(
   if (!reusedValidCv) {
   cvTask = startTask("cv", workflowId, "Generate tailored CV", `Version ${version} · ${job.company}`, {
     taskType: "cv_generation",
+    dependsOn: options.dependsOn,
     inputRefs: { jobId: job.id, version, masterCv: profile.profile.source_cv_id ?? null },
     idempotencyKey: `documents:${job.id}:${version}:cv`,
   });
@@ -888,6 +1097,11 @@ export async function generateApplicationPackage(
     rendered: cvArtifact,
   });
   cvPages = cvArtifact.pages;
+  markStage("cv_generation", {
+    status: "completed",
+    outputRefs: { cvDocumentId: cvDocs.pdfId, cvDocxId: cvDocs.docxId, version },
+    evidence: { pages: cvPages, qualityStatus: cvQuality.status },
+  });
 
   if (cvQuality.status === "failed") {
     const blockedAtsTask = startTask("ats", workflowId, "Quality control audit", "The CV did not reach the audit stage because preservation and layout validation failed", {
@@ -896,6 +1110,13 @@ export async function generateApplicationPackage(
     });
     failTask(blockedAtsTask, "ats", `CV quality gate rejected the output: ${cvQuality.issues.filter((item) => item.severity === "error").map((item) => item.message).join(" ")}`, "validation");
     failTask(cvTask, "cv", "The CV did not pass preservation and layout validation.", "validation");
+    markStage("cv_validation", {
+      status: "failed",
+      outputRefs: { cvDocumentId: cvDocs.pdfId },
+      evidence: { qualityStatus: cvQuality.status, issues: cvQuality.issues.slice(0, 5) },
+      reason: "The CV did not pass preservation and layout validation.",
+      errorClass: "validation",
+    });
     run("UPDATE documents SET status = 'blocked' WHERE job_id = ? AND version = ?", [job.id, version]);
     if (!options.workflowId) finishWorkflow(workflowId, "failed", "CV quality gate rejected the package");
     notify({ userId, kind: "ats_blocked", subject: "Documents blocked by quality control", body: `${job.title} at ${job.company}: the generated CV is materially weaker than the uploaded original.` });
@@ -907,6 +1128,11 @@ export async function generateApplicationPackage(
       warnings: [...new Set([...cvAts.warnings, ...cvQuality.issues.map((item) => item.message)])],
     };
   }
+  markStage("cv_validation", {
+    status: "completed",
+    outputRefs: { cvDocumentId: cvDocs.pdfId, qualityStatus: cvQuality.status },
+    evidence: { score: cvQuality.score, checks: cvQuality.checks.length },
+  });
   completeTask(
     cvTask,
     "cv",
@@ -976,6 +1202,23 @@ export async function generateApplicationPackage(
     workflowId,
     coverLetterRequirements,
   });
+  const coverDiagnostics = aiCover.diagnostics ?? null;
+  run(
+    `UPDATE tasks SET provider = COALESCE(?, provider), model = COALESCE(?, model),
+       ai_outcome = ?, output_refs = ? WHERE id = ?`,
+    [
+      aiCover.provider,
+      aiCover.model,
+      aiCover.tailoredWithAi ? "ok" : coverDiagnostics?.usableContent ? "fallback" : aiCover.provider ? "error" : "blocked",
+      JSON.stringify({
+        provider: aiCover.provider,
+        model: aiCover.model,
+        fallback: !aiCover.tailoredWithAi,
+        diagnostics: coverDiagnostics,
+      }),
+      coverTask,
+    ],
+  );
   let coverOutput: CoverLetterContent = aiCover;
   let coverModel = buildCoverLetterModel({ master, cover: coverOutput, job: jobLike });
   let coverText = modelToText(coverModel);
@@ -983,7 +1226,14 @@ export async function generateApplicationPackage(
   let coverQuality = validateCoverQuality(master, coverOutput, coverArtifact.text, coverArtifact.pages, { ...jobLike, analysis });
 
   if (coverQuality.status === "failed") {
-    coverOutput = deterministicCoverLetter(master, jobLike, analysis, coverLetterRequirements);
+    const deterministic = deterministicCoverLetter(master, jobLike, analysis, coverLetterRequirements);
+    coverOutput = {
+      ...deterministic,
+      provider: aiCover.provider,
+      model: aiCover.model,
+      diagnostics: coverDiagnostics,
+      warnings: [...aiCover.warnings, ...deterministic.warnings],
+    };
     coverModel = buildCoverLetterModel({ master, cover: coverOutput, job: jobLike });
     coverText = modelToText(coverModel);
     coverArtifact = await renderArtifact(coverModel);
@@ -1010,9 +1260,48 @@ export async function generateApplicationPackage(
     quality: coverQuality,
     rendered: coverArtifact,
   });
+  markStage("cover_generation", {
+    status: "completed",
+    outputRefs: { coverDocumentId: coverDocs.pdfId, coverDocxId: coverDocs.docxId, version },
+    evidence: { pages: coverArtifact.pages, qualityStatus: coverQuality.status, diagnostics: coverDiagnostics },
+  });
+  if (coverQuality.status === "passed") {
+    markStage("cover_validation", {
+      status: "completed",
+      outputRefs: { coverDocumentId: coverDocs.pdfId, qualityStatus: coverQuality.status },
+      evidence: { score: coverQuality.score, checks: coverQuality.checks.length },
+    });
+    markStage("rendering", {
+      status: "completed",
+      outputRefs: { cvDocumentId: cvDocs?.pdfId ?? null, coverDocumentId: coverDocs.pdfId },
+      evidence: { cvPages, coverPages: coverArtifact.pages, formats: ["pdf", "docx"] },
+    });
+  }
 
   if (coverQuality.status === "failed") {
-    failTask(coverTask, "cover", "The cover letter did not pass evidence and layout validation.", "validation");
+    const validationMessage = coverQuality.issues.find((item) => item.severity === "error")?.message ?? "evidence and layout validation failed";
+    failTask(
+      coverTask,
+      "cover",
+      `The cover letter did not pass evidence and layout validation: ${validationMessage}`,
+      "validation",
+      {
+        outputRefs: {
+          coverDocumentId: coverDocs.pdfId,
+          qualityStatus: coverQuality.status,
+          qualityIssues: coverQuality.issues.filter((item) => item.severity === "error").slice(0, 5),
+          diagnostics: coverDiagnostics,
+          recovery: "cover_only",
+        },
+      },
+    );
+    markStage("cover_validation", {
+      status: "failed",
+      outputRefs: { coverDocumentId: coverDocs.pdfId },
+      evidence: { qualityStatus: coverQuality.status, issues: coverQuality.issues.slice(0, 5), diagnostics: coverDiagnostics },
+      reason: "The cover letter did not pass evidence and layout validation.",
+      errorClass: "validation",
+    });
     run("UPDATE documents SET status = 'blocked' WHERE job_id = ? AND version = ?", [job.id, version]);
     if (!options.workflowId) finishWorkflow(workflowId, "failed", "Cover letter quality gate rejected the package");
     notify({ userId, kind: "ats_blocked", subject: "Documents blocked by quality control", body: `${job.title} at ${job.company}: the cover letter failed the evidence and layout gate.` });
@@ -1032,7 +1321,15 @@ export async function generateApplicationPackage(
       coverLetterRequirements.source === "recruiter" ? "the explicit recruiter instruction" : "the internal 180–320 word professional default"
     }. A CV ATS compatibility score is not applicable.`,
     false,
-    { outputRefs: { coverDocumentId: coverDocs.pdfId, coverDocxId: coverDocs.docxId, version, pages: coverArtifact.pages } },
+    {
+      outputRefs: {
+        coverDocumentId: coverDocs.pdfId,
+        coverDocxId: coverDocs.docxId,
+        version,
+        pages: coverArtifact.pages,
+        diagnostics: coverDiagnostics,
+      },
+    },
   );
   const combinedQuality = combinePackageQuality(cvQuality!, coverQuality);
   const warnings = [...new Set([
@@ -1089,6 +1386,11 @@ export async function generateApplicationPackage(
       ],
     );
   }
+  markStage("package_assembly", {
+    status: "completed",
+    outputRefs: { applicationId, cvDocumentId: cvDocs!.pdfId, coverDocumentId: coverDocs.pdfId },
+    evidence: { qualityState: qualityReviewState, cvQuality: cvQuality!.status, coverQuality: coverQuality.status },
+  });
   run("UPDATE jobs SET status = CASE WHEN status = 'rejected' THEN status ELSE 'documents' END WHERE id = ?", [job.id]);
   run("UPDATE documents SET status = ? WHERE job_id = ? AND version = ?", [bothQualityPassed ? "ready" : "quality_review_required", job.id, version]);
 
@@ -1109,6 +1411,8 @@ export async function generateApplicationPackage(
     readinessState: qualityReviewState,
     cvDocumentId: cvDocs!.pdfId,
     coverDocumentId: coverDocs.pdfId,
+    cvTaskId: cvTask ?? undefined,
+    coverTaskId: coverTask,
     warnings,
   };
 }

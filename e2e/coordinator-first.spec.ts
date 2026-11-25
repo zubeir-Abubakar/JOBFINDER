@@ -117,4 +117,8 @@ test("logging out and back in still starts Chief, not the last text specialist",
   expect(posts[0].agentKey).toBe("coordinator");
 
   await page.request.post("/api/assistant/message", { data: { message: "Take me back to Chief." } });
+
+  // This test signed out the shared setup session, then created a replacement.
+  // Persist that replacement so later serial projects do not reuse a dead token.
+  await page.context().storageState({ path: E2E.ownerState });
 });

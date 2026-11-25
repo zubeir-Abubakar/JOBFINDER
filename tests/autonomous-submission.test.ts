@@ -302,10 +302,10 @@ function fakePackage(jobId: string) {
   };
 }
 
-test("defaults are 85%, 7 days, 5/day and automatic submission with no per-application approval", () => {
+test("defaults are 85%, 7 days, 3/day and automatic submission with no per-application approval", () => {
   const current = policy.getRecruitmentPolicy();
   assert.equal(current.minMatchScore, 85);
-  assert.equal(current.maxSubmissionsPerDay, 5);
+  assert.equal(current.maxSubmissionsPerDay, 3);
   assert.equal(current.freshnessDays, 7);
   assert.equal(current.autonomousSubmission, true);
   assert.equal(current.requirePerApplicationApproval, false);
@@ -340,7 +340,7 @@ test("one blocked application does not stop another qualifying application", asy
   assert.equal(policy.getRecruitmentPolicy().active, true);
   // Keep the cap out of the way for the channel/evidence tests; the dedicated
   // daily-limit tests below lower it deliberately.
-  policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 10 });
+  policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 3 });
   const salary = makeJob({
     id: "run_salary",
     title: "Senior QA Automation Engineer",
@@ -467,6 +467,7 @@ test("an application cannot bypass the persisted readiness gate", async () => {
 });
 
 test("atomic claim prevents concurrent workers from sending the same vacancy twice", async () => {
+  db.run("DELETE FROM submission_attempts");
   const { jobId, applicationId } = makeJob({
     id: "race_job",
     title: "Senior QA Automation Engineer",
@@ -577,6 +578,7 @@ test("CAPTCHA and MFA stop the workflow before any POST", async () => {
 });
 
 test("an ambiguous response is unverified and cannot be blindly retried", async () => {
+  db.run("DELETE FROM submission_attempts");
   const { jobId, applicationId } = makeJob({
     id: "ambiguous_job",
     title: "Senior QA Automation Engineer",
@@ -595,6 +597,7 @@ test("an ambiguous response is unverified and cannot be blindly retried", async 
 });
 
 test("a duplicate application is blocked and does not create another attempt", async () => {
+  db.run("DELETE FROM submission_attempts");
   const { jobId, applicationId } = makeJob({
     id: "duplicate_job",
     title: "Senior QA Automation Engineer",
@@ -705,7 +708,7 @@ test("the daily limit is three verified submissions and policy edits cannot wide
     maxSubmissionsPerDay: 99,
   });
   assert.equal(edited.minMatchScore, 85, "the threshold floor cannot be lowered");
-  assert.equal(edited.maxSubmissionsPerDay, 10, "the hard cap is enforced");
+  assert.equal(edited.maxSubmissionsPerDay, 3, "the hard cap is enforced");
   policy.saveRecruitmentPolicy({ autonomousSubmission: true, minMatchScore: 85, maxSubmissionsPerDay: 3 });
   assert.equal(policy.dailySubmissionUsage(future).remaining, 0);
 });

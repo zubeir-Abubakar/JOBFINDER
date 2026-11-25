@@ -164,12 +164,13 @@ test("working, waiting, completed, failed, idle and offline states come from per
     {
       working: snapshot.stats.working,
       waiting: snapshot.stats.waiting,
+      recovering: snapshot.stats.recovering,
       completed: snapshot.stats.completed,
       failed: snapshot.stats.failed,
       idle: snapshot.stats.idle,
       offline: snapshot.stats.offline,
     },
-    { working: 2, waiting: 2, completed: 1, failed: 1, idle: 1, offline: 1 },
+    { working: 2, waiting: 2, recovering: 0, completed: 1, failed: 1, idle: 1, offline: 1 },
   );
 });
 
@@ -182,11 +183,13 @@ test("only a genuine running assignment illuminates an animated connection", () 
   const analysis = snapshot.connections.find((connection) => connection.agentKey === "analysis");
   assert.equal(analysis?.active, false, "a queued task is waiting, not active");
   const cv = snapshot.connections.find((connection) => connection.agentKey === "cv");
-  assert.equal(cv?.active, false, "a completed task never animates");
+  assert.equal(cv?.active, false, "a historical completed task is not replayed as live");
   assert.equal(cv?.direction, "agent-to-chief");
+  assert.equal(cv?.phase, "result");
   const ats = snapshot.connections.find((connection) => connection.agentKey === "ats");
   assert.equal(ats?.active, false, "a failed task never animates");
-  assert.equal(ats?.direction, "agent-to-chief");
+  assert.equal(ats?.phase, "failed");
+  assert.equal(ats?.direction, null);
 });
 
 test("the run panel uses the real run and assignment counts without an invented completion percentage", () => {
@@ -199,10 +202,12 @@ test("the run panel uses the real run and assignment counts without an invented 
   assert.equal(snapshot.run?.jobsDiscovered, 14);
   assert.equal(snapshot.run?.jobsUpdated, 3);
   assert.deepEqual(snapshot.run?.counts, {
-    total: 7,
+    assigned: 5,
+    total: 5,
     completed: 2,
     running: 1,
-    waiting: 2,
+    waiting: 1,
+    recovering: 0,
     failed: 1,
     skipped: 1,
   });
@@ -272,7 +277,27 @@ test("a blocked task exposes its real dependency reason and heartbeat in the top
   assert.equal(cover?.task?.errorClass, "dependency");
   assert.deepEqual(cover?.task?.dependsOn, ["task_topology_ats"]);
   assert.equal(cover?.task?.heartbeatAt, "2026-11-22T12:00:06.000Z");
-  assert.equal(snapshot.connections.find((connection) => connection.agentKey === "cover")?.active, false);
+  const coverConnection = snapshot.connections.find((connection) => connection.agentKey === "cover");
+  assert.equal(coverConnection?.active, false);
+  assert.equal(coverConnection?.phase, "waiting");
+  assert.equal(coverConnection?.direction, "chief-to-agent");
+  assert.match(coverConnection?.label ?? "", /waiting/i);
+
+  // A retry-scheduled task is a distinct recovering state, not ordinary waiting
+  // and not successful activity.
+  db.run(
+    `UPDATE tasks SET status = 'retry_scheduled', recovery_state = 'retry_scheduled', state_reason = ?,
+       error_class = 'provider_unavailable' WHERE id = 'task_topology_cover_blocked'`,
+    ["Provider 502 preserved the validated CV; cover-letter retry is scheduled."],
+  );
+  db.run("UPDATE agents SET status = 'idle' WHERE key = 'cover'");
+  const recovering = topology.getAgentTopologySnapshot(ACTOR, new Date(AT));
+  const recoveringAgent = recovering.agents.find((agent) => agent.key === "cover");
+  const recoveringConnection = recovering.connections.find((connection) => connection.agentKey === "cover");
+  assert.equal(recoveringAgent?.state, "recovering");
+  assert.equal(recoveringConnection?.phase, "recovering");
+  assert.equal(recoveringConnection?.active, true);
+  assert.match(recoveringConnection?.label ?? "", /recovering/i);
 });
 
 test("state derivation is deterministic for disabled, paused and terminal agents", () => {

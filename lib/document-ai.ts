@@ -1,6 +1,6 @@
 import type { MasterCv, MasterRole } from "./master-cv";
 import type { JobAnalysis } from "./scoring";
-import { generateText } from "./providers";
+import { diagnosticsFromError, generateText, type ProviderDiagnostics } from "./providers";
 import {
   coverLetterLengthIssues,
   extractCoverLetterRequirements,
@@ -35,6 +35,8 @@ export type CoverLetterContent = {
   provider: string | null;
   model: string | null;
   warnings: string[];
+  /** Safe, credential-free provider/transport evidence retained with the task. */
+  diagnostics?: ProviderDiagnostics | null;
 };
 
 type JobLike = {
@@ -205,6 +207,58 @@ function fitCoverLetterToMaximum(
   };
 }
 
+/**
+ * Expand a short deterministic letter only with achievements that already exist
+ * in the verified master CV. This is the repair path for a provider outage: it
+ * raises the letter to an explicit minimum without inventing candidate facts or
+ * padding the body with generic prose.
+ */
+function fitCoverLetterToRequirements(
+  content: CoverLetterContent,
+  master: MasterCv,
+  job: JobLike,
+  analysis: JobAnalysis,
+  requirements: CoverLetterRequirements,
+): CoverLetterContent {
+  const minimum = requirements.minWords;
+  if (minimum === null || measureCoverLetter(content).words >= minimum) {
+    return fitCoverLetterToMaximum(content, job, requirements);
+  }
+  const keywords = keywordSet(job, analysis);
+  const existing = content.paragraphs.join(" ").toLowerCase();
+  const additions: string[] = [];
+  for (const candidate of achievementCandidates(master, keywords)) {
+    const bullet = candidate.bullet.replace(/\.$/, "").trim();
+    if (!bullet || existing.includes(bullet.toLowerCase().slice(0, 48))) continue;
+    if (additions.some((item) => item.toLowerCase().includes(bullet.toLowerCase().slice(0, 48)))) continue;
+    additions.push(`At ${candidate.role.company} as ${candidate.role.title}, I ${lowerFirst(bullet)}.`);
+    const trial = { ...content, paragraphs: [...content.paragraphs, additions.join(" ")] };
+    if (measureCoverLetter(trial).words >= minimum + 8) break;
+  }
+  if (additions.length === 0) {
+    return {
+      ...fitCoverLetterToMaximum(content, job, requirements),
+      warnings: [
+        ...content.warnings,
+        `The verified master CV did not contain enough additional achievements to reach the ${minimum}-word professional minimum without inventing facts.`,
+      ],
+    };
+  }
+  const expanded: CoverLetterContent = {
+    ...content,
+    paragraphs: [
+      ...content.paragraphs.slice(0, Math.min(2, content.paragraphs.length)),
+      additions.join(" "),
+      ...content.paragraphs.slice(Math.min(2, content.paragraphs.length)),
+    ],
+    warnings: [
+      ...content.warnings,
+      "Additional verified achievements from the master CV were used to satisfy the internal professional minimum.",
+    ],
+  };
+  return fitCoverLetterToMaximum(expanded, job, requirements);
+}
+
 export function deterministicCoverLetter(
   master: MasterCv,
   job: JobLike,
@@ -234,7 +288,7 @@ export function deterministicCoverLetter(
       ? `That evidence is relevant to the vacancy's focus on ${(analysis.matched ?? []).slice(0, 2).join(" and ")}.`
       : "The evidence above reflects the technical depth and release ownership described in the vacancy.";
 
-  return fitCoverLetterToMaximum(
+  return fitCoverLetterToRequirements(
     {
       salutation,
       paragraphs: [
@@ -249,7 +303,9 @@ export function deterministicCoverLetter(
       model: null,
       warnings: ["Generated from the verified master CV using the deterministic fallback."],
     },
+    master,
     job,
+    analysis,
     requirements,
   );
 }
@@ -436,6 +492,7 @@ ${JSON.stringify({
       prompt,
       maxTokens: 3_200,
       temperature: 0.2,
+      format: "json",
       maxWaitMs: 35_000,
     });
     const parsed = parseJsonObject(result.text);
@@ -533,16 +590,41 @@ ${JSON.stringify({
       prompt,
       maxTokens: 1_500,
       temperature: 0.35,
+      format: "json",
       maxWaitMs: 35_000,
     });
     const parsed = parseJsonObject(result.text);
-    if (!parsed) return { ...fallback, provider: result.provider, model: result.model, warnings: ["AI returned malformed JSON; deterministic letter retained."] };
+    const diagnostics = result.diagnostics ?? null;
+    if (!parsed) {
+      return {
+        ...fallback,
+        provider: result.provider,
+        model: result.model,
+        diagnostics: diagnostics ? { ...diagnostics, usableContent: false } : null,
+        warnings: ["AI returned malformed JSON; deterministic letter retained."],
+      };
+    }
     const paragraphs = Array.isArray(parsed.paragraphs)
       ? parsed.paragraphs.map(cleanString).filter((paragraph): paragraph is string => Boolean(paragraph))
       : [];
-    const salutation = cleanString(parsed.salutation) ?? fallback.salutation;
-    const closing = cleanString(parsed.closing) ?? fallback.closing;
+    const salutation = cleanString(parsed.salutation);
+    const closing = cleanString(parsed.closing);
+    if (!salutation || !closing) {
+      return {
+        ...fallback,
+        provider: result.provider,
+        model: result.model,
+        diagnostics: diagnostics ? { ...diagnostics, usableContent: false } : null,
+        warnings: [`AI cover letter was rejected (${!salutation ? "missing salutation" : "missing closing"}); the validated deterministic letter was used.`],
+      };
+    }
     const text = paragraphs.join(" ");
+    const normalizedParagraphs = paragraphs.map((paragraph) => paragraph.toLowerCase().replace(/\s+/g, " ").trim());
+    const repeatedParagraph = new Set(normalizedParagraphs).size !== normalizedParagraphs.length;
+    const finalParagraph = paragraphs.at(-1) ?? "";
+    const truncated =
+      !/[.!?]\s*$/.test(finalParagraph) ||
+      /(?:,|\band|\bor|\bthe|\bto|\bof|\bwith|\bfor)\s*$/i.test(finalParagraph);
     const candidateLength = measureCoverLetter({ salutation, paragraphs, closing });
     const lengthIssues = coverLetterLengthIssues(candidateLength, requirements);
     const source = sourceMetrics(master);
@@ -556,6 +638,8 @@ ${JSON.stringify({
       paragraphs.length < 3 ||
       paragraphs.length > 6 ||
       lengthIssues.length > 0 ||
+      repeatedParagraph ||
+      truncated ||
       invalidGenericOpening(paragraphs[0] ?? "") ||
       hasGenericCoverLanguage(text) ||
       hasKeywordStuffing(text, 6) ||
@@ -568,11 +652,25 @@ ${JSON.stringify({
       (authorisationAsked && permitB && !authorisationMentioned) ||
       claimsRequiresSponsorship(text);
     if (invalid) {
-      const reason = lengthIssues[0]?.message ?? "grounding, length or vacancy-targeting checks";
-      return { ...fallback, provider: result.provider, model: result.model, warnings: [`AI cover letter was rejected (${reason}); the deterministic letter was used.`] };
+      const reason = repeatedParagraph
+        ? "repeated paragraphs"
+        : truncated
+          ? "truncated or incomplete final paragraph"
+          : lengthIssues[0]?.message ?? "grounding, length or vacancy-targeting checks";
+      return {
+        ...fallback,
+        provider: result.provider,
+        model: result.model,
+        diagnostics: diagnostics ? { ...diagnostics, usableContent: false } : null,
+        warnings: [`AI cover letter was rejected (${reason}); the validated deterministic letter was used.`],
+      };
     }
-    return { salutation, paragraphs, closing, tailoredWithAi: true, provider: result.provider, model: result.model, warnings: [] };
+    return { salutation, paragraphs, closing, tailoredWithAi: true, provider: result.provider, model: result.model, warnings: [], diagnostics };
   } catch (error) {
-    return { ...fallback, warnings: [`AI cover letter was unavailable (${error instanceof Error ? error.message : "unknown error"}); deterministic letter retained.`] };
+    return {
+      ...fallback,
+      diagnostics: diagnosticsFromError(error),
+      warnings: [`AI cover letter was unavailable (${error instanceof Error ? error.message : "unknown error"}); the validated deterministic letter was retained.`],
+    };
   }
 }

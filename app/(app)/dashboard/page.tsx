@@ -12,6 +12,8 @@ import { SubmitButton } from "@/components/SubmitButton";
 import { Icon } from "@/components/icons";
 import { statusLabel, statusClass } from "@/lib/application-status";
 import { boardColumnForRow } from "@/lib/application-board";
+import { getDashboardSnapshot } from "@/lib/dashboard-live";
+import { AgentCommandDashboard } from "@/components/AgentCommandDashboard";
 
 export const dynamic = "force-dynamic";
 
@@ -83,6 +85,10 @@ export default async function DashboardPage({
       ? one<{ id: string; label: string }>("SELECT id, label FROM workflows WHERE status = 'paused' ORDER BY created_at DESC LIMIT 1")
       : null;
 
+  // Live workforce projection: persisted roster, task ledger, provider usage
+  // and the last actual health check. Unavailable measurements stay null.
+  const workforce = getDashboardSnapshot();
+
   return (
     <>
       <Flash ok={param(sp.ok)} error={param(sp.error)} saved={param(sp.saved)} />
@@ -134,6 +140,8 @@ export default async function DashboardPage({
           tone="amber"
         />
       </section>
+
+      <AgentCommandDashboard initialSnapshot={workforce} />
 
       {completeness < 100 || !profile.profile.email ? (
         <div className="alert alert-info mb-4">

@@ -60,7 +60,7 @@ const nextConfig: NextConfig = {
     ];
   },
   outputFileTracingRoot: process.cwd(),
-  serverExternalPackages: ["mammoth", "unpdf", "pdf-lib", "docx"],
+  serverExternalPackages: ["mammoth", "unpdf", "pdf-lib", "docx", "playwright"],
   experimental: {
     serverActions: { bodySizeLimit: "12mb" },
     // Hydration must not wait for the dev-only React debug channel. When HMR is

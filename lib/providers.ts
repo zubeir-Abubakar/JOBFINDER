@@ -1,6 +1,30 @@
+import { randomUUID } from "node:crypto";
+import { GoogleGenAI } from "@google/genai";
 import { all, nowIso, one, run } from "./db.ts";
 import { getSetting, setSetting } from "./settings";
 import { notify } from "./notify";
+import {
+  AiSpendingPolicyError,
+  authorizeAiRequest,
+  evaluateAiPolicy,
+  markPolicyNetworkTransmitted,
+  type AiPolicyDecision,
+} from "./ai-spending-policy";
+import {
+  FREE_TIER_STATE_LABEL,
+  freeTierStatus,
+  recordFreeTierFailure,
+  recordFreeTierSuccess,
+  type FreeTierState,
+} from "./free-tier";
+import { agentRoutePreference, freeTierRouteOrder } from "./agent-models";
+import {
+  OpenRouterRequestError,
+  checkOpenRouterCredential,
+  openRouterStatus,
+  openRouterTextConfig,
+  validateOpenRouterFreeModel,
+} from "./openrouter";
 import { clearProviderCooldowns,
   classifyProviderFailure,
   isFailClosedFailure,
@@ -16,12 +40,15 @@ import { clearProviderCooldowns,
 /**
  * Shared AI provider service.
  *
- * FreeLLMAPI (local OpenAI-compatible gateway) is the primary inference path.
- * When it is configured, a recoverable failure (rate limit, cooldown, network
- * error, timeout or provider outage) can fall back to an explicitly enabled
- * local Ollama instance. Non-recoverable request/configuration/auth failures
- * fail closed and are never hidden by a fallback. Gemini/OpenRouter remain
- * non-permitted for text inference; Gemini Live is a separate voice path.
+ * FreeLLMAPI (local OpenAI-compatible gateway) and Gemini are the default
+ * free-tier text paths. OpenRouter is an additional opt-in route: it accepts
+ * only one exact catalogue-verified `:free` model, checks the authenticated key
+ * and zero pricing before transmission, and never falls through to Ollama when
+ * an agent is explicitly assigned to it. When a default route is configured, a
+ * recoverable failure can fall back to the other verified free tier or an
+ * explicitly enabled local Ollama instance. Non-recoverable
+ * request/configuration/auth failures fail closed. Gemini Live is a separate
+ * voice path.
  *
  * A successful primary call clears the gateway cooldown, so the next request
  * returns to FreeLLMAPI automatically. A fallback result is never cached as a
@@ -45,6 +72,22 @@ export type ProviderHealth = {
   latencyMs: number | null;
   /** When this health result was produced. */
   checkedAt?: string | null;
+  /** True when metadata is reachable but inference is blocked by policy. */
+  policyBlocked?: boolean;
+  executionType?: "local" | "verified_free_external" | "owner_authorised_external" | "blocked";
+  policyReason?: string | null;
+  /** Free-tier state for the external providers; absent for OpenRouter. */
+  freeTierState?: FreeTierState;
+  /** Separate speech diagnostics; a text provider can be healthy while TTS is retired. */
+  tts?: {
+    enabled: boolean;
+    model: string;
+    voice: string;
+    provider: string;
+    expiresAt: string | null;
+    valid: boolean;
+    detail: string;
+  };
 };
 
 export type Usage = { promptTokens: number; completionTokens: number; totalTokens: number };
@@ -67,6 +110,22 @@ export type AiCallSource = "task" | "assistant" | "admin_test" | "manual" | "leg
 /** 0 = interactive, 1 = workflow, 2 = advisory queue. */
 export type AiPriority = 0 | 1 | 2;
 
+export type ProviderDiagnostics = {
+  requestId: string;
+  provider: ProviderName | null;
+  model: string | null;
+  httpStatus: number | null;
+  durationMs: number;
+  errorClass: string | null;
+  retryCount: number;
+  fallbackDecision: "primary" | "gemini" | "freellmapi" | "openrouter" | "ollama" | "none";
+  /** Provider that failed before a local fallback was selected. */
+  fallbackFrom?: ProviderName | null;
+  /** Credential-free reason the fallback was selected. */
+  fallbackReason?: string | null;
+  usableContent: boolean;
+};
+
 export type GenerateResult = {
   text: string;
   provider: ProviderName;
@@ -79,6 +138,8 @@ export type GenerateResult = {
   costChf: null;
   costStatus: CostStatus;
   routedVia: RoutedVia;
+  /** Safe, credential-free request evidence for persisted task diagnostics. */
+  diagnostics?: ProviderDiagnostics;
 };
 
 export type GenerateInput = {
@@ -88,6 +149,8 @@ export type GenerateInput = {
   temperature?: number;
   maxTokens?: number;
   technical?: boolean;
+  /** Ask a capable provider for a JSON object; fallback uses Ollama JSON mode. */
+  format?: "json";
   workflowId?: string | null;
   /** The task that caused this call. Required for source="task". */
   taskId?: string | null;
@@ -141,6 +204,13 @@ export class AiProviderConfigError extends AiProviderError {
   }
 }
 
+export function diagnosticsFromError(error: unknown): ProviderDiagnostics | null {
+  if (!error || typeof error !== "object") return null;
+  const diagnostics = (error as { diagnostics?: unknown }).diagnostics;
+  if (!diagnostics || typeof diagnostics !== "object") return null;
+  return diagnostics as ProviderDiagnostics;
+}
+
 export function isTemporaryAiError(error: unknown): boolean {
   return (
     error instanceof AiRateLimitedError ||
@@ -162,7 +232,9 @@ export function isRecoverableProviderError(error: unknown): boolean {
 }
 
 const HEALTH_TTL_MS = 30_000;
+const HEALTH_SNAPSHOT_KEY = "ai_provider_health_snapshot";
 type Cache = { at: number; items: ProviderHealth[] };
+export type CachedProviderHealth = { checkedAt: string; items: ProviderHealth[] };
 type AiSlotWaiter = { priority: number; queuedAt: number; grant: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
 type AiSlotState = { active: number; waiters: AiSlotWaiter[] };
 const g = globalThis as typeof globalThis & {
@@ -182,7 +254,10 @@ function config() {
   const env = process.env;
   return {
     budgetChf: Number(env.AI_BUDGET_LIMIT_CHF ?? "0") || 0,
-    maxRetries: Math.max(0, Math.min(4, Number(env.AI_MAX_RETRIES ?? "2") || 2)),
+    maxRetries: (() => {
+      const parsed = Number(env.AI_MAX_RETRIES ?? "2");
+      return Number.isFinite(parsed) ? Math.max(0, Math.min(4, parsed)) : 2;
+    })(),
     primary: (env.AI_PRIMARY_PROVIDER ?? "freellmapi").trim().toLowerCase(),
     freellmapi: {
       enabled: (env.FREELLMAPI_ENABLED ?? "false") === "true",
@@ -195,13 +270,15 @@ function config() {
     gemini: {
       enabled: Boolean(env.GEMINI_API_KEY),
       key: env.GEMINI_API_KEY ?? "",
-      model: env.GEMINI_MODEL ?? "gemini-2.0-flash",
+      model: (env.GEMINI_MODEL ?? "gemini-3.6-flash").trim(),
       base: "https://generativelanguage.googleapis.com/v1beta",
     },
     openrouter: {
-      enabled: (env.OPENROUTER_ENABLED ?? "false") === "true" && Boolean(env.OPENROUTER_API_KEY),
+      enabled: (env.OPENROUTER_ENABLED ?? "false") === "true",
       key: env.OPENROUTER_API_KEY ?? "",
-      model: env.OPENROUTER_MODEL ?? "openrouter/free",
+      base: (env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1").trim().replace(/\/+$/, ""),
+      model: (env.OPENROUTER_MODEL ?? "").trim(),
+      assignedAgents: csv(env.OPENROUTER_ASSIGNED_AGENTS),
       allowPaid: (env.OPENROUTER_ALLOW_PAID_MODELS ?? "false") === "true",
     },
     ollama: {
@@ -452,9 +529,9 @@ export function freeLlmPolicyIssue(): string | null {
   return null;
 }
 
-/** Gateway configured AND the zero-cost model policy passes. */
+/** Gateway configured, model policy passes, and the declared free tier is available. */
 export function freeLlmUsable(): boolean {
-  return freeLlmConfigured() && freeLlmPolicyIssue() === null;
+  return freeLlmConfigured() && freeLlmPolicyIssue() === null && freeTierStatus("freellmapi").allowed;
 }
 
 export function ollamaConfigured(): boolean {
@@ -462,19 +539,36 @@ export function ollamaConfigured(): boolean {
   return c.enabled && Boolean(c.base) && Boolean(c.model);
 }
 
+/** A loopback Ollama model that is both configured and policy-authorised. */
+export function localFallbackAllowed(model?: string | null): boolean {
+  const c = config().ollama;
+  if (!c.enabled || !c.base) return false;
+  const chosen = (model ?? c.model).trim();
+  if (!chosen) return false;
+  return evaluateAiPolicy({ provider: "ollama", model: chosen }).allowed;
+}
+
+/** Gemini text is available only through a verified, non-exhausted free tier. */
+export function geminiConfigured(): boolean {
+  const c = config().gemini;
+  return Boolean(c.enabled && c.key && c.model) && freeTierStatus("gemini").allowed;
+}
+
+/** True when the operator's preferred primary is Gemini. */
+export function geminiSelectedForText(): boolean {
+  return config().primary === "gemini";
+}
+
 /**
  * One shared answer for the Coordinator and every specialist.
  *
- * A configured-but-policy-invalid FreeLLMAPI is a configuration error, not a
- * runtime outage: fail closed instead of silently moving every call to Ollama.
- * If FreeLLMAPI is not configured at all, an enabled local Ollama can serve the
- * text agents.
+ * Any verified, non-exhausted free route counts as configured. A local Ollama
+ * endpoint can serve text on its own. A configured-but-unverified external
+ * route is a configuration gap, not a runtime outage: the policy fails closed
+ * before transmission instead of silently moving the call to another provider.
  */
 export function providerConfigured(): boolean {
-  if (freeLlmConfigured()) return freeLlmUsable();
-  // Gemini and OpenRouter are never text providers. A key for either one must
-  // not make the Coordinator look available when no text route exists.
-  return ollamaConfigured();
+  return freeLlmUsable() || geminiConfigured() || localFallbackAllowed(config().ollama.model);
 }
 
 /** Synchronous view of the latest health check in this process, if any. */
@@ -487,103 +581,70 @@ export type ProviderSnapshot = {
   activeProvider?: ProviderName | null;
   activeModel?: string | null;
   fallbackEnabled?: boolean;
+  fallbackAvailable?: boolean | null;
+  fallbackModel?: string | null;
 };
 
 export function providerStatusSnapshot(): ProviderSnapshot {
-  const cooling = gatewayCooldownStatus();
   const cached = g.__atwProviderHealth;
-  const fl = cached?.items.find((item) => item.name === "freellmapi");
-  const ollama = cached?.items.find((item) => item.name === "ollama");
-  const fallbackEnabled = ollamaConfigured();
+  const reading = (name: ProviderName) => cached?.items.find((item) => item.name === name) ?? null;
+  const ollama = reading("ollama");
+  const gemini = reading("gemini");
+  const freellmapi = reading("freellmapi");
   const checkedAt = cached ? new Date(cached.at).toISOString() : null;
+  const geminiTier = freeTierStatus("gemini");
+  const freeLlmTier = freeTierStatus("freellmapi");
+  const checkHealth = () => evaluateAiPolicy({ provider: "ollama", model: config().ollama.model });
+  const localPolicy = checkHealth();
+  const fallbackEnabled = localFallbackAllowed(config().ollama.model);
+  const fallbackAvailable = fallbackEnabled && ollama ? ollama.available : null;
+  const order: Array<"gemini" | "freellmapi" | "ollama"> = geminiSelectedForText()
+    ? ["gemini", "freellmapi", "ollama"]
+    : ["freellmapi", "gemini", "ollama"];
+  const candidates = order.map((name) => ({ name, reading: reading(name) }));
+  const active = candidates.find((candidate) => candidate.reading?.available)?.reading ?? null;
+  const configured = providerConfigured();
+  const tierDetail = `Gemini: ${FREE_TIER_STATE_LABEL[geminiTier.state]}${geminiTier.allowed ? "" : ` (${geminiTier.detail})`}. FreeLLMAPI: ${FREE_TIER_STATE_LABEL[freeLlmTier.state]}${freeLlmTier.allowed ? "" : ` (${freeLlmTier.detail})`}.`;
 
-  // A policy/configuration fault is not a provider outage. Never advertise the
-  // local fallback as a way around missing FreeLLMAPI configuration.
-  if (freeLlmConfigured() && !freeLlmUsable()) {
+  if (active) {
+    return {
+      configured,
+      available: true,
+      detail: `${tierDetail} Active route: ${active.name}/${active.model}.`,
+      model: active.model,
+      checkedAt,
+      activeProvider: active.name,
+      activeModel: active.model,
+      fallbackEnabled,
+      fallbackAvailable,
+      fallbackModel: config().ollama.model || null,
+    };
+  }
+  if (!configured) {
     return {
       configured: false,
       available: false,
-      detail: freeLlmPolicyIssue() ?? "FreeLLMAPI configuration is invalid.",
-      model: config().freellmapi.model,
+      detail: `${tierDetail} ${localPolicy.block_reason ?? "No authorised inference route is available."}`,
+      model: geminiTier.model ?? freeLlmTier.model ?? "not configured",
       checkedAt,
       activeProvider: null,
       activeModel: null,
       fallbackEnabled,
+      fallbackAvailable,
+      fallbackModel: config().ollama.model || null,
     };
   }
-
-  if (cooling.remainingMs > 0) {
-    if (ollama?.available) {
-      return {
-        configured: true,
-        available: true,
-        detail: `FreeLLMAPI cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s; Ollama fallback is ready. ${cooling.reason ?? ""}`.trim(),
-        model: ollama.model,
-        checkedAt: checkedAt ?? new Date().toISOString(),
-        activeProvider: "ollama",
-        activeModel: ollama.model,
-        fallbackEnabled,
-      };
-    }
-    return {
-      configured: freeLlmConfigured() || ollamaConfigured(),
-      available: false,
-      detail: `FreeLLMAPI is cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s. Ollama fallback is ${fallbackEnabled ? (ollama?.detail ?? "not verified") : "disabled"}. ${cooling.reason ?? ""}`.trim(),
-      model: config().freellmapi.model,
-      checkedAt: checkedAt ?? new Date().toISOString(),
-      activeProvider: null,
-      activeModel: null,
-      fallbackEnabled,
-    };
-  }
-
-  if (freeLlmConfigured()) {
-    if (fl?.available) {
-      return {
-        configured: true,
-        available: true,
-        detail: fl.detail,
-        model: fl.model,
-        checkedAt,
-        activeProvider: "freellmapi",
-        activeModel: fl.model,
-        fallbackEnabled,
-      };
-    }
-    if (ollama?.available) {
-      return {
-        configured: true,
-        available: true,
-        detail: `FreeLLMAPI is unavailable; Ollama fallback is ready. ${fl?.detail ?? ""}`.trim(),
-        model: ollama.model,
-        checkedAt: checkedAt ?? new Date().toISOString(),
-        activeProvider: "ollama",
-        activeModel: ollama.model,
-        fallbackEnabled,
-      };
-    }
-    return {
-      configured: true,
-      available: fl ? fl.available : null,
-      detail: fl?.detail ?? "Health has not been checked in this process yet.",
-      model: fl?.model ?? config().freellmapi.model,
-      checkedAt,
-      activeProvider: null,
-      activeModel: null,
-      fallbackEnabled,
-    };
-  }
-
-  const usable = cached ? cached.items.some((item) => item.enabled && item.available) : null;
   return {
-    configured: ollamaConfigured(),
-    available: usable,
-    detail: ollama?.detail ?? fl?.detail ?? "FreeLLMAPI is not configured.",
-    model: ollama?.model ?? fl?.model ?? config().freellmapi.model,
+    configured: true,
+    available: null,
+    detail: `${tierDetail} No provider health result has been recorded in this process yet.`,
+    model: (geminiTier.allowed ? geminiTier.model : freeLlmTier.model) ?? config().ollama.model,
     checkedAt,
-    activeProvider: ollama?.available ? "ollama" : null,
-    activeModel: ollama?.available ? ollama.model : null,
+    activeProvider: null,
+    activeModel: null,
     fallbackEnabled,
+    fallbackAvailable,
+    fallbackModel: config().ollama.model || null,
   };
 }
 
@@ -597,27 +658,40 @@ export type ConfiguredTextProvider = {
 
 export function configuredTextProvider(): ConfiguredTextProvider {
   const c = config();
-  if (freeLlmConfigured()) {
-    return {
-      provider: "freellmapi",
-      model: c.freellmapi.model || null,
-      source: "primary",
-      detail: "Shared FreeLLMAPI text route configured for every agent.",
-    };
+  const geminiTier = freeTierStatus("gemini");
+  const freeLlmTier = freeTierStatus("freellmapi");
+  const geminiRoute: ConfiguredTextProvider = {
+    provider: "gemini",
+    model: c.gemini.model || null,
+    source: "primary",
+    detail: `Gemini ${c.gemini.model} is the free-tier route (${FREE_TIER_STATE_LABEL[geminiTier.state]}). A cross-provider free-tier or loopback Ollama fallback may be used only for a recoverable route failure.`,
+  };
+  const freeLlmRoute: ConfiguredTextProvider = {
+    provider: "freellmapi",
+    model: c.freellmapi.model || null,
+    source: "primary",
+    detail: `FreeLLMAPI ${c.freellmapi.model} is the pinned free-tier route (${FREE_TIER_STATE_LABEL[freeLlmTier.state]}). A cross-provider free-tier or loopback Ollama fallback may be used only for a recoverable route failure.`,
+  };
+  if (geminiSelectedForText()) {
+    if (geminiConfigured()) return geminiRoute;
+    if (freeLlmUsable()) return freeLlmRoute;
+  } else {
+    if (freeLlmUsable()) return freeLlmRoute;
+    if (geminiConfigured()) return geminiRoute;
   }
-  if (ollamaConfigured()) {
+  if (localFallbackAllowed(c.ollama.model)) {
     return {
       provider: "ollama",
       model: c.ollama.model || null,
       source: "fallback",
-      detail: "FreeLLMAPI is not configured; the shared route is the local Ollama model.",
+      detail: "No external free tier is verified and available. Loopback Ollama is the only authorised text route; paid inference is never used.",
     };
   }
   return {
     provider: null,
     model: null,
     source: null,
-    detail: "No shared text provider is configured.",
+    detail: `No authorised text route is available. Gemini: ${FREE_TIER_STATE_LABEL[geminiTier.state]}. FreeLLMAPI: ${FREE_TIER_STATE_LABEL[freeLlmTier.state]}. ${freeLlmTier.detail}`,
   };
 }
 
@@ -702,9 +776,11 @@ function timeout(ms: number): AbortSignal {
 
 async function freeLlmHealth(): Promise<ProviderHealth> {
   const c = config().freellmapi;
+  const guard = evaluateAiPolicy({ provider: "freellmapi", model: c.model });
+  const tier = freeTierStatus("freellmapi");
   const base: ProviderHealth = {
     name: "freellmapi",
-    label: "FreeLLMAPI (local gateway)",
+    label: "FreeLLMAPI (external gateway · free tier)",
     enabled: c.enabled,
     configured: freeLlmConfigured(),
     available: false,
@@ -712,6 +788,10 @@ async function freeLlmHealth(): Promise<ProviderHealth> {
     models: [],
     detail: "",
     latencyMs: null,
+    policyBlocked: !guard.allowed,
+    executionType: guard.execution_type,
+    policyReason: guard.block_reason,
+    freeTierState: tier.state,
   };
   if (!c.enabled) return { ...base, detail: "FREELLMAPI_ENABLED is not true." };
   if (!c.key) return { ...base, detail: "FREELLMAPI_API_KEY is not set." };
@@ -763,10 +843,19 @@ async function freeLlmHealth(): Promise<ProviderHealth> {
         detail: `${c.model} is not in the gateway catalogue (${models.length} models listed). No substitution was attempted.`,
       };
     }
+    if (!tier.allowed) {
+      return {
+        ...base,
+        models,
+        detail: `${models.length} models available and the pinned ${c.model} is catalogued, but inference is blocked: ${tier.detail} Metadata reachability is not free-tier eligibility.`,
+      };
+    }
     return {
       ...base,
       available: true,
-      detail: `${models.length} models available. Pinned ${c.model} is catalogued and allowlisted; resolution must be the pinned id or a declared alias. Cost remains unverified (the gateway publishes no pricing).`,
+      policyBlocked: false,
+      executionType: "verified_free_external",
+      detail: `${models.length} models available. Pinned ${c.model} is catalogued, allowlisted and declared free-tier (${FREE_TIER_STATE_LABEL[tier.state]}). If its quota is exhausted the route is paused, never upgraded to a paid request.`,
     };
   } catch (error) {
     base.latencyMs = Date.now() - started;
@@ -776,36 +865,91 @@ async function freeLlmHealth(): Promise<ProviderHealth> {
 
 async function geminiHealth(): Promise<ProviderHealth> {
   const c = config().gemini;
+  const guard = evaluateAiPolicy({ provider: "gemini", model: c.model });
+  const tier = freeTierStatus("gemini");
   const base: ProviderHealth = {
     name: "gemini",
-    label: "Google Gemini (not permitted)",
+    label: "Google Gemini (free tier)",
     enabled: c.enabled,
-    configured: c.enabled,
+    configured: Boolean(c.enabled && c.model),
     available: false,
     model: c.model,
-    models: [],
+    models: c.model ? [c.model] : [],
     detail: "",
     latencyMs: null,
+    policyBlocked: !guard.allowed,
+    executionType: guard.execution_type,
+    policyReason: guard.block_reason,
+    freeTierState: tier.state,
   };
-  if (!c.enabled) return { ...base, detail: "GEMINI_API_KEY is not set. FreeLLMAPI is the only permitted gateway." };
-  return { ...base, detail: "Configured but not used: fallback to Gemini is disabled." };
+  if (!c.enabled) return { ...base, detail: "GEMINI_API_KEY is not set. No Gemini request is made." };
+  if (!c.model) return { ...base, detail: "GEMINI_MODEL is not set. No model is guessed." };
+  if (!tier.allowed) return { ...base, detail: tier.detail };
+  if (!guard.allowed) return { ...base, detail: guard.block_reason ?? "Gemini policy check failed." };
+  const last = one<{ status: string; model: string; created_at: string; error: string | null }>(
+    "SELECT status, model, created_at, error FROM provider_usage WHERE provider = 'gemini' ORDER BY id DESC LIMIT 1",
+  );
+  if (!last) {
+    return {
+      ...base,
+      detail: `${c.model} is declared free-tier (${FREE_TIER_STATE_LABEL[tier.state]}). No Gemini inference has been recorded yet; availability is not claimed from configuration alone.`,
+    };
+  }
+  if (last.status === "ok") {
+    return {
+      ...base,
+      available: true,
+      model: last.model || c.model,
+      executionType: "verified_free_external",
+      detail: `Last Gemini inference succeeded with ${last.model || c.model} at ${last.created_at} on the declared free tier. Exhaustion pauses this route; it is never upgraded to a paid request.`,
+    };
+  }
+  return {
+    ...base,
+    detail: `Last Gemini inference failed with ${last.model || c.model} at ${last.created_at}: ${last.error ?? "unknown error"}. A verified FreeLLMAPI free tier or loopback Ollama route may be used for recoverable failures; authentication, configuration and paid-model failures fail closed.`,
+  };
 }
 
 async function openRouterHealth(): Promise<ProviderHealth> {
   const c = config().openrouter;
+  const guard = evaluateAiPolicy({ provider: "openrouter", model: c.model });
   const base: ProviderHealth = {
     name: "openrouter",
-    label: "OpenRouter (not permitted)",
+    label: "OpenRouter (provider-verified free models)",
     enabled: c.enabled,
-    configured: c.enabled,
+    configured: c.enabled && Boolean(c.key) && Boolean(c.model),
     available: false,
     model: c.model,
     models: [],
     detail: "",
     latencyMs: null,
+    policyBlocked: true,
+    executionType: "blocked",
+    policyReason: guard.block_reason,
   };
-  if (!c.enabled) return { ...base, detail: "OPENROUTER_ENABLED is false. FreeLLMAPI is the only permitted gateway." };
-  return { ...base, detail: "Configured but not used: fallback to OpenRouter is disabled." };
+  if (!c.enabled) return { ...base, detail: "OPENROUTER_ENABLED is not true. No OpenRouter request is transmitted." };
+  if (!c.key) return { ...base, detail: "OPENROUTER_API_KEY is not set. No OpenRouter request is transmitted." };
+  if (!c.model) return { ...base, detail: "OPENROUTER_MODEL is not set. No model is guessed and no request is transmitted." };
+
+  const status = await openRouterStatus();
+  const assignment = c.assignedAgents.length > 0 ? c.assignedAgents.join(", ") : "no agents assigned";
+  return {
+    ...base,
+    available: status.text.valid,
+    policyBlocked: !status.text.valid,
+    executionType: status.text.valid ? "verified_free_external" : "blocked",
+    policyReason: status.text.policyIssue,
+    detail: `${status.text.detail} Assignments: ${assignment}. ${status.tts.detail}`,
+    tts: {
+      enabled: status.tts.enabled,
+      model: status.tts.model,
+      voice: status.tts.voice,
+      provider: status.tts.provider,
+      expiresAt: status.tts.expiresAt,
+      valid: status.tts.valid,
+      detail: status.tts.detail,
+    },
+  };
 }
 
 function safeEndpoint(raw: string): string {
@@ -894,9 +1038,10 @@ export async function testOllamaConnection(): Promise<OllamaConnectionTest> {
 
 async function ollamaHealth(): Promise<ProviderHealth> {
   const c = config().ollama;
+  const guard = evaluateAiPolicy({ provider: "ollama", model: c.model });
   const base: ProviderHealth = {
     name: "ollama",
-    label: "Ollama (local fallback)",
+    label: "Ollama (local only)",
     enabled: c.enabled,
     configured: c.enabled && Boolean(c.base) && Boolean(c.model),
     available: false,
@@ -904,11 +1049,15 @@ async function ollamaHealth(): Promise<ProviderHealth> {
     models: [],
     detail: "",
     latencyMs: null,
+    policyBlocked: !guard.allowed,
+    executionType: guard.execution_type,
+    policyReason: guard.block_reason,
   };
   if (!c.enabled) return { ...base, detail: "OLLAMA_ENABLED is false. No local model is loaded or contacted." };
   if (!c.base) return { ...base, detail: "OLLAMA_BASE_URL is not set." };
   if (!c.model) return { ...base, detail: "OLLAMA_MODEL is not set." };
   if (!c.coderModel) return { ...base, detail: "OLLAMA_CODER_MODEL is not set; coding-specific fallback is unavailable." };
+  if (!guard.allowed) return { ...base, detail: guard.block_reason ?? "Ollama is not verified as local." };
   const started = Date.now();
   try {
     const response = await fetch(`${c.base}/api/tags`, { signal: timeout(5_000), cache: "no-store" });
@@ -940,6 +1089,23 @@ async function ollamaHealth(): Promise<ProviderHealth> {
   }
 }
 
+/**
+ * Latest health results without sending a request. The in-process cache is
+ * preferred; the persisted snapshot survives a restart. This is deliberately
+ * read-only and is used by the lightweight authenticated status route.
+ */
+export function cachedProviderHealth(): CachedProviderHealth | null {
+  const cached = g.__atwProviderHealth;
+  if (cached) return { checkedAt: new Date(cached.at).toISOString(), items: cached.items };
+  try {
+    const saved = getSetting<CachedProviderHealth | null>(HEALTH_SNAPSHOT_KEY, null);
+    if (!saved || typeof saved.checkedAt !== "string" || !Array.isArray(saved.items)) return null;
+    return saved;
+  } catch {
+    return null;
+  }
+}
+
 export async function providerHealth(force = false): Promise<ProviderHealth[]> {
   const cached = g.__atwProviderHealth;
   if (!force && cached && Date.now() - cached.at < HEALTH_TTL_MS) return cached.items;
@@ -954,6 +1120,11 @@ export async function providerHealth(force = false): Promise<ProviderHealth[]> {
   );
   const cacheable = rateLimited ? stamped.filter((item) => item.name !== "freellmapi") : stamped;
   g.__atwProviderHealth = { at: Date.now(), items: cacheable };
+  try {
+    setSetting(HEALTH_SNAPSHOT_KEY, { checkedAt, items: stamped });
+  } catch {
+    // Status persistence is advisory; the in-process health result still applies.
+  }
   return stamped;
 }
 
@@ -972,23 +1143,34 @@ export function recordUsage(input: {
   status: string;
   error?: string | null;
   routedVia?: RoutedVia;
-}) {
-  // A call cannot claim to be task-bound without a task. Misconfiguration is
-  // recorded as a manual call instead of creating unattributable task usage.
+  fallbackFrom?: ProviderName | null;
+  fallbackReason?: string | null;
+}): boolean {
+  // Task attribution is proven here, at the single usage writer. A caller may
+  // request a task link, but it is retained only when the task exists and is
+  // owned by the same agent. A missing or mismatched link stays source="task"
+  // with task_id=NULL, which the dashboard reports as unresolved. It is never
+  // silently converted into background usage or moved to another agent.
   const requested = input.source ?? (input.taskId ? "task" : "manual");
-  const source: AiCallSource = requested === "task" && !input.taskId ? "manual" : requested;
+  let source: AiCallSource = requested;
+  let taskId = input.taskId ?? null;
+  const agentKey = input.agentKey;
+  if (source === "task" && taskId) {
+    const task = one<{ agent_key: string }>("SELECT agent_key FROM tasks WHERE id = ?", [taskId]);
+    if (!task || task.agent_key !== agentKey) taskId = null;
+  }
   try {
     // cost_chf stays 0 for schema compatibility but cost_status records that the
     // figure is unverified: the gateway publishes no pricing metadata.
     run(
-      `INSERT INTO provider_usage (provider, model, agent_key, workflow_id, task_id, session_id, source, prompt_tokens, completion_tokens, total_tokens, cached_tokens, usage_source, cost_chf, cost_status, routed_platform, routed_model, latency_ms, status, error, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'unverified', ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO provider_usage (provider, model, agent_key, workflow_id, task_id, session_id, source, prompt_tokens, completion_tokens, total_tokens, cached_tokens, usage_source, cost_chf, cost_status, routed_platform, routed_model, latency_ms, status, error, fallback_from, fallback_reason, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'unverified', ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         input.provider,
         input.model,
-        input.agentKey,
+        agentKey,
         input.workflowId ?? null,
-        input.taskId ?? null,
+        taskId,
         input.sessionId ?? null,
         source,
         input.usage.promptTokens,
@@ -1001,22 +1183,45 @@ export function recordUsage(input: {
         input.latencyMs,
         input.status,
         input.error ? scrub(input.error) : null,
+        input.fallbackFrom ?? null,
+        input.fallbackReason ? scrub(input.fallbackReason) : null,
         nowIso(),
       ],
     );
+    // Task execution metadata is a projection of the same usage rows, not a
+    // second hand-maintained record. Every provider call (including a failed
+    // attempt) updates attempts, provider/model and AI execution mode together.
+    if (source === "task" && taskId) {
+      run(
+        `UPDATE tasks SET
+           provider = (SELECT provider FROM provider_usage WHERE task_id = ? ORDER BY id DESC LIMIT 1),
+           model = (SELECT model FROM provider_usage WHERE task_id = ? ORDER BY id DESC LIMIT 1),
+           execution_mode = 'ai',
+           attempts = (SELECT COUNT(*) FROM provider_usage WHERE task_id = ? AND agent_key = ? AND source = 'task'),
+           ai_outcome = CASE WHEN EXISTS (
+             SELECT 1 FROM provider_usage WHERE task_id = ? AND agent_key = ? AND source = 'task' AND status = 'ok'
+           ) THEN 'ok' ELSE 'failed' END
+         WHERE id = ? AND agent_key = ?`,
+        [taskId, taskId, taskId, agentKey, taskId, agentKey, taskId, agentKey],
+      );
+    }
     // One place updates the roster counters, so they are exactly the count of
-    // task-sourced calls. Attempts count individually; a retry is a failed call.
-    if (source === "task" && input.taskId) {
+    // valid task-sourced calls. Assistant/manual and unresolved rows never move
+    // these counters.
+    if (source === "task" && taskId) {
       if (input.status === "ok") {
-        run("UPDATE agents SET ai_success_count = ai_success_count + 1 WHERE key = ?", [input.agentKey]);
+        run("UPDATE agents SET ai_success_count = ai_success_count + 1 WHERE key = ?", [agentKey]);
       } else if (input.status === "error") {
-        run("UPDATE agents SET ai_failure_count = ai_failure_count + 1 WHERE key = ?", [input.agentKey]);
+        run("UPDATE agents SET ai_failure_count = ai_failure_count + 1 WHERE key = ?", [agentKey]);
       }
     }
+    return true;
   } catch (error) {
     // Usage tracking must never break an agent run, but a silent failure would
-    // make the roster lie, so it is reported on the server log (scrubbed).
+    // make the roster lie, so it is reported on the server log (scrubbed) and
+    // the caller is told the row was not persisted.
     console.error("[ai-usage] failed to record call", scrub(error instanceof Error ? error.message : "unknown error"));
+    return false;
   }
 }
 
@@ -1041,7 +1246,7 @@ function providerHttpFailure(
   if (status === 401 || status === 403) {
     return new AiProviderConfigError(provider, `Authentication failed (HTTP ${status}): ${message}`);
   }
-  if (status === 400 || status === 404 || status === 409 || status === 422) {
+  if (status === 400 || status === 402 || status === 404 || status === 409 || status === 422) {
     return new AiProviderConfigError(provider, `Request/model configuration failed (HTTP ${status}): ${message}`);
   }
   return new AiProviderError(provider, `Provider HTTP ${status}: ${message}`, status === 408 || status === 425 || status >= 500, status);
@@ -1049,6 +1254,8 @@ function providerHttpFailure(
 
 async function callFreeLlmStreaming(input: GenerateInput & { onDelta: (delta: string) => void }): Promise<GenerateResult> {
   const c = config().freellmapi;
+  const guard = evaluateAiPolicy({ provider: "freellmapi", model: c.model });
+  if (!guard.allowed) throw new AiSpendingPolicyError(guard);
   try {
     assertPermittedModel(c.model);
   } catch (error) {
@@ -1152,6 +1359,8 @@ async function callFreeLlmStreaming(input: GenerateInput & { onDelta: (delta: st
 async function callFreeLlm(input: GenerateInput): Promise<GenerateResult> {
   if (input.onDelta) return callFreeLlmStreaming(input as GenerateInput & { onDelta: (delta: string) => void });
   const c = config().freellmapi;
+  const guard = evaluateAiPolicy({ provider: "freellmapi", model: c.model });
+  if (!guard.allowed) throw new AiSpendingPolicyError(guard);
   try {
     assertPermittedModel(c.model);
   } catch (error) {
@@ -1223,6 +1432,264 @@ async function callFreeLlm(input: GenerateInput): Promise<GenerateResult> {
   };
 }
 
+function openRouterFailure(error: unknown): Error {
+  if (error instanceof AiProviderError || error instanceof AiRateLimitedError) return error;
+  if (error instanceof OpenRouterRequestError) {
+    if (error.kind === "rate_limit") {
+      return new AiRateLimitedError(error.message, error.retryAfterMs ?? 30_000, error.status);
+    }
+    if (error.kind === "authentication" || error.kind === "configuration") {
+      return new AiProviderConfigError("openrouter", error.message);
+    }
+    return new AiProviderError("openrouter", error.message, true, error.status);
+  }
+  return new AiProviderError(
+    "openrouter",
+    scrub(error instanceof Error ? error.message : "OpenRouter request failed."),
+    true,
+  );
+}
+
+function openRouterValidationFailure(
+  validation: Exclude<Awaited<ReturnType<typeof validateOpenRouterFreeModel>>, { ok: true }>,
+): Error {
+  if (validation.code === "rate_limit") {
+    return new AiRateLimitedError(validation.reason, 30_000, 429);
+  }
+  if (validation.code === "provider_unavailable") {
+    return new AiProviderError("openrouter", validation.reason, true);
+  }
+  return new AiProviderConfigError("openrouter", validation.reason);
+}
+
+/**
+ * OpenRouter may report the base model id for a request made to its `:free`
+ * variant. That is the same published model, not a paid substitution. Any
+ * other id is discarded because it could be a silent upstream change.
+ */
+function assertOpenRouterResolution(requested: string, returned: string): void {
+  if (returned === requested) return;
+  if (requested.endsWith(":free") && returned === requested.slice(0, -5)) return;
+  throw new AiProviderConfigError(
+    "openrouter",
+    `Refused: OpenRouter resolved ${requested} to ${returned}, which is not the pinned free id or its exact base id. The response was discarded; no paid substitution is permitted.`,
+  );
+}
+
+function openRouterHeaders(key: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${key}`,
+    "Content-Type": "application/json",
+    "X-Title": "AT AI Workforce",
+  };
+  const referer = (process.env.APP_BASE_URL ?? "").trim();
+  if (referer) headers["HTTP-Referer"] = referer;
+  return headers;
+}
+
+async function callOpenRouterStreaming(
+  input: GenerateInput & { onDelta: (delta: string) => void },
+): Promise<GenerateResult> {
+  const c = openRouterTextConfig();
+  try {
+    await checkOpenRouterCredential();
+  } catch (error) {
+    throw openRouterFailure(error);
+  }
+  const validation = await validateOpenRouterFreeModel(c.model, "text", { checkKey: false });
+  if (!validation.ok) throw openRouterValidationFailure(validation);
+
+  const started = Date.now();
+  const response = await fetch(`${c.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: openRouterHeaders(c.key),
+    signal: timeout(60_000),
+    body: JSON.stringify({
+      model: c.model,
+      stream: true,
+      stream_options: { include_usage: true },
+      messages: [
+        { role: "system", content: input.system },
+        { role: "user", content: input.prompt },
+      ],
+      temperature: input.temperature ?? 0.2,
+      max_tokens: input.maxTokens ?? 800,
+      provider: { allow_fallbacks: false },
+      ...(input.format === "json" ? { response_format: { type: "json_object" } } : {}),
+    }),
+  });
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let payload: { error?: { message?: string } } = {};
+    try { payload = JSON.parse(raw) as { error?: { message?: string } }; } catch {}
+    throw providerHttpFailure(
+      "openrouter",
+      response.status,
+      payload.error?.message ?? raw.slice(0, 300) ?? `OpenRouter HTTP ${response.status}`,
+      response.headers,
+      payload,
+    );
+  }
+  if (!response.body) throw new AiProviderError("openrouter", "OpenRouter returned no streaming body.", true);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let text = "";
+  let model = c.model;
+  let provider: string | null = null;
+  let usagePayload: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+  } | null = null;
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("data:")) return;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === "[DONE]") return;
+    const payload = JSON.parse(data) as {
+      model?: string;
+      provider?: string;
+      choices?: Array<{ delta?: { content?: string }; text?: string }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number };
+      };
+      error?: { message?: string; code?: number };
+    };
+    if (payload.error) {
+      throw new AiProviderError("openrouter", payload.error.message ?? "OpenRouter stream error.", false, payload.error.code ?? null);
+    }
+    if (payload.model) model = payload.model;
+    if (payload.provider) provider = payload.provider;
+    if (payload.usage) usagePayload = payload.usage;
+    const delta = payload.choices?.[0]?.delta?.content ?? payload.choices?.[0]?.text ?? "";
+    if (delta) {
+      text += delta;
+      input.onDelta(delta);
+    }
+  };
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline = buffer.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffer.slice(0, newline).replace(/\r$/, "");
+      buffer = buffer.slice(newline + 1);
+      processLine(line);
+      newline = buffer.indexOf("\n");
+    }
+  }
+  if (buffer.trim()) processLine(buffer);
+  if (!text.trim()) throw new AiProviderError("openrouter", "OpenRouter returned an empty completion.", true);
+  assertOpenRouterResolution(c.model, model);
+  const usage = usagePayload as {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+    prompt_tokens_details?: { cached_tokens?: number };
+  } | null;
+  return {
+    text: text.trim(),
+    provider: "openrouter",
+    model,
+    usage: {
+      promptTokens: usage?.prompt_tokens ?? estimateTokens(input.prompt),
+      completionTokens: usage?.completion_tokens ?? estimateTokens(text),
+      totalTokens: usage?.total_tokens ?? estimateTokens(input.prompt) + estimateTokens(text),
+    },
+    usageSource: usage ? "provider" : "estimated",
+    cachedTokens: Number(usage?.prompt_tokens_details?.cached_tokens ?? 0),
+    latencyMs: Date.now() - started,
+    costChf: null,
+    costStatus: "unverified",
+    routedVia: { platform: provider, model },
+  };
+}
+
+async function callOpenRouter(input: GenerateInput): Promise<GenerateResult> {
+  if (input.onDelta) return callOpenRouterStreaming(input as GenerateInput & { onDelta: (delta: string) => void });
+  const c = openRouterTextConfig();
+  try {
+    await checkOpenRouterCredential();
+  } catch (error) {
+    throw openRouterFailure(error);
+  }
+  const validation = await validateOpenRouterFreeModel(c.model, "text", { checkKey: false });
+  if (!validation.ok) throw openRouterValidationFailure(validation);
+
+  const started = Date.now();
+  const response = await fetch(`${c.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: openRouterHeaders(c.key),
+    signal: timeout(60_000),
+    body: JSON.stringify({
+      model: c.model,
+      messages: [
+        { role: "system", content: input.system },
+        { role: "user", content: input.prompt },
+      ],
+      temperature: input.temperature ?? 0.2,
+      max_tokens: input.maxTokens ?? 800,
+      provider: { allow_fallbacks: false },
+      ...(input.format === "json" ? { response_format: { type: "json_object" } } : {}),
+    }),
+  });
+  const payload = (await response.json().catch(() => ({}))) as {
+    model?: string;
+    provider?: string;
+    choices?: Array<{ message?: { content?: unknown } }>;
+    usage?: {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      prompt_tokens_details?: { cached_tokens?: number };
+    };
+    error?: { message?: string; code?: number };
+  };
+  if (!response.ok) {
+    throw providerHttpFailure(
+      "openrouter",
+      response.status,
+      payload.error?.message ?? `OpenRouter HTTP ${response.status}`,
+      response.headers,
+      payload,
+    );
+  }
+  const rawContent = payload.choices?.[0]?.message?.content;
+  const text = (typeof rawContent === "string"
+    ? rawContent
+    : Array.isArray(rawContent)
+      ? rawContent
+          .map((part) => (part && typeof part === "object" && "text" in part ? String((part as { text?: unknown }).text ?? "") : ""))
+          .join("")
+      : "").trim();
+  if (!text) throw new AiProviderError("openrouter", "OpenRouter returned an empty completion.", true);
+  const model = String(payload.model ?? c.model);
+  assertOpenRouterResolution(c.model, model);
+  const usage = payload.usage;
+  return {
+    text,
+    provider: "openrouter",
+    model,
+    usage: {
+      promptTokens: usage?.prompt_tokens ?? estimateTokens(input.prompt),
+      completionTokens: usage?.completion_tokens ?? estimateTokens(text),
+      totalTokens: usage?.total_tokens ?? estimateTokens(input.prompt) + estimateTokens(text),
+    },
+    usageSource: usage ? "provider" : "estimated",
+    cachedTokens: Number(usage?.prompt_tokens_details?.cached_tokens ?? 0),
+    latencyMs: Date.now() - started,
+    costChf: null,
+    costStatus: "unverified",
+    routedVia: { platform: payload.provider ?? null, model },
+  };
+}
+
 function ollamaModelFor(input: GenerateInput): string {
   const c = config().ollama;
   return input.technical ? c.coderModel : c.model;
@@ -1230,6 +1697,8 @@ function ollamaModelFor(input: GenerateInput): string {
 
 async function callOllamaStreaming(input: GenerateInput & { onDelta: (delta: string) => void }): Promise<GenerateResult> {
   const c = config().ollama;
+  const guard = evaluateAiPolicy({ provider: "ollama", model: ollamaModelFor(input) });
+  if (!guard.allowed) throw new AiSpendingPolicyError(guard);
   if (!c.enabled) throw new AiProviderConfigError("ollama", "Ollama fallback is disabled (OLLAMA_ENABLED is not true).");
   if (!c.base) throw new AiProviderConfigError("ollama", "OLLAMA_BASE_URL is not set.");
   const model = ollamaModelFor(input);
@@ -1244,6 +1713,7 @@ async function callOllamaStreaming(input: GenerateInput & { onDelta: (delta: str
       model,
       stream: true,
       keep_alive: "5m",
+      format: input.format === "json" ? "json" : undefined,
       messages: [
         { role: "system", content: input.system },
         { role: "user", content: input.prompt },
@@ -1310,6 +1780,8 @@ async function callOllamaStreaming(input: GenerateInput & { onDelta: (delta: str
 async function callOllama(input: GenerateInput): Promise<GenerateResult> {
   if (input.onDelta) return callOllamaStreaming(input as GenerateInput & { onDelta: (delta: string) => void });
   const c = config().ollama;
+  const guard = evaluateAiPolicy({ provider: "ollama", model: ollamaModelFor(input) });
+  if (!guard.allowed) throw new AiSpendingPolicyError(guard);
   if (!c.enabled) throw new AiProviderConfigError("ollama", "Ollama fallback is disabled (OLLAMA_ENABLED is not true).");
   if (!c.base) throw new AiProviderConfigError("ollama", "OLLAMA_BASE_URL is not set.");
   const model = ollamaModelFor(input);
@@ -1325,6 +1797,7 @@ async function callOllama(input: GenerateInput): Promise<GenerateResult> {
       model,
       stream: false,
       keep_alive: "5m",
+      format: input.format === "json" ? "json" : undefined,
       messages: [
         { role: "system", content: input.system },
         { role: "user", content: input.prompt },
@@ -1371,6 +1844,113 @@ async function callOllama(input: GenerateInput): Promise<GenerateResult> {
     costChf: null,
     costStatus: "unverified",
     routedVia: null,
+  };
+}
+
+function geminiHttpStatus(error: unknown): number {
+  const candidate = error as { status?: unknown; code?: unknown; response?: { status?: unknown } };
+  const parsed = Number(candidate?.response?.status ?? candidate?.status ?? candidate?.code);
+  return Number.isFinite(parsed) && parsed >= 400 && parsed <= 599 ? parsed : 502;
+}
+
+function geminiErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : "Gemini request failed";
+  return scrub(message).slice(0, 500);
+}
+
+/**
+ * Gemini text/vision-capable generateContent route. The model is pinned by
+ * GEMINI_MODEL; a response is never retried on a different model or provider.
+ */
+async function callGemini(input: GenerateInput, modelOverride?: string): Promise<GenerateResult> {
+  const c = config().gemini;
+  const model = (modelOverride ?? c.model).trim();
+  const guard = evaluateAiPolicy({ provider: "gemini", model });
+  if (!guard.allowed) throw new AiSpendingPolicyError(guard);
+  if (!c.enabled || !c.key) throw new AiProviderConfigError("gemini", "GEMINI_API_KEY is not set.");
+  if (!model) throw new AiProviderConfigError("gemini", "GEMINI_MODEL is not set.");
+  const ai = new GoogleGenAI({
+    apiKey: c.key,
+    apiVersion: process.env.GEMINI_API_VERSION?.trim() || "v1beta",
+  });
+  const started = Date.now();
+  const configForCall = {
+    systemInstruction: input.system,
+    temperature: input.temperature ?? 0.2,
+    maxOutputTokens: input.maxTokens ?? 800,
+    thinkingConfig: { thinkingBudget: 0 },
+    ...(input.format === "json" ? { responseMimeType: "application/json" } : {}),
+  };
+  try {
+    let text = "";
+    let usage: Record<string, number> | null = null;
+    if (input.onDelta) {
+      const stream = await ai.models.generateContentStream({
+        model,
+        contents: [{ role: "user", parts: [{ text: input.prompt }] }],
+        config: configForCall,
+      });
+      for await (const chunk of stream) {
+        const delta = chunk.text ?? "";
+        if (delta) {
+          text += delta;
+          input.onDelta(delta);
+        }
+        if (chunk.usageMetadata) usage = chunk.usageMetadata as unknown as Record<string, number>;
+      }
+    } else {
+      const response = await ai.models.generateContent({
+        model,
+        contents: [{ role: "user", parts: [{ text: input.prompt }] }],
+        config: configForCall,
+      });
+      text = response.text ?? "";
+      usage = response.usageMetadata ? (response.usageMetadata as unknown as Record<string, number>) : null;
+    }
+    text = text.trim();
+    if (!text) {
+      throw new AiProviderError("gemini", "Gemini returned no text. The configured model and generation settings were not silently changed.", false);
+    }
+    const promptTokens = Number(usage?.promptTokenCount ?? 0) || estimateTokens(`${input.system}\n${input.prompt}`);
+    const completionTokens = Number(usage?.candidatesTokenCount ?? 0) || estimateTokens(text);
+    const totalTokens = Number(usage?.totalTokenCount ?? 0) || promptTokens + completionTokens;
+    return {
+      text,
+      provider: "gemini",
+      model,
+      usage: { promptTokens, completionTokens, totalTokens },
+      usageSource: usage ? "provider" : "estimated",
+      cachedTokens: Number(usage?.cachedContentTokenCount ?? 0),
+      latencyMs: Date.now() - started,
+      costChf: null,
+      costStatus: "unverified",
+      routedVia: null,
+    };
+  } catch (error) {
+    if (error instanceof AiSpendingPolicyError || error instanceof AiProviderError || error instanceof AiRateLimitedError) throw error;
+    const status = geminiHttpStatus(error);
+    const message = geminiErrorMessage(error);
+    // A Gemini model that is unavailable is a recoverable model-route failure
+    // once the local fallback is configured. Authentication and malformed
+    // requests remain terminal and fail closed.
+    if (status === 404) throw new AiProviderError("gemini", `Model unavailable (HTTP 404): ${message}`, true, 404);
+    throw providerHttpFailure("gemini", status, message);
+  }
+}
+
+/** Local model compatibility for this exact request, including cooldown. */
+function localFallbackAvailability(input: GenerateInput) {
+  const c = config().ollama;
+  const model = ollamaModelFor(input);
+  const configured = c.enabled && Boolean(c.base) && Boolean(model);
+  const decision = configured ? evaluateAiPolicy({ provider: "ollama", model }) : null;
+  const cooldown = configured ? providerCooldown("ollama", model) : null;
+  return {
+    configured,
+    model,
+    decision,
+    cooldown,
+    enabled: Boolean(decision?.allowed) && !cooldown?.remainingMs,
   };
 }
 
@@ -1423,22 +2003,26 @@ function announceQuota(provider: string, model: string, kind: ProviderFailureKin
     kind: "provider_quota_exhausted",
     dedupeKey: `provider_quota:${provider}:${model}:${hour}`,
     subject: `${provider} inference route cooling down`,
-    body: `${provider}/${model} returned ${kind.replace(/_/g, " ")}. The route is paused${retryAt ? ` until ${retryAt}` : ""} and no repeated requests will be sent. Ollama is the next permitted text route when the task permits local inference.`,
+    body: `${provider}/${model} returned ${kind.replace(/_/g, " ")}. The route is paused${retryAt ? ` until ${retryAt}` : ""} and no repeated requests will be sent. The other verified free tier is tried next, then loopback Ollama when local inference is configured. No paid request is made.`,
   });
 }
 
-function announceFallback(primaryModel: string, result: GenerateResult): void {
+function announceFallback(fromProvider: ProviderName, primaryModel: string, result: GenerateResult): void {
   const hour = new Date().toISOString().slice(0, 13);
   notify({
     kind: "provider_fallback",
-    dedupeKey: `provider_fallback:${primaryModel}:${hour}`,
-    subject: "Local Ollama fallback handled inference",
-    body: `FreeLLMAPI did not complete the request. Ollama ${result.model} completed it and the actual provider/model was recorded. Task context was preserved.`,
+    dedupeKey: `provider_fallback:${fromProvider}:${primaryModel}:${hour}`,
+    subject: `${fromProvider} failed; local Ollama fallback handled inference`,
+    body: `${fromProvider}/${primaryModel} did not complete the request. Ollama ${result.model} completed it and the actual provider/model was recorded. Task context was preserved.`,
   });
 }
 
-function completedUsage(input: GenerateInput, result: GenerateResult): void {
-  recordUsage({
+function completedUsage(
+  input: GenerateInput,
+  result: GenerateResult,
+  fallback?: { from: ProviderName; reason: string },
+): boolean {
+  return recordUsage({
     provider: result.provider,
     model: result.model,
     agentKey: input.agentKey,
@@ -1452,135 +2036,316 @@ function completedUsage(input: GenerateInput, result: GenerateResult): void {
     latencyMs: result.latencyMs,
     status: "ok",
     routedVia: result.routedVia,
+    fallbackFrom: fallback?.from ?? null,
+    fallbackReason: fallback?.reason ?? null,
   });
 }
 
 /**
- * FreeLLMAPI is the only remote text route. Ollama is the only text fallback.
- * Gemini Live is deliberately absent: it is a separate voice transport and a
- * Gemini text key can never be selected here by configuration drift.
+ * Gemini, FreeLLMAPI and an explicitly assigned OpenRouter free model are text
+ * routes. OpenRouter is opt-in; its assignment never rewrites the default
+ * eight-agent map. Gemini Live is deliberately absent: it is a separate voice
+ * transport and a Gemini text key can never be selected here by drift.
+ */
+type RouteCandidate = {
+  provider: "gemini" | "freellmapi" | "openrouter" | "ollama";
+  model: string;
+};
+
+export type TextRouteChain = {
+  agentKey: string;
+  preference: ReturnType<typeof agentRoutePreference>;
+  candidates: RouteCandidate[];
+  skipped: Array<{ provider: string; reason: string }>;
+};
+
+function routeModel(provider: RouteCandidate["provider"], input: GenerateInput): string | null {
+  if (provider === "gemini") return config().gemini.model || null;
+  if (provider === "freellmapi") return config().freellmapi.model || null;
+  if (provider === "openrouter") return config().openrouter.model || null;
+  return input.technical ? config().ollama.coderModel || null : config().ollama.model || null;
+}
+
+/**
+ * Ordered free-tier chain for one agent call.
+ *
+ * The agent's assigned provider comes first. Existing Gemini/FreeLLMAPI agents
+ * keep their cross-provider free fallback and loopback Ollama. An explicitly
+ * assigned OpenRouter agent fails closed on an OpenRouter outage instead of
+ * being moved to Ollama.
+ */
+export function textRouteChain(input: GenerateInput): TextRouteChain {
+  const preference = agentRoutePreference(input.agentKey);
+  const candidates: RouteCandidate[] = [];
+  const skipped: Array<{ provider: string; reason: string }> = [];
+  for (const provider of freeTierRouteOrder(input.agentKey)) {
+    const model = routeModel(provider, input);
+    if (!model) {
+      skipped.push({ provider, reason: `${provider} has no configured model.` });
+      continue;
+    }
+    if (provider === "gemini" && !config().gemini.enabled) {
+      skipped.push({ provider, reason: "GEMINI_API_KEY is not set." });
+      continue;
+    }
+    if (provider === "freellmapi" && !freeLlmConfigured()) {
+      skipped.push({ provider, reason: "FreeLLMAPI is not completely configured." });
+      continue;
+    }
+    if (provider === "openrouter" && !openRouterTextConfig().enabled) {
+      skipped.push({ provider, reason: "OPENROUTER_ENABLED is not true." });
+      continue;
+    }
+    if (provider === "openrouter" && !openRouterTextConfig().key) {
+      skipped.push({ provider, reason: "OPENROUTER_API_KEY is not set." });
+      continue;
+    }
+    if (provider === "ollama" && !ollamaConfigured()) {
+      skipped.push({ provider, reason: "Ollama is not completely configured." });
+      continue;
+    }
+    candidates.push({ provider, model });
+  }
+  return { agentKey: input.agentKey, preference, candidates, skipped };
+}
+
+/**
+ * Free-tier-first text routing.
+ *
+ * Gemini and FreeLLMAPI are tried in the agent's configured order, then local
+ * Ollama. A confirmed free-quota exhaustion moves to the next free route and
+ * marks that provider exhausted; it never becomes a paid request. A rate limit
+ * only cools the route down. Authentication, malformed-request and model-policy
+ * failures fail closed without substituting another provider. If no route is
+ * authorised, the audited policy refusal is thrown before any fetch.
  */
 export async function generateText(input: GenerateInput): Promise<GenerateResult> {
-  const attempts = config().maxRetries + 1;
-  const fallbackEnabled = ollamaConfigured();
-  if (!freeLlmConfigured() && !fallbackEnabled) {
-    throw new ProvidersUnavailableError(
-      "No permitted text provider is configured. FreeLLMAPI is the primary text route and Ollama is the local fallback; Gemini Live is used only for voice.",
-    );
-  }
-
+  const requestId = `ai_${randomUUID()}`;
+  const requestStarted = Date.now();
+  const chain = textRouteChain(input);
+  const policyContext = {
+    agentKey: input.agentKey,
+    workflowId: input.workflowId ?? null,
+    taskId: input.taskId ?? null,
+    sessionId: input.sessionId ?? null,
+    source: input.source ?? (input.taskId ? "task" : "manual"),
+  };
+  const failures: string[] = [];
+  const blockedDecisions: AiPolicyDecision[] = [];
+  let attemptsMade = 0;
+  let lastFailureKind: ProviderFailureKind | null = null;
+  let lastRateLimit: AiRateLimitedError | null = null;
+  let fallbackFrom: ProviderName | null = null;
+  let fallbackModel = "";
+  let fallbackReason: string | null = null;
   let streamed = false;
-  const onDelta = input.onDelta
-    ? (delta: string) => { streamed = true; input.onDelta?.(delta); }
-    : undefined;
-  const attemptInput = onDelta ? { ...input, onDelta } : input;
-  const release = await acquireAiSlot(input.priority ?? 1, input.maxWaitMs ?? 60_000);
-  try {
-    const errors: string[] = [];
-    let primaryError: unknown = null;
-    const primaryModel = config().freellmapi.model || "not configured";
 
-    if (freeLlmConfigured()) {
-      const route = providerCooldown("freellmapi", primaryModel);
-      const gateway = gatewayCooldownStatus();
-      const remainingMs = Math.max(route?.remainingMs ?? 0, gateway.remainingMs);
-      if (remainingMs > 0) {
-        const message = `FreeLLMAPI route cooldown for ${Math.ceil(remainingMs / 1000)}s. ${route?.reason ?? gateway.reason ?? ""}`.trim();
-        primaryError = new AiRateLimitedError(message, remainingMs, 429);
-        errors.push(message);
-      } else {
+  const attemptInput = input.onDelta
+    ? { ...input, onDelta: (delta: string) => { streamed = true; input.onDelta?.(delta); } }
+    : input;
+
+  try {
+    if (chain.candidates.length === 0) {
+      const provider = chain.preference.provider === "freellmapi" ? "freellmapi" : "gemini";
+      const decision = authorizeAiRequest({
+        ...policyContext,
+        provider,
+        model: chain.preference.model,
+        operation: "text.generate",
+      });
+      const gap = chain.preference.gap ?? chain.skipped.map((item) => `${item.provider}: ${item.reason}`).join(" ");
+      throw new AiSpendingPolicyError({
+        ...decision,
+        block_reason: `${decision.block_reason ?? "No authorised text route is available."} ${gap}`.trim(),
+      });
+    }
+
+    const release = await acquireAiSlot(input.priority ?? 1, input.maxWaitMs ?? 60_000);
+    try {
+      for (const candidate of chain.candidates) {
+        const { provider, model } = candidate;
+        const decision = authorizeAiRequest({
+          ...policyContext,
+          provider,
+          model,
+          operation: provider === "ollama" ? "text.generate.local" : "text.generate",
+        });
+        if (!decision.allowed) {
+          blockedDecisions.push(decision);
+          failures.push(`${provider}: ${decision.block_reason ?? "blocked by policy"}`);
+          continue;
+        }
+
+        const cooling = providerCooldown(provider, model);
+        if (cooling?.remainingMs) {
+          failures.push(
+            `${provider} ${model} is cooling down for ${Math.ceil(cooling.remainingMs / 1000)}s: ${cooling.reason ?? "route failure"}`,
+          );
+          continue;
+        }
+        if (provider === "freellmapi") {
+          const gateway = gatewayCooldownStatus();
+          if (gateway.remainingMs > 0) {
+            failures.push(
+              `FreeLLMAPI gateway cooling down for ${Math.ceil(gateway.remainingMs / 1000)}s: ${gateway.reason ?? "route failure"}`,
+            );
+            continue;
+          }
+        }
+
+        const attempts = provider === "ollama" ? 1 : config().maxRetries + 1;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
+          attemptsMade += 1;
           const started = Date.now();
+          markPolicyNetworkTransmitted(decision.correlation_id);
           try {
-            const result = await callFreeLlm(attemptInput);
-            recordProviderSuccess("freellmapi", result.model);
-            clearGatewayCooldown();
-            completedUsage(input, result);
+            const result =
+              provider === "gemini"
+                ? await callGemini(attemptInput, model)
+                : provider === "freellmapi"
+                  ? await callFreeLlm(attemptInput)
+                  : provider === "openrouter"
+                    ? await callOpenRouter(attemptInput)
+                    : await callOllama(attemptInput);
+            recordProviderSuccess(provider, result.model);
+            if (provider === "gemini" || provider === "freellmapi") {
+              recordFreeTierSuccess(provider, result.model);
+            }
+            if (provider === "freellmapi") clearGatewayCooldown();
+            const usedFallback = Boolean(fallbackFrom && fallbackFrom !== provider);
+            const usageRecorded = completedUsage(
+              input,
+              result,
+              usedFallback && fallbackFrom ? { from: fallbackFrom, reason: fallbackReason ?? "route failure" } : undefined,
+            );
+            result.diagnostics = {
+              requestId,
+              provider: result.provider,
+              model: result.model,
+              httpStatus: 200,
+              durationMs: Date.now() - requestStarted,
+              errorClass: usedFallback ? lastFailureKind : null,
+              retryCount: Math.max(0, attemptsMade - 1),
+              fallbackDecision: usedFallback ? provider : "primary",
+              fallbackFrom: usedFallback ? fallbackFrom : null,
+              fallbackReason: usedFallback ? fallbackReason : null,
+              usableContent: result.text.trim().length > 0,
+            };
+            // The owner notification claims the fallback was recorded, so it is
+            // only sent when the usage row actually exists. A failed insert is
+            // reported instead of being contradicted by the notification.
+            if (usedFallback && fallbackFrom && usageRecorded) {
+              announceFallback(fallbackFrom, fallbackModel, result);
+            } else if (usedFallback && fallbackFrom && !usageRecorded) {
+              notify({
+                kind: "provider_fallback",
+                dedupeKey: `provider_fallback_unrecorded:${requestId}`,
+                subject: "Fallback inference served but not recorded",
+                body: `${provider}/${result.model} completed the request after ${fallbackFrom} failed, but the usage row could not be written. Token totals exclude this call until it is reconciled.`,
+              });
+            }
             return result;
           } catch (error) {
+            if (error instanceof AiSpendingPolicyError) throw error;
             const failure = routeFailure(error);
-            recordProviderFailure(input, "freellmapi", primaryModel, started, failure.message);
+            lastFailureKind = failure.kind;
+            if (error instanceof AiRateLimitedError) lastRateLimit = error;
+            if (!fallbackFrom) {
+              fallbackFrom = provider;
+              fallbackModel = model;
+              fallbackReason = `${failure.kind.replace(/_/g, " ")}: ${failure.message}`;
+            }
+            recordProviderFailure(input, provider, model, started, failure.message);
             const cooldown = recordRouteFailure({
-              provider: "freellmapi",
-              model: primaryModel,
+              provider,
+              model,
               kind: failure.kind,
               message: failure.message,
               retryAfterMs: failure.retryAfterMs,
               attempt,
             });
-            announceQuota("freellmapi", primaryModel, failure.kind, cooldown.until);
-            errors.push(`FreeLLMAPI attempt ${attempt}: ${failure.message}`);
-            primaryError = error;
-            if (streamed) throw new ProvidersUnavailableError(`FreeLLMAPI stream interrupted after a partial response: ${failure.message}. No duplicate fallback was attempted.`);
-
-            if (isFailClosedFailure(failure.kind)) {
-              // Invalid credentials, malformed requests and model-policy
-              // violations fail closed. They are never answered by Ollama, so a
-              // configuration defect cannot hide behind a successful reply.
-              throw new AiProviderConfigError("freellmapi", failure.message);
+            announceQuota(provider, model, failure.kind, cooldown.until);
+            if (provider === "gemini" || provider === "freellmapi") {
+              recordFreeTierFailure({
+                provider,
+                model,
+                kind: failure.kind,
+                message: failure.message,
+                retryAfterMs: failure.retryAfterMs,
+              });
             }
-            if (failure.kind === "quota_exhausted" || failure.kind === "rate_limited" || failure.kind === "cooldown") {
+            if (
+              provider === "freellmapi" &&
+              (failure.kind === "quota_exhausted" || failure.kind === "rate_limited" || failure.kind === "cooldown")
+            ) {
               setGatewayCooldown(cooldown.remainingMs || failure.retryAfterMs || 60_000, failure.message);
-              break;
+            }
+            failures.push(`${provider} ${model}: ${failure.message}`);
+
+            if (streamed) {
+              throw new ProvidersUnavailableError(
+                `${provider} stream failed after a partial response: ${failure.message}. No duplicate provider request was attempted.`,
+              );
+            }
+            if (isFailClosedFailure(failure.kind) || error instanceof AiProviderConfigError) {
+              if (error instanceof AiProviderConfigError) throw error;
+              throw new ProvidersUnavailableError(
+                `${provider} ${model} failed: ${failure.message}. This failure class fails closed; no other provider was contacted.`,
+              );
             }
             if (!isTransientFailure(failure.kind) || attempt >= attempts) break;
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs(attempt, failure.kind, failure.retryAfterMs)));
           }
         }
-
-        if (primaryError && !(primaryError instanceof AiRateLimitedError)) {
-          const route = providerCooldown("freellmapi", primaryModel);
-          if (route?.remainingMs) setGatewayCooldown(route.remainingMs, route.reason ?? "FreeLLMAPI temporarily unavailable.");
-        }
       }
-    }
 
-    if (!fallbackEnabled) {
-      if (primaryError instanceof AiRateLimitedError) throw primaryError;
-      if (primaryError instanceof AiProviderConfigError) throw primaryError;
+      if (blockedDecisions.length === chain.candidates.length) {
+        const primary = blockedDecisions[0];
+        throw new AiSpendingPolicyError({
+          ...primary,
+          block_reason: `${primary.block_reason ?? "External inference blocked."} ${failures.slice(0, 3).join(" ")}`.trim(),
+        });
+      }
+      if (lastRateLimit) throw lastRateLimit;
       throw new ProvidersUnavailableError(
-        `FreeLLMAPI failed and Ollama fallback is disabled. ${errors.slice(-2).join(" · ")}`.trim(),
+        `All free-tier routes failed; no paid fallback is permitted. ${failures.slice(-3).join(" · ")}`.trim(),
       );
+    } finally {
+      release();
     }
-
-    const fallbackModel = ollamaModelFor(input) || config().ollama.model || "not configured";
-    const fallbackCooldown = providerCooldown("ollama", fallbackModel);
-    if (fallbackCooldown?.remainingMs) {
-      throw new ProvidersUnavailableError(
-        `Ollama is cooling down for ${Math.ceil(fallbackCooldown.remainingMs / 1000)}s after ${fallbackCooldown.kind ?? "a provider failure"}. ${fallbackCooldown.reason ?? ""}`.trim(),
-      );
+  } catch (error) {
+    const diagnostics: ProviderDiagnostics = {
+      requestId,
+      provider: null,
+      model: null,
+      httpStatus: errorStatus(error),
+      durationMs: Date.now() - requestStarted,
+      errorClass:
+        lastFailureKind ??
+        classifyProviderFailure(error instanceof Error ? scrub(error.message) : "provider failure", errorStatus(error)),
+      retryCount: Math.max(0, attemptsMade - 1),
+      fallbackDecision: fallbackFrom
+        ? fallbackFrom === "gemini"
+          ? "gemini"
+          : fallbackFrom === "freellmapi"
+            ? "freellmapi"
+            : fallbackFrom === "openrouter"
+              ? "openrouter"
+              : "ollama"
+        : "none",
+      fallbackFrom: null,
+      fallbackReason: null,
+      usableContent: false,
+    };
+    if (error && typeof error === "object") {
+      (error as Error & { diagnostics?: ProviderDiagnostics }).diagnostics = diagnostics;
     }
-
-    const fallbackStarted = Date.now();
-    try {
-      const result = await callOllama(attemptInput);
-      recordProviderSuccess("ollama", result.model);
-      completedUsage(input, result);
-      if (errors.length > 0) announceFallback(primaryModel, result);
-      return result;
-    } catch (error) {
-      const failure = routeFailure(error);
-      recordProviderFailure(input, "ollama", fallbackModel, fallbackStarted, failure.message);
-      const cooldown = recordRouteFailure({
-        provider: "ollama",
-        model: fallbackModel,
-        kind: failure.kind,
-        message: failure.message,
-        retryAfterMs: failure.retryAfterMs,
-      });
-      announceQuota("ollama", fallbackModel, failure.kind, cooldown.until);
-      const retry = cooldown.until ? ` Next retry after ${cooldown.until}.` : "";
-      const detail = `FreeLLMAPI failed (${errors.slice(-2).join(" · ") || "not attempted"}). Ollama fallback failed: ${failure.message}${retry}`.trim();
-      if (error instanceof AiProviderConfigError) throw new AiProviderConfigError("ollama", detail);
-      throw new ProvidersUnavailableError(detail);
-    }
-  } finally {
-    release();
+    throw error;
   }
 }
 
 export async function generateJson<T>(input: GenerateInput): Promise<T> {
-  const result = await generateText(input);
+  const result = await generateText({ ...input, format: "json" });
   const cleaned = result.text.replace(/```(?:json)?/gi, "").trim();
   const start = cleaned.search(/[[{]/);
   const end = Math.max(cleaned.lastIndexOf("}"), cleaned.lastIndexOf("]"));
@@ -1608,8 +2373,10 @@ export function aiCounterReconciliation(): AgentAiReconciliation[] {
     `SELECT a.key, a.name,
             a.ai_success_count AS counterOk,
             a.ai_failure_count AS counterFailed,
-            (SELECT COUNT(*) FROM provider_usage u WHERE u.agent_key = a.key AND u.source = 'task' AND u.status = 'ok') AS usageOk,
-            (SELECT COUNT(*) FROM provider_usage u WHERE u.agent_key = a.key AND u.source = 'task' AND u.status = 'error') AS usageFailed
+            (SELECT COUNT(*) FROM provider_usage u JOIN tasks t ON t.id = u.task_id AND t.agent_key = u.agent_key
+              WHERE u.agent_key = a.key AND u.source = 'task' AND u.status = 'ok') AS usageOk,
+            (SELECT COUNT(*) FROM provider_usage u JOIN tasks t ON t.id = u.task_id AND t.agent_key = u.agent_key
+              WHERE u.agent_key = a.key AND u.source = 'task' AND u.status = 'error') AS usageFailed
      FROM agents a ORDER BY a.sort`,
   ).map((row) => ({
     ...row,
@@ -1651,8 +2418,10 @@ export function recentUsage(limit = 20) {
     cost_status: string | null;
     routed_platform: string | null;
     routed_model: string | null;
+    fallback_from: string | null;
+    fallback_reason: string | null;
   }>(
-    "SELECT provider, model, agent_key, workflow_id, task_id, source, total_tokens, latency_ms, status, error, created_at, cost_status, routed_platform, routed_model FROM provider_usage ORDER BY id DESC LIMIT ?",
+    "SELECT provider, model, agent_key, workflow_id, task_id, source, total_tokens, latency_ms, status, error, created_at, cost_status, routed_platform, routed_model, fallback_from, fallback_reason FROM provider_usage ORDER BY id DESC LIMIT ?",
     [limit],
   );
 }

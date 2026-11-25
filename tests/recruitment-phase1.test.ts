@@ -28,6 +28,7 @@ process.env.ASHBY_JOB_BOARDS = "novapay";
 process.env.GREENHOUSE_BOARDS = "novapay";
 process.env.LEVER_SITES = "novapay";
 process.env.JOBS_CH_QUERIES = "QA Engineer|SDET";
+process.env.RECRUITMENT_DISCOVERY_EXPANSION = "false";
 process.env.EMPLOYER_CAREER_PAGES = "https://careers.nova.test/jobs";
 
 const now = new Date();
@@ -384,7 +385,7 @@ db.run("UPDATE profiles SET source_cv_id = 'doc_phase1_master' WHERE id = 1");
 db.run("UPDATE settings SET value = 'false' WHERE key = 'recruitment_dry_run'");
 db.run("UPDATE settings SET value = 'true' WHERE key = 'autonomous_submission'");
 db.run("UPDATE settings SET value = 'false' WHERE key = 'approval_mode'");
-db.run("UPDATE settings SET value = '5' WHERE key = 'max_applications_per_day'");
+db.run("UPDATE settings SET value = '3' WHERE key = 'max_applications_per_day'");
 db.run(
   "INSERT INTO settings (key, value, updated_at) VALUES ('standing_authorisation_activated_at', ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
   [JSON.stringify(now.toISOString()), now.toISOString()],
@@ -467,7 +468,7 @@ test("a normal fixture run covers every connector, deduplicates and preserves re
     1,
     "the Ashby/Greenhouse duplicate is stored once",
   );
-  assert.equal(stored.some((job) => job.title === "QA Lead" && job.company === "Expired Swiss AG"), false, "expired jobs.ch vacancy is not stored");
+  assert.equal(stored.some((job) => job.title === "QA Lead" && job.company === "Expired Swiss AG"), true, "an old publication date alone is not treated as expiry");
   assert.equal(stored.some((job) => job.title === "Pagination QA Engineer" && job.company === "Pagination AG"), true, "the supported second jobs.ch page is read");
   assert.equal(stored.some((job) => job.title === "QA Analyst" && job.company === "Nova Career AG"), false, "expired career-page vacancy is not stored");
 
@@ -715,17 +716,17 @@ test("a six-vacancy fixture run prepares and submits only the configured daily l
   });
 
   assert.equal(outcome.qualified, 6, "the duplicate id is assessed once");
-  assert.equal(outcome.prepared, 5, "the persisted five/day cap is enforced");
-  assert.equal(outcome.submitted, 5);
-  assert.equal(submissionPosts, 5, "exactly five mock submissions were posted");
-  assert.equal(new Set(preparedJobs).size, 5, "no vacancy is prepared twice");
-  assert.deepEqual(preparedJobs, rankedIds.slice(0, 5));
+  assert.equal(outcome.prepared, 3, "the persisted three/day cap is enforced");
+  assert.equal(outcome.submitted, 3);
+  assert.equal(submissionPosts, 3, "exactly three mock submissions were posted");
+  assert.equal(new Set(preparedJobs).size, 3, "no vacancy is prepared twice");
+  assert.deepEqual(preparedJobs, rankedIds.slice(0, 3));
   assert.ok(outcome.warnings.some((warning) => /daily submission limit/i.test(warning)));
 
   const stored = runs.runById(created.run.id);
   assert.equal(stored?.jobs_qualified, 6);
-  assert.equal(stored?.packages_prepared, 5);
-  assert.equal(stored?.applications_submitted, 5);
+  assert.equal(stored?.packages_prepared, 3);
+  assert.equal(stored?.applications_submitted, 3);
   assert.equal(stored?.sources_checked, 1);
   assert.equal(stored?.sources_succeeded, 1);
   assert.equal(stored?.discovery_state, "ok");
@@ -733,12 +734,12 @@ test("a six-vacancy fixture run prepares and submits only the configured daily l
   db.closeDb();
   db.getDb();
   const afterRestart = runs.runById(created.run.id);
-  assert.equal(afterRestart?.applications_submitted, 5);
+  assert.equal(afterRestart?.applications_submitted, 3);
   assert.ok(afterRestart?.report?.includes("Daily recruitment report"));
 });
 
 test("no real application or email is sent by the fixture suite", () => {
-  assert.equal(submissionPosts, 5);
+  assert.equal(submissionPosts, 3);
   const externalAttempts = db.all<{ channel: string; endpoint: string | null }>("SELECT channel, endpoint FROM submission_attempts");
   assert.ok(externalAttempts.every((attempt) => attempt.endpoint?.startsWith("https://apply.test/")));
   const outbox = db.all<{ recipient: string }>("SELECT recipient FROM notification_outbox");
@@ -747,9 +748,9 @@ test("no real application or email is sent by the fixture suite", () => {
 
 test("the controlled fixture execution records every agent and a verified mock submission", () => {
   const run = db.one<{ id: string; run_key: string; status: string; packages_prepared: number; applications_submitted: number }>(
-    "SELECT id, run_key, status, packages_prepared, applications_submitted FROM recruitment_runs WHERE packages_prepared = 5 AND applications_submitted = 5 ORDER BY started_at DESC LIMIT 1",
+    "SELECT id, run_key, status, packages_prepared, applications_submitted FROM recruitment_runs WHERE packages_prepared = 3 AND applications_submitted = 3 ORDER BY started_at DESC LIMIT 1",
   );
-  assert.ok(run, "the five-package controlled run is present");
+  assert.ok(run, "the three-package controlled run is present");
   const rows = db.all<{ agent_key: string; assignment: string; status: string; output: string | null; error: string | null }>(
     "SELECT agent_key, assignment, status, output, error FROM recruitment_run_agents WHERE run_id = ? ORDER BY id",
     [run.id],
@@ -773,13 +774,13 @@ test("the controlled fixture execution records every agent and a verified mock s
     "SELECT status, reference FROM submission_attempts WHERE application_id IN (SELECT id FROM applications WHERE job_id IN (SELECT id FROM jobs WHERE run_id = ?))",
     [run.id],
   );
-  assert.equal(attempts.length, 5, "five controlled submissions were attempted");
+  assert.equal(attempts.length, 3, "three controlled submissions were attempted");
   assert.ok(attempts.every((attempt) => attempt.status === "verified" && attempt.reference?.startsWith("PHASE1-")));
 });
 
 test("the execution report is generated from the controlled run with every required section", () => {
   const run = db.one<{ id: string }>(
-    "SELECT id FROM recruitment_runs WHERE packages_prepared = 5 AND applications_submitted = 5 ORDER BY started_at DESC LIMIT 1",
+    "SELECT id FROM recruitment_runs WHERE packages_prepared = 3 AND applications_submitted = 3 ORDER BY started_at DESC LIMIT 1",
   );
   assert.ok(run);
   const content = emailTemplate.buildRecruitmentExecutionEmail(run.id);

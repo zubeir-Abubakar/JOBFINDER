@@ -38,7 +38,7 @@ export function AiQueuePanel({ embedded = false }: { embedded?: boolean }) {
         <div>
           <h2>AI request queue</h2>
           <p className="card-sub">
-            Optional advisory work waits for the pinned FreeLLMAPI route. Deterministic scoring, statuses and documents never wait here.
+            Optional advisory work uses a verified free-tier route. A FreeLLMAPI cooldown does not stall the queue while Gemini or local Ollama is available. Deterministic scoring, statuses and documents never wait here.
           </p>
         </div>
         <span className={`badge ${cooling ? "badge-warn" : "badge-good"}`}>
@@ -52,7 +52,7 @@ export function AiQueuePanel({ embedded = false }: { embedded?: boolean }) {
               {LABELS[status]} <span className="num">{snapshot.counts[status]}</span>
             </span>
           ))}
-          <span className="badge badge-neutral" title="Shared FreeLLMAPI concurrency">
+          <span className="badge badge-neutral" title="Shared AI inference concurrency">
             max {snapshot.slots.limit} concurrent
           </span>
           <span className="badge badge-neutral" title="Advisory jobs retry with backoff">

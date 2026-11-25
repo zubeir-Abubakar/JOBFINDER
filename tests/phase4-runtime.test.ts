@@ -23,6 +23,7 @@ const runs = await import("../lib/recruitment-run.ts");
 const notifications = await import("../lib/notify.ts");
 const lifecycle = await import("../lib/runtime-lifecycle.ts");
 const health = await import("../lib/runtime-health.ts");
+const schedule = await import("../lib/recruitment-schedule.ts");
 const { setSetting } = await import("../lib/settings.ts");
 const auth = await import("../lib/auth.ts");
 const security = await import("../lib/security.ts");
@@ -46,6 +47,11 @@ test("runtime leases are exclusive across instances and expire to a new owner", 
   runtime.releaseRuntimeLock(key, "instance-b");
 });
 
+test("the process identity is stable for the life of the process", () => {
+  assert.equal(runtime.runtimeInstanceId(), runtime.runtimeInstanceId());
+  assert.match(runtime.runtimeInstanceId(), /:\d+$/);
+});
+
 test("worker heartbeats distinguish running, stale and stopped workers", () => {
   runtime.startRuntimeWorker("test_worker", "phase 4 test");
   let row = runtime.runtimeWorkerSnapshot().find((worker) => worker.name === "test_worker");
@@ -55,9 +61,31 @@ test("worker heartbeats distinguish running, stale and stopped workers", () => {
   ]);
   row = runtime.runtimeWorkerSnapshot().find((worker) => worker.name === "test_worker");
   assert.equal(row?.effectiveStatus, "stale");
+  db.run("UPDATE runtime_workers SET heartbeat_at = 'not-a-timestamp' WHERE name = 'test_worker'");
+  row = runtime.runtimeWorkerSnapshot().find((worker) => worker.name === "test_worker");
+  assert.equal(row?.effectiveStatus, "stale", "an unparseable heartbeat is not treated as fresh execution");
   runtime.stopRuntimeWorker("test_worker", "test complete");
   row = runtime.runtimeWorkerSnapshot().find((worker) => worker.name === "test_worker");
   assert.equal(row?.effectiveStatus, "stopped");
+});
+
+test("an idle stale queue worker is dormant instead of degrading the application", () => {
+  const previousSchedule = schedule.ensureSchedule().enabled;
+  schedule.setScheduleEnabled(false);
+  db.run("DELETE FROM recruitment_recovery");
+  runtime.startRuntimeWorker("document_recovery", "idle-worker test");
+  db.run("UPDATE runtime_workers SET heartbeat_at = ? WHERE name = 'document_recovery'", [
+    new Date(Date.now() - 10 * 60_000).toISOString(),
+  ]);
+  const snapshot = health.operationalHealthSnapshot();
+  assert.equal(
+    snapshot.status,
+    "operational",
+    `${snapshot.detail} permission=${snapshot.database.permissionWarning} workers=${snapshot.workers.map((worker) => `${worker.name}:${worker.effectiveStatus}`).join(",")}`,
+  );
+  assert.match(snapshot.detail, /dormant/i);
+  runtime.stopRuntimeWorker("document_recovery", "test complete");
+  schedule.setScheduleEnabled(previousSchedule === 1);
 });
 
 test("an abandoned run and its task are marked interrupted, while a safe scheduled run is resumed", () => {
@@ -121,6 +149,11 @@ test("two notification workers cannot send the same outbox row", async () => {
   assert.equal(row?.status, "sent");
   assert.equal(row?.attempts, 1);
   assert.equal(row?.provider_message_id, "phase4-mock-id");
+  const outbox = notifications.notificationQueueSnapshot();
+  assert.equal(outbox.deliveryCounts.accepted_by_gmail, 1);
+  assert.equal(outbox.deliveryCounts.sent_folder_observed, 0);
+  assert.equal(outbox.deliveryCounts.delivery_confirmed, 0);
+  assert.equal(outbox.lastAccepted?.delivery, "accepted_by_gmail", "the last accepted query cannot return a merely Sent-folder row");
 });
 
 test("notification retries are bounded and end in a failed dead-letter row", async () => {
@@ -230,6 +263,11 @@ test("health reports database, worker and scheduler state from persisted data", 
   assert.ok(snapshot.scheduler.nextRunAt);
   assert.ok(snapshot.workers.length >= 1);
   assert.equal(snapshot.database.permissionWarning, null);
+  assert.equal(snapshot.executiveBrief.time, "16:00");
+  assert.equal(snapshot.executiveBrief.timezone, "Europe/Zurich");
+  assert.equal(snapshot.executiveBrief.requiresRunningHost, true);
+  assert.equal(snapshot.executiveBrief.heartbeatAgeSeconds, null, "no persisted scheduler tick is reported as no evidence");
+  assert.equal(snapshot.executiveBrief.stale, true, "a schedule with no tick evidence is stale, not assumed running");
 });
 
 test("security headers include a restrictive CSP and transport protections", async () => {

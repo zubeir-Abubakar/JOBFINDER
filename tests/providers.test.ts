@@ -5,13 +5,19 @@ import {
   assertPinnedResolution,
   classifyGatewayError,
   classifyGatewayHealth,
+  configuredTextProvider,
   freeLlmConfigured,
   freeLlmPolicyIssue,
+  geminiConfigured,
+  geminiSelectedForText,
   isBillableModelId,
   ollamaConfigured,
   providerConfigured,
   scrubProviderError,
 } from "../lib/providers.ts";
+import { geminiEvidence } from "./helpers/free-tier-evidence.ts";
+
+process.env.GEMINI_FREE_TIER_EVIDENCE = geminiEvidence();
 
 const MANAGED = [
   "FREELLMAPI_ENABLED",
@@ -20,7 +26,12 @@ const MANAGED = [
   "FREELLMAPI_MODEL",
   "FREELLMAPI_ALLOWED_MODELS",
   "FREELLMAPI_MODEL_ALIASES",
+  "AI_PRIMARY_PROVIDER",
   "GEMINI_API_KEY",
+  "GEMINI_MODEL",
+  "GEMINI_PAID_AUTHORISED",
+  "GEMINI_FREE_TIER_VERIFIED",
+  "FREELLMAPI_FREE_TIER_VERIFIED",
   "OPENROUTER_ENABLED",
   "OPENROUTER_API_KEY",
   "OLLAMA_ENABLED",
@@ -58,11 +69,11 @@ const GATEWAY = {
   OLLAMA_ENABLED: "false",
 };
 
-test("a pinned, catalogued, allowlisted model is permitted", () => {
+test("a pinned catalogued model passes the name policy but its external route is still blocked", () => {
   withEnv(GATEWAY, () => {
     assert.equal(freeLlmConfigured(), true);
     assert.equal(freeLlmPolicyIssue(), null);
-    assert.equal(providerConfigured(), true);
+    assert.equal(providerConfigured(), false, "no loopback Ollama is authorised");
     assert.doesNotThrow(() => assertPermittedModel("gpt-oss-120b"));
     assert.deepEqual(classifyGatewayHealth(200).kind, "ok");
   });
@@ -164,6 +175,47 @@ test("Ollama disabled alone never makes a provider available", () => {
   withEnv({ OLLAMA_ENABLED: "false" }, () => {
     assert.equal(providerConfigured(), false);
   });
+});
+
+test("verified free-tier Gemini is a text route when explicitly selected", () => {
+  withEnv(
+    {
+      AI_PRIMARY_PROVIDER: "gemini",
+      GEMINI_API_KEY: "test-gemini-key",
+      GEMINI_MODEL: "gemini-3.6-flash",
+      GEMINI_FREE_TIER_VERIFIED: "true",
+      FREELLMAPI_ENABLED: "false",
+      OLLAMA_ENABLED: "false",
+    },
+    () => {
+      assert.equal(geminiSelectedForText(), true);
+      assert.equal(geminiConfigured(), true);
+      const route = configuredTextProvider();
+      assert.equal(route.provider, "gemini");
+      assert.equal(route.model, "gemini-3.6-flash");
+      assert.match(route.detail, /free-tier/i);
+    },
+  );
+});
+
+test("Gemini credentials without a free-tier declaration never count as a text route", () => {
+  withEnv(
+    {
+      AI_PRIMARY_PROVIDER: "gemini",
+      GEMINI_API_KEY: "test-gemini-key",
+      GEMINI_MODEL: "gemini-3.6-flash",
+      // A paid-authorisation flag must not authorise text inference.
+      GEMINI_PAID_AUTHORISED: "true",
+      GEMINI_FREE_TIER_VERIFIED: "false",
+      FREELLMAPI_ENABLED: "false",
+      OLLAMA_ENABLED: "false",
+    },
+    () => {
+      assert.equal(geminiSelectedForText(), true);
+      assert.equal(geminiConfigured(), false);
+      assert.equal(configuredTextProvider().provider, null);
+    },
+  );
 });
 
 test("Gemini and OpenRouter credentials never count as a text route", () => {

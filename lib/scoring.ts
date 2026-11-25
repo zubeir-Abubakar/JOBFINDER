@@ -1,5 +1,6 @@
 import type { ProfileData, Skill } from "./profile";
 import { classifyVacancy } from "./vacancy-classification";
+import { analyseVacancyGermanRequirement } from "./language-requirements";
 import { agentIdentity } from "./agent-identity";
 
 export type MatchFlag = "strong" | "possible" | "weak" | "not_suitable";
@@ -273,7 +274,8 @@ export function analyseJob(
   const preferred = detectPreferredSkills(combined, allMissing);
   const missing = allMissing.filter((tech) => !preferred.includes(tech));
   const languages = detectLanguages(combined);
-  const german = languageRequired(combined, "German");
+  const germanAssessment = analyseVacancyGermanRequirement(job.title, description);
+  const german = { required: germanAssessment.status === "required", level: germanAssessment.level };
   const french = languageRequired(combined, "French");
   const english = languageRequired(combined, "English");
 
@@ -338,6 +340,9 @@ export function analyseJob(
   if (german.required) {
     language = 0.15;
     concerns.push(`German${german.level ? ` ${german.level}` : ""} appears to be required — the profile currently evidences English only.`);
+  } else if (germanAssessment.status === "ambiguous" || germanAssessment.status === "unknown") {
+    language = Math.min(language, 0.5);
+    concerns.push(`German requirement unresolved — automatic submission is blocked: ${germanAssessment.detail}`);
   } else if (french.required) {
     language = 0.6;
     concerns.push(`French${french.level ? ` ${french.level}` : ""} is requested; confirm your actual level before applying.`);
@@ -585,19 +590,32 @@ export function effectiveMinMatchScore(configured: unknown, floor: number = QUAL
  * eligibility rules: a mandatory German requirement cannot be applied around,
  * and a citizenship-only posting is not an application the candidate can make.
  */
-export function autoApplyBlockers(analysis: { score: number; concerns?: string[] }): string[] {
+export function autoApplyBlockers(analysis: {
+  score: number;
+  concerns?: string[];
+  mandatoryBlockers?: string[];
+}): string[] {
   const blockers: string[] = [];
   if (analysis.score < QUALIFYING_MATCH_SCORE) {
     blockers.push(`Match score ${analysis.score}% is below the ${QUALIFYING_MATCH_SCORE}% threshold.`);
   }
+  // A high weighted score cannot override an explicitly required qualification.
+  for (const blocker of analysis.mandatoryBlockers ?? []) {
+    if (blocker.trim()) blockers.push(blocker.trim());
+  }
   for (const concern of analysis.concerns ?? []) {
     if (/German(?:\s+[A-C][12])?[^.]*required/i.test(concern)) blockers.push(concern);
+    if (/German requirement unresolved/i.test(concern)) blockers.push(concern);
     if (/citizenship or sponsorship restriction/i.test(concern)) blockers.push(concern);
   }
   return blockers;
 }
 
-export function qualifiesForAutoApply(analysis: { score: number; concerns?: string[] }): boolean {
+export function qualifiesForAutoApply(analysis: {
+  score: number;
+  concerns?: string[];
+  mandatoryBlockers?: string[];
+}): boolean {
   return autoApplyBlockers(analysis).length === 0;
 }
 

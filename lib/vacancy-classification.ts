@@ -11,6 +11,8 @@
  * involved, so a vendor cannot relabel a role to reach the 85% threshold.
  */
 
+import { analyseGermanRequirement, MANDATORY_GERMAN_REQUIREMENT } from "./language-requirements";
+
 export type VacancyCategory =
   | "hands_on_testing"
   | "test_automation"
@@ -59,7 +61,7 @@ export type ClassificationInput = {
 };
 
 const QA_TITLE =
-  /\b(qa|quality assurance|quality analyst|test(?:ing)? engineer|test automation|sdet|software (?:development )?engineer in test|software test|test lead|test manager|lead qa|qa lead|qa automation|qa engineer|test analyst|quality engineer|test specialist|test consultant|test infrastructure|verification engineer|validation engineer)\b/i;
+  /\b(qa|quality assurance(?: engineer| analyst)?|quality analyst|quality manager|test(?:ing)? engineer|test automation|test architect|automation test(?:ing)? engineer|sdet|software (?:development )?engineer in test|software test|software qa|test lead|test manager|testmanager|lead qa|qa lead|qa automation|qa engineer|qa analyst|qa specialist|qa tester|api test(?:er|ing)? engineer|mobile qa(?: engineer)?|test analyst|quality engineer|test specialist|test consultant|test infrastructure|verification engineer|validation engineer|teamlead(?:er)? (?:test|testing|qa|quality)|head of (?:test|testing|qa|quality)|testingenieur|ing[ée]nieur (?:test|qa|qualit[ée])|testeur|testeuse|analyste qa|responsable (?:test|qa))\b/i;
 
 const TESTING_TERMS =
   /\b(test(?:ing|s|ed)?|quality assurance|qa|automation|automated|sdet|defect|bug|regression|exploratory|test cases?|test plans?|test strategy|test framework|release sign-?off|ci\/cd)\b/gi;
@@ -71,7 +73,7 @@ const HANDS_ON_TERMS =
 const INFRA_TERMS =
   /\b(sdet|test infrastructure|test tooling|test framework|developer productivity|build system|internal tooling|ci\/cd pipeline|quality engineering platform)\b/i;
 const LEADERSHIP_TERMS =
-  /\b(qa lead|lead qa|head of (?:qa|quality)|qa manager|quality manager|test lead|test manager|engineering manager|director of quality)\b/i;
+  /\b(qa lead|lead qa|head of (?:test|testing|qa|quality)|qa manager|quality manager|test lead|test manager|testmanager|teamlead(?:er)? (?:test|testing|qa|quality)|engineering manager|director of quality)\b/i;
 const MANAGEMENT_TERMS = /\b(test manager|quality manager|qa manager|head of (?:qa|quality))\b/i;
 const CONSULTING_TERMS = /\b(consultant|consulting|client[- ]facing|client account|advisory|professional services)\b/i;
 const PRODUCT_TERMS = /\b(product manager|product owner|program manager|project manager|business analyst|requirements engineer|product analyst)\b/i;
@@ -135,8 +137,20 @@ export function testingResponsibilities(description: string): string[] {
 
 function languageRequirement(text: string): MandatoryRequirement[] {
   const out: MandatoryRequirement[] = [];
-  for (const language of ["German", "French", "English"]) {
-    const pattern = language === "German" ? /\b(german|deutsch)\b/i : language === "French" ? /\b(french|français|francais)\b/i : /\b(english|englisch|anglais)\b/i;
+  // German uses the shared hard-exclusion analyzer. It recognises every CEFR
+  // level and proficiency wording, not only the words this classifier happens
+  // to use for French and English.
+  const german = analyseGermanRequirement(text);
+  if (german.status === "required") {
+    out.push({
+      kind: "language",
+      language: "German",
+      level: german.level,
+      detail: `${MANDATORY_GERMAN_REQUIREMENT}: ${german.detail}`,
+    });
+  }
+  for (const language of ["French", "English"]) {
+    const pattern = language === "French" ? /\b(french|français|francais)\b/i : /\b(english|englisch|anglais)\b/i;
     for (const sentence of text.split(/\n|•|(?<=[.!?;])\s+/)) {
       if (!pattern.test(sentence)) continue;
       if (/\b(no|not|without|keine[n]?|nicht)\b[^.]{0,40}\b(required|needed|necessary|erforderlich)\b/i.test(sentence)) continue;

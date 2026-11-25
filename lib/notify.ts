@@ -602,7 +602,7 @@ export function notificationQueueSnapshot() {
     delivery: string | null;
     report_id: string | null;
   }>(
-    "SELECT provider_message_id, kind, finished_at, delivery, report_id FROM notification_outbox WHERE status = 'sent' ORDER BY finished_at DESC LIMIT 1",
+    "SELECT provider_message_id, kind, finished_at, delivery, report_id FROM notification_outbox WHERE delivery IN ('accepted_by_gmail','sent_folder_observed','delivery_confirmed') ORDER BY finished_at DESC LIMIT 1",
   );
   return { counts, deliveryCounts, latest, lastError, lastAccepted, configured: Boolean(notificationRecipient()) };
 }

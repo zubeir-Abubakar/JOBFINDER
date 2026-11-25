@@ -21,8 +21,10 @@ export async function POST(request: Request) {
         "Content-Type": result.mime,
         "Content-Length": String(result.bytes.length),
         "Cache-Control": "private, no-store",
-        "X-Voice-Source": result.cached ? "cache" : "freellmapi",
+        "X-Voice-Source": result.cached ? "cache" : result.source,
         "X-Voice-Name": result.voice,
+        "X-Voice-Model": result.model,
+        ...(result.expiresAt ? { "X-Voice-Expires-At": result.expiresAt } : {}),
       },
     });
   } catch (error) {

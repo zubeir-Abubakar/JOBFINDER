@@ -58,6 +58,31 @@ test.before(async () => {
       response.end(page({ title, validThrough: "2027-01-31T23:59:59Z" }));
       return;
     }
+    if (path === "/form") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end(
+        page({
+          title,
+          body: '<form action="/apply"><input type="email" name="email"><input type="file" name="cv"><button type="submit">Apply</button></form>',
+        }),
+      );
+      return;
+    }
+    if (path === "/linked") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end(page({ title, body: '<a href="/form">Apply now</a>' }));
+      return;
+    }
+    if (path === "/iframe-form") {
+      response.writeHead(200, { "Content-Type": "text/html" });
+      response.end(
+        page({
+          title,
+          body: '<form><input type="email" name="newsletter"></form><iframe src="https://forms.example.test/apply"></iframe>',
+        }),
+      );
+      return;
+    }
     response.writeHead(200, { "Content-Type": "text/html" });
     response.end(page({ title }));
   });
@@ -165,6 +190,95 @@ test("a generic careers page cannot verify the role and is blocked", async () =>
   assert.equal(result.status, "unverified");
   assert.equal(result.checks.every((check) => check.kind !== "application" || !check.identityMatched), true);
   assert.match(result.reason, /could be matched|did not return a page/i);
+});
+
+test("route evidence distinguishes resolved, reachable, identity, open and form support", async () => {
+  const id = insertFixture("/form");
+  const job = db.one<Record<string, string | null>>("SELECT * FROM jobs WHERE id = ?", [id]);
+  assert.ok(job);
+  const result = await vacancy.verifyAndPersistVacancy(
+    {
+      id,
+      title,
+      company,
+      url: job.url,
+      application_url: job.application_url,
+      published_at: job.published_at,
+      url_confidence: "direct",
+    },
+    { fetchImpl: fetch, now: new Date() },
+  );
+  assert.equal(result.status, "open");
+  assert.equal(result.route.urlResolved, true);
+  assert.equal(result.route.urlReachable, true);
+  assert.equal(result.route.employerIdentityVerified, true);
+  assert.equal(result.route.vacancyOpenVerified, true);
+  assert.equal(result.route.applicationFormSupported, true);
+  assert.equal(result.route.finalStatus, "APPLICATION_FORM_SUPPORTED");
+  assert.match(result.route.formEvidence.join(" "), /HTML form element/i);
+  assert.match(result.route.formEvidence.join(" "), /upload control/i);
+  const stored = db.one<{ vacancy_verification: string }>(
+    "SELECT vacancy_verification FROM jobs WHERE id = ?",
+    [id],
+  );
+  assert.match(stored?.vacancy_verification ?? "", /APPLICATION_FORM_SUPPORTED/);
+});
+
+test("an explicit employer apply link is followed once and the form page becomes the route", async () => {
+  const id = insertFixture("/linked");
+  const job = db.one<Record<string, string | null>>("SELECT * FROM jobs WHERE id = ?", [id]);
+  assert.ok(job);
+  const result = await vacancy.verifyAndPersistVacancy(
+    {
+      id,
+      title,
+      company,
+      url: job.url,
+      application_url: job.application_url,
+      published_at: job.published_at,
+      url_confidence: "direct",
+    },
+    { fetchImpl: fetch, now: new Date() },
+  );
+  assert.equal(result.route.finalStatus, "APPLICATION_FORM_SUPPORTED");
+  assert.match(result.route.finalUrl ?? "", /\/form$/);
+  assert.equal(result.checks.some((check) => check.kind === "application_form"), true);
+});
+
+test("an embedded third-party form is reported as unsupported, not form-supported", async () => {
+  const id = insertFixture("/iframe-form");
+  const job = db.one<Record<string, string | null>>("SELECT * FROM jobs WHERE id = ?", [id]);
+  assert.ok(job);
+  const result = await vacancy.verifyVacancy(
+    {
+      title,
+      company,
+      url: job.url,
+      application_url: job.application_url,
+      published_at: job.published_at,
+      url_confidence: "direct",
+    },
+    { fetchImpl: fetch, now: new Date() },
+  );
+  assert.equal(result.route.vacancyOpenVerified, true);
+  assert.equal(result.route.applicationFormSupported, false);
+  assert.equal(result.route.finalStatus, "VACANCY_OPEN_VERIFIED");
+  assert.match(result.route.formEvidence.join(" "), /embedded third-party iframe/i);
+  assert.match(result.route.reason, /third-party iframe/i);
+});
+
+test("an unresolved aggregator-only vacancy has no employer route", async () => {
+  const id = insertFixture("/open");
+  db.run("UPDATE jobs SET application_url = NULL, url_confidence = 'unresolved' WHERE id = ?", [id]);
+  const job = db.one<Record<string, string | null>>("SELECT * FROM jobs WHERE id = ?", [id]);
+  assert.ok(job);
+  const result = await vacancy.verifyVacancy(
+    { title, company, url: job.url, application_url: null, published_at: job.published_at, url_confidence: "unresolved" },
+    { fetchImpl: fetch, now: new Date() },
+  );
+  assert.equal(result.route.urlResolved, false);
+  assert.equal(result.route.finalStatus, "APPLICATION_ROUTE_UNRESOLVED");
+  assert.deepEqual(result.route.statuses, ["APPLICATION_ROUTE_UNRESOLVED"]);
 });
 
 test("a missing publication date blocks an otherwise reachable listing", async () => {

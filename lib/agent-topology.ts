@@ -7,6 +7,7 @@ import {
 } from "./agent-identity";
 import { effectiveVoiceProfileForAgent } from "./agent-voice-settings";
 import { workflowAccessibleTo, type WorkflowActor } from "./workflow-view";
+import { runStageSummary, type StageCheckpoint } from "./recruitment-stages";
 
 /**
  * Read-only projection of the existing execution records for the live topology.
@@ -20,6 +21,7 @@ export type TopologyState =
   | "working"
   | "processing"
   | "waiting"
+  | "recovering"
   | "completed"
   | "failed"
   | "idle"
@@ -67,6 +69,8 @@ export type TopologyAgent = {
   state: TopologyState;
   stateLabel: string;
   active: boolean;
+  /** True only when a persisted task or run assignment exists for this run. */
+  assigned: boolean;
   activity: string;
   task: TopologyTask | null;
   startedAt: string | null;
@@ -83,6 +87,10 @@ export type TopologyConnection = {
   active: boolean;
   direction: "chief-to-agent" | "agent-to-chief" | null;
   label: string | null;
+  phase: "assignment" | "result" | "waiting" | "recovering" | "failed" | null;
+  taskId: string | null;
+  eventId: number | null;
+  updatedAt: string | null;
 };
 
 export type TopologyRun = {
@@ -100,13 +108,34 @@ export type TopologyRun = {
   jobsDiscovered: number;
   jobsUpdated: number;
   counts: {
+    assigned: number;
     total: number;
     completed: number;
     running: number;
     waiting: number;
+    recovering: number;
     failed: number;
     skipped: number;
   };
+};
+
+export type TopologyRecovery = {
+  lastCompleted: string | null;
+  currentStage: string | null;
+  failedStage: string | null;
+  nextAction: string | null;
+  retryCount: number;
+  checkpoints: Array<{
+    stage: string;
+    jobId: string;
+    status: string;
+    attempt: number;
+    decision: string | null;
+    reason: string | null;
+    nextStage: string | null;
+    outputRefs: string | null;
+    updatedAt: string;
+  }>;
 };
 
 export type AgentTopologySnapshot = {
@@ -117,6 +146,7 @@ export type AgentTopologySnapshot = {
   agents: TopologyAgent[];
   connections: TopologyConnection[];
   run: TopologyRun | null;
+  recovery: TopologyRecovery | null;
   events: TopologyEvent[];
   stats: {
     total: number;
@@ -125,6 +155,7 @@ export type AgentTopologySnapshot = {
     waiting: number;
     completed: number;
     failed: number;
+    recovering: number;
     idle: number;
     offline: number;
   };
@@ -229,6 +260,7 @@ const STATE_LABELS: Record<TopologyState, string> = {
   working: "Working",
   processing: "Processing",
   waiting: "Waiting",
+  recovering: "Recovering",
   completed: "Completed",
   failed: "Failed",
   idle: "Idle",
@@ -253,6 +285,7 @@ export function deriveTopologyState(input: {
   enabled: boolean;
   agentStatus: string;
   taskStatus?: string | null;
+  recoveryState?: string | null;
 }): TopologyState {
   if (!input.enabled || ["disabled", "paused", "unavailable"].includes(input.agentStatus)) return "offline";
   const taskStatus = input.taskStatus ?? null;
@@ -260,7 +293,11 @@ export function deriveTopologyState(input: {
     if (ACTIVE_TASK_STATUSES.has(taskStatus)) {
       return input.agentStatus === "thinking" || taskStatus === "thinking" ? "processing" : "working";
     }
-    if (WAITING_TASK_STATUSES.has(taskStatus)) return "waiting";
+    if (WAITING_TASK_STATUSES.has(taskStatus)) {
+      return /retry|resum|recover/i.test(input.recoveryState ?? "") || taskStatus === "retry_scheduled"
+        ? "recovering"
+        : "waiting";
+    }
     if (taskStatus === "failed") return "failed";
     if (taskStatus === "completed") return "completed";
   }
@@ -332,8 +369,8 @@ function taskFromAssignment(row: AssignmentRow): TopologyTask {
 
 function activityFor(agent: AgentRow, task: TopologyTask | null, state: TopologyState): string {
   if (state === "offline") return agent.enabled === 1 ? "Paused — no new work will start." : "Disabled in agent management.";
-  if (!task) return "No active task.";
-  if (state === "waiting") {
+  if (!task) return "Not assigned to this run.";
+  if (state === "waiting" || state === "recovering") {
     return clip(task.stateReason ?? task.detail ?? task.title, 220);
   }
   if (state === "working" || state === "processing") {
@@ -407,6 +444,15 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
         [runRow.id],
       )
     : [];
+  const runTaskRows = runRow
+    ? all<TaskRow>(
+        `SELECT id, agent_key, title, status, detail, output, error, task_type, state_reason,
+                heartbeat_at, depends_on, retry_count, error_class, recovery_state,
+                created_at, started_at, finished_at
+         FROM tasks WHERE run_id = ? ORDER BY created_at DESC`,
+        [runRow.id],
+      )
+    : [];
   const eventRows = workflowId
     ? all<EventRow>(
         `SELECT id, workflow_id, agent_key, type, message, created_at
@@ -457,8 +503,9 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
       enabled: row.enabled === 1,
       agentStatus: row.status,
       taskStatus: task?.status,
+      recoveryState: task?.recoveryState ?? null,
     });
-    const active = state === "working" || state === "processing" || state === "waiting";
+    const active = state === "working" || state === "processing" || state === "waiting" || state === "recovering";
     const recentEvents = events.filter((event) => event.agentKey === row.key).slice(-5).reverse();
     return {
       key: row.key as IdentityAgentKey,
@@ -470,8 +517,9 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
       initials: initialsForName(identity.name),
       enabled: row.enabled === 1,
       state,
-      stateLabel: STATE_LABELS[state],
+      stateLabel: !task && state === "idle" ? "Not assigned" : STATE_LABELS[state],
       active,
+      assigned: Boolean(task),
       activity: activityFor(row, task, state),
       task,
       startedAt: task?.startedAt ?? null,
@@ -500,6 +548,7 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
       state: "offline",
       stateLabel: STATE_LABELS.offline,
       active: false,
+      assigned: false,
       activity: "Coordinator record is unavailable.",
       task: null,
       startedAt: null,
@@ -529,38 +578,74 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
   );
   const specialists = displayAgents.filter((agent) => agent.key !== "coordinator");
   const connections: TopologyConnection[] = specialists.map((agent) => {
+    const latest = agent.recentEvents[0] ?? null;
+    const eventAge = latest ? now.getTime() - Date.parse(latest.createdAt) : Number.NaN;
+    const recentTerminal =
+      Boolean(latest) &&
+      (latest?.type === "agent.completed" || latest?.type === "agent.failed") &&
+      Number.isFinite(eventAge) &&
+      eventAge >= 0 &&
+      eventAge < 20_000;
     const runningNow =
       Boolean(agent.task) &&
       (agent.state === "working" || agent.state === "processing") &&
       Boolean(agent.task && ACTIVE_TASK_STATUSES.has(agent.task.status));
-    const latest = agent.recentEvents[0] ?? null;
-    const completedOrFailed = latest?.type === "agent.completed" || latest?.type === "agent.failed";
+    const phase: TopologyConnection["phase"] =
+      agent.state === "recovering"
+        ? "recovering"
+        : runningNow
+          ? "assignment"
+          : agent.state === "waiting"
+            ? "waiting"
+            : agent.state === "failed"
+              ? "failed"
+              : latest?.type === "agent.completed"
+                ? "result"
+                : null;
     return {
       agentKey: agent.key,
-      active: runningNow,
-      direction: runningNow
-        ? "chief-to-agent"
-        : agent.state === "waiting"
-          ? "chief-to-agent"
-          : completedOrFailed
-            ? "agent-to-chief"
+      active: phase === "assignment" || phase === "recovering" || (phase === "result" && recentTerminal),
+      direction:
+        phase === "result"
+          ? "agent-to-chief"
+          : phase === "assignment" || phase === "waiting" || phase === "recovering"
+            ? "chief-to-agent"
             : null,
-      label: runningNow && agent.task
-        ? `${coordinator.name} assigned: ${agent.task.title}`
-        : latest?.message ?? null,
+      phase,
+      taskId: agent.task?.id ?? null,
+      eventId: latest?.id ?? null,
+      updatedAt: latest?.createdAt ?? agent.task?.finishedAt ?? agent.task?.startedAt ?? null,
+      label:
+        phase === "assignment" && agent.task
+          ? `${coordinator.name} assigned ${agent.name}: ${agent.task.title}`
+          : phase === "result"
+            ? `${agent.name} returned: ${agent.task?.title ?? latest?.message ?? "task result"}`
+            : phase === "waiting" && agent.task
+              ? `${agent.name} waiting: ${(agent.task.stateReason ?? agent.task.dependsOn.join(", ")) || agent.task.title}`
+              : phase === "failed"
+                ? `${agent.name} failed: ${agent.task?.error ?? latest?.message ?? "see task error"}`
+                : phase === "recovering"
+                  ? `${agent.name} recovering: ${agent.task?.stateReason ?? "retry scheduled"}`
+                  : latest?.message ?? null,
     };
   });
 
-  const counts = {
-    total: assignmentRows.length,
-    completed: assignmentRows.filter((row) => row.status === "completed").length,
-    running: assignmentRows.filter((row) => row.status === "running").length,
-    waiting: assignmentRows.filter((row) =>
-      ["queued", "retry_scheduled", "waiting_provider", "waiting_intervention", "retried"].includes(row.status),
+  const countedTasks = runTaskRows.length > 0 ? runTaskRows : taskRows;
+  const taskCounts = {
+    assigned: countedTasks.length,
+    total: countedTasks.length,
+    completed: countedTasks.filter((row) => row.status === "completed").length,
+    running: countedTasks.filter((row) => ACTIVE_TASK_STATUSES.has(row.status)).length,
+    waiting: countedTasks.filter(
+      (row) => WAITING_TASK_STATUSES.has(row.status) && !/retry|resum|recover/i.test(row.recovery_state ?? "") && row.status !== "retry_scheduled",
     ).length,
-    failed: assignmentRows.filter((row) => row.status === "failed").length,
+    recovering: countedTasks.filter(
+      (row) => /retry|resum|recover/i.test(row.recovery_state ?? "") || row.status === "retry_scheduled",
+    ).length,
+    failed: countedTasks.filter((row) => row.status === "failed").length,
     skipped: assignmentRows.filter((row) => row.status === "skipped").length,
   };
+  const counts = taskCounts;
 
   const run: TopologyRun | null = runRow
     ? {
@@ -586,6 +671,30 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
       }
     : null;
 
+  const recovery: TopologyRecovery | null = runRow
+    ? (() => {
+        const summary = runStageSummary(runRow.id);
+        return {
+          lastCompleted: summary.lastCompleted,
+          currentStage: summary.currentStage,
+          failedStage: summary.failedStage,
+          nextAction: summary.nextAction,
+          retryCount: summary.retryCount,
+          checkpoints: summary.checkpoints.map((row: StageCheckpoint) => ({
+            stage: row.stage,
+            jobId: row.job_id,
+            status: row.status,
+            attempt: row.attempt,
+            decision: row.decision,
+            reason: row.reason,
+            nextStage: row.next_stage,
+            outputRefs: row.output_refs,
+            updatedAt: row.updated_at,
+          })),
+        };
+      })()
+    : null;
+
   const stats = {
     total: displayAgents.length,
     working: displayAgents.filter((agent) => agent.state === "working").length,
@@ -593,6 +702,7 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
     waiting: displayAgents.filter((agent) => agent.state === "waiting").length,
     completed: displayAgents.filter((agent) => agent.state === "completed").length,
     failed: displayAgents.filter((agent) => agent.state === "failed").length,
+    recovering: displayAgents.filter((agent) => agent.state === "recovering").length,
     idle: displayAgents.filter((agent) => agent.state === "idle").length,
     offline: displayAgents.filter((agent) => agent.state === "offline").length,
   };
@@ -607,6 +717,7 @@ export function getAgentTopologySnapshot(user: WorkflowActor, now: Date = new Da
     agents: displayAgents,
     connections,
     run,
+    recovery,
     events,
     stats,
   };

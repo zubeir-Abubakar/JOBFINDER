@@ -8,14 +8,19 @@ import { agentIdentity } from "@/lib/agent-identity";
 type Msg = { id: string | number; role: string; content: string; created_at?: string };
 type VoiceSettings = { voice: string; speed: number; volume: number; muted: boolean; spokenProgress: boolean };
 
-const DEFAULT_SETTINGS: VoiceSettings = { voice: "Charon", speed: 1, volume: 1, muted: false, spokenProgress: true };
+const DEFAULT_SETTINGS: VoiceSettings = { voice: "nadine", speed: 1, volume: 1, muted: false, spokenProgress: true };
 const STORAGE_KEY = "atw.voice.settings.v1";
 const VOICES = [
-  ["Charon", "Charon — calm, deep male voice (verified through FreeLLMAPI)"],
-  ["Fenrir", "Fenrir — lower, deliberate male voice"],
-  ["Puck", "Puck — brighter, energetic voice"],
-  ["Kore", "Kore — composed female voice"],
-  ["Aoede", "Aoede — warm female voice"],
+  ["nadine", "Nadine — clear, natural default (OpenRouter HeyGen free)"],
+  ["tabitha", "Tabitha — warm female voice (OpenRouter HeyGen free)"],
+  ["bram", "Bram — lower male voice (OpenRouter HeyGen free)"],
+  ["gareth", "Gareth — deliberate male voice (OpenRouter HeyGen free)"],
+  ["noelle", "Noelle — composed female voice (OpenRouter HeyGen free)"],
+  ["meredith", "Meredith — measured female voice (OpenRouter HeyGen free)"],
+  ["sabrina", "Sabrina — brighter female voice (OpenRouter HeyGen free)"],
+  ["lucian", "Lucian — lower male voice (OpenRouter HeyGen free)"],
+  ["weston", "Weston — steady male voice (OpenRouter HeyGen free)"],
+  ["vincent", "Vincent — deep male voice (OpenRouter HeyGen free)"],
 ];
 const EVENT_TYPES = [
   "workflow.started",
@@ -40,8 +45,9 @@ function loadSettings(): VoiceSettings {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_SETTINGS;
     const parsed = JSON.parse(raw) as Partial<VoiceSettings>;
+    const savedVoice = typeof parsed.voice === "string" ? parsed.voice : "";
     return {
-      voice: typeof parsed.voice === "string" ? parsed.voice : DEFAULT_SETTINGS.voice,
+      voice: VOICES.some(([id]) => id === savedVoice) ? savedVoice : DEFAULT_SETTINGS.voice,
       speed: Math.min(1.3, Math.max(0.7, Number(parsed.speed ?? 1) || 1)),
       volume: Math.min(1, Math.max(0, Number(parsed.volume ?? 1))),
       muted: Boolean(parsed.muted),

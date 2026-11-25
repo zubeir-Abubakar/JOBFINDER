@@ -17,6 +17,7 @@ const voices = await import("../lib/agent-voices.ts");
 const capabilities = await import("../lib/agent-capabilities.ts");
 const operations = await import("../lib/operations.ts");
 const providers = await import("../lib/providers.ts");
+const availability = await import("../lib/agent-availability.ts");
 
 db.getDb();
 const now = new Date().toISOString();
@@ -193,6 +194,15 @@ test("token rows carry provider/estimated provenance and one attempt per inferen
   assert.equal(totals.failedRequests, 1);
 });
 
+test("missing AI restricts Chief without taking deterministic coordination offline", () => {
+  const chief = availability.agentAvailability("coordinator");
+  assert.equal(chief.available, true);
+  assert.equal(chief.restricted, true);
+  assert.equal(chief.restriction, "ai_inference");
+  assert.match(chief.reason ?? "", /deterministic coordination remains available/i);
+  assert.equal(availability.effectiveAgentStatus("idle", true, chief), "idle");
+});
+
 test("the live operational snapshot answers without inventing provider or token state", async () => {
   const snapshot = await operations.getOperationalSnapshot();
   assert.equal(snapshot.agentCount, 8);
@@ -238,5 +248,10 @@ test("the live operational snapshot answers without inventing provider or token 
   assert.match(email, /Gmail:/);
   assert.match(email, /Executive Brief/);
   assert.match(email, /state generated|state queued|state accepted_by_gmail|state sent_folder_observed|state delivery_confirmed/);
-  assert.match(operations.operationsBrief(snapshot), new RegExp(`schema v${db.SCHEMA_VERSION}`));
+  assert.match(email, /not delivery-confirmed/);
+  const brief = operations.operationsBrief(snapshot);
+  assert.match(brief, new RegExp(`schema v${db.SCHEMA_VERSION}`));
+  assert.match(brief, /Gmail accepted \(not delivery-confirmed\)/);
+  assert.match(brief, /Sent-folder observed/);
+  assert.match(brief, /delivery confirmed/);
 });

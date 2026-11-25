@@ -20,6 +20,7 @@ import { getSetting } from "@/lib/settings";
 import { AgentAvatar } from "@/components/AgentAvatar";
 import { DocumentWorkspace } from "@/components/DocumentWorkspace";
 import { agentIdentity } from "@/lib/agent-identity";
+import { GermanRequirementCard } from "@/components/GermanRequirementCard";
 
 export const dynamic = "force-dynamic";
 
@@ -57,8 +58,12 @@ export default async function ApplicationDetailPage({
     salary: string | null;
     employment_type: string | null;
     description: string | null;
+    eligibility: string | null;
+    german_requirement: string | null;
+    language_evidence: string | null;
   }>(
-    `SELECT a.*, j.title, j.company, j.location, j.url, j.match_score, j.match_flag, j.salary, j.employment_type, j.description
+    `SELECT a.*, j.title, j.company, j.location, j.url, j.match_score, j.match_flag, j.salary, j.employment_type, j.description,
+            j.eligibility, j.german_requirement, j.language_evidence
      FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?`,
     [id],
   );
@@ -383,6 +388,12 @@ export default async function ApplicationDetailPage({
               </details>
             </div>
           </section>
+
+          <GermanRequirementCard
+            status={app.german_requirement}
+            evidence={app.language_evidence}
+            eligibility={app.eligibility}
+          />
 
           <section className="card">
             <div className="card-head">

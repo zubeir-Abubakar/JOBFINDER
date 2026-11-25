@@ -165,7 +165,7 @@ export default async function AdminEmailPage({
                   </form>
                 ) : null}
               </div>
-              <div className="mt-2" style={{ color: "var(--muted)" }}>Send Now generates the current report and processes only its outbox row immediately. It does not wait for 17:00. Duplicate prevention stays active; Resend is offered only after a definitive failure, block or bounce.</div>
+              <div className="mt-2" style={{ color: "var(--muted)" }}>Send Now generates the current report and processes only its outbox row immediately. It does not wait for 16:00. Duplicate prevention stays active; Resend is offered only after a definitive failure, block or bounce.</div>
             </div>
             <div className="card-quiet p-3 mb-3 text-[11.5px] leading-relaxed">
               <strong>Daily executive brief:</strong> {briefSchedule.enabled ? "enabled" : "disabled"} · {briefSchedule.time} {briefSchedule.timezone} · next {briefSchedule.next_run_at ? formatDateTime(briefSchedule.next_run_at) : "not scheduled"} · last status {briefSchedule.last_status ?? "not run"}.
@@ -173,7 +173,7 @@ export default async function AdminEmailPage({
               <div className="mt-1">The Coordinator is the only sender of the consolidated owner report. Routine successful applications stay in-app; blocked exceptions remain visible in the brief.</div>
             </div>
             <div className="card-quiet p-3 mb-3 text-[11.5px] leading-relaxed">
-              <strong>Delivery outbox:</strong> {outbox.counts.pending} pending · {outbox.counts.retry_scheduled} retry scheduled · {outbox.counts.sending} sending · {outbox.counts.sent} accepted by Gmail · {outbox.counts.failed} failed.
+              <strong>Delivery outbox:</strong> {outbox.counts.pending} pending · {outbox.counts.retry_scheduled} retry scheduled · {outbox.counts.sending} sending · {outbox.deliveryCounts.accepted_by_gmail} accepted by Gmail (not delivery-confirmed) · {outbox.deliveryCounts.sent_folder_observed} Sent-folder observed · {outbox.deliveryCounts.delivery_confirmed} delivery confirmed · {outbox.counts.failed} failed.
               {outbox.lastError?.last_error ? <div className="mt-1"><strong>Last delivery error:</strong> {outbox.lastError.last_error}</div> : null}
               {outbox.lastAccepted ? <div className="mt-1"><strong>Last accepted:</strong> {outbox.lastAccepted.kind ?? "email"} · message {outbox.lastAccepted.provider_message_id ?? "none"} · {outbox.lastAccepted.finished_at ? formatDateTime(outbox.lastAccepted.finished_at) : "unknown"}</div> : null}
             </div>

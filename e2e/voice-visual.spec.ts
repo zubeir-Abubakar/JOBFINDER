@@ -16,13 +16,16 @@ test("a live voice walkthrough collapses to a floating companion and survives na
 
   const panel = page.locator(".lv-panel");
   await expect(panel).toBeVisible();
-  await expect.poll(async () => await panel.locator(".lv-status").innerText(), { timeout: 35_000 }).toMatch(/Listening|Speaking/);
+  await expect.poll(async () => await panel.locator(".lv-status").innerText(), { timeout: 35_000 }).toMatch(/Listening|Speaking|Unavailable/i);
   const alert = page.locator(".lv-alert");
   if (await alert.count()) {
     const detail = (await alert.innerText()).slice(0, 220);
-    testInfo.annotations.push({ type: "BLOCKED", description: detail });
-    test.skip(true, "The live provider was unavailable before Visual Companion Mode could be exercised.");
+    if (/External voice inference blocked|free-tier|zero-spend|CHF 0\.00/i.test(detail)) {
+      testInfo.annotations.push({ type: "BLOCKED", description: detail });
+      test.skip(true, "Gemini Live is blocked by the CHF 0.00 policy before Visual Companion Mode can be exercised.");
+    }
   }
+  await expect.poll(async () => await panel.locator(".lv-status").innerText(), { timeout: 35_000 }).toMatch(/Listening|Speaking/);
   await expect(panel.locator(".lv-presence")).toContainText("Connected");
   const connectsBefore = (await diagnosticEvents(page)).filter((event) => event === "LIVE_SESSION_CONNECTED").length;
 

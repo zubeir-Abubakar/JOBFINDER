@@ -126,8 +126,20 @@ test("a failed document stage resumes from the saved vacancy without repeating d
     "INSERT INTO jobs (id, source, title, company, status, qualified, match_score, document_state, discovered_at) VALUES ('job_recovery', 'test', 'Senior QA Engineer', 'Acme', 'shortlisted', 1, 92, 'awaiting_documents', ?)",
     [now],
   );
+  for (const [id, kind, mime, name] of [
+    ["doc_recovery_cv", "tailored_cv", "application/pdf", "recovery-cv.pdf"],
+    ["doc_recovery_cover", "cover_letter", "application/pdf", "recovery-cover.pdf"],
+  ] as const) {
+    db.run(
+      `INSERT INTO documents
+         (id, user_id, kind, display_name, file_name, mime, relative_path, size_bytes, status, job_id, version, quality_status, quality_score, text_content, created_at)
+       VALUES (?, 'system', ?, ?, ?, ?, ?, 1200, 'ready', 'job_recovery', '1.0', 'passed', 100, 'Verified recovery fixture.', ?)`,
+      [id, kind, `${kind} fixture`, name, mime, name, now],
+    );
+  }
   db.run(
-    "INSERT INTO applications (id, job_id, status, last_update, created_at) VALUES ('app_recovery', 'job_recovery', 'awaiting_documents', ?, ?)",
+    `INSERT INTO applications (id, job_id, status, cv_document_id, cover_letter_id, last_update, created_at)
+     VALUES ('app_recovery', 'job_recovery', 'awaiting_documents', 'doc_recovery_cv', 'doc_recovery_cover', ?, ?)`,
     [now, now],
   );
 

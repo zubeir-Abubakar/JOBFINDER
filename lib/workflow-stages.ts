@@ -51,16 +51,22 @@ export const WORKFLOW_STAGES: readonly WorkflowStage[] = [
     hint: `${analysis.title} — scores fit against your profile`,
   },
   {
-    key: "generation",
-    label: `${cv.name} & ${cover.name}`,
-    agents: [cv.key, cover.key],
-    hint: `${cv.title} · ${cover.title}`,
+    key: "cv",
+    label: cv.name,
+    agents: [cv.key],
+    hint: `${cv.title} — generates and preserves the tailored CV`,
+  },
+  {
+    key: "cover",
+    label: cover.name,
+    agents: [cover.key],
+    hint: `${cover.title} — writes from the validated CV`,
   },
   {
     key: "quality",
     label: ats.name,
     agents: [ats.key],
-    hint: `${ats.title} — checks claims and readiness`,
+    hint: `${ats.title} — independently validates the complete package`,
   },
   {
     key: "submission",

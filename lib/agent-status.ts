@@ -37,6 +37,7 @@ export type TaskExecution = {
   tone: string;
   aiBacked: boolean;
   aiFailed: boolean;
+  aiBlocked?: boolean;
 };
 
 /** Whether a completed task may be counted as a successful AI execution. */
@@ -55,6 +56,17 @@ export function taskExecutionMeta(row: {
   model?: string | null;
 }): TaskExecution {
   if (row.execution_mode === "ai") {
+    if (row.ai_outcome === "blocked") {
+      return {
+        mode: "ai",
+        label: "AI blocked — deterministic fallback",
+        detail: "The request was blocked before transmission; no model output was used.",
+        tone: "badge-warn",
+        aiBacked: false,
+        aiFailed: false,
+        aiBlocked: true,
+      };
+    }
     if (row.ai_outcome === "failed") {
       return {
         mode: "ai",

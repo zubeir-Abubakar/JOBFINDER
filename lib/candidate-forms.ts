@@ -7,9 +7,10 @@
  * enters credentials, bypasses MFA, pays a fee, or pretends a form was submitted
  * when the response did not confirm it.
  *
- * The implementation intentionally handles server-rendered forms only. A form
- * that requires JavaScript, an account login or a security challenge is queued
- * for human intervention rather than driven through a browser.
+ * This module handles server-rendered forms. When a page renders its form with
+ * JavaScript, lib/browser-form.ts drives the same verified answers through the
+ * local Playwright browser. Neither path solves a CAPTCHA, enters credentials,
+ * bypasses MFA, pays a fee, or invents a candidate fact.
  */
 
 import { assertPublicHttpUrl } from "./outbound-url";
@@ -139,7 +140,7 @@ function normalise(value: string): string {
   return value.toLowerCase().replace(/[’‘]/g, "'").replace(/[“”]/g, '"').replace(/\s+/g, " ").trim();
 }
 
-function detectSecurity(html: string): string | null {
+export function detectSecurity(html: string): string | null {
   for (const [pattern, message] of SECURITY_PATTERNS) if (pattern.test(html)) return message;
   return null;
 }
@@ -237,7 +238,7 @@ function parseFields(formHtml: string): CandidateField[] {
   return fields;
 }
 
-function categoryFor(field: CandidateField): string {
+export function categoryFor(field: CandidateField): string {
   const text = normalise(`${field.name} ${field.label} ${field.type} ${field.accept ?? ""}`);
   if (field.type === "file") {
     if (/cover|motivation|anschreiben/.test(text)) return "cover_file";
@@ -299,7 +300,7 @@ function matchOption(field: CandidateField, answer: string): string | null {
   return null;
 }
 
-function answerFor(
+export function answerFor(
   category: string,
   field: CandidateField,
   profile: CandidateProfile,
@@ -502,6 +503,14 @@ export async function prepareCandidateForm(input: {
   }
 
   const fields = parseFields(form.body);
+  if (fields.every((field) => field.hidden)) {
+    return {
+      ...empty,
+      status: "unsupported",
+      detail: "The form has no fillable server-rendered fields. The employer may render the application with JavaScript.",
+      blockers: ["No fillable server-rendered fields were found."],
+    };
+  }
   const authorised = input.authorised ?? {};
   const questions = fields
     .filter((field) => field.name !== "_charset_")
@@ -533,7 +542,7 @@ function extractReference(text: string): string | null {
   return match?.[1]?.trim() ?? null;
 }
 
-function classifySuccess(text: string, finalUrl: string, httpStatus: number): {
+export function classifySuccess(text: string, finalUrl: string, httpStatus: number): {
   status: "verified" | "unverified";
   detail: string;
   reference: string | null;

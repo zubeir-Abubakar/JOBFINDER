@@ -30,7 +30,9 @@ test("an adapter existing is not reported as an operational integration", async 
   assert.equal(greenhouse?.credentials[0]?.present, false);
   assert.ok(greenhouse?.missing[0]?.includes("GREENHOUSE_JOB_BOARD_API_KEY"));
   const candidate = inventory.integrations.find((item) => item.key === "candidate_form");
-  assert.match(candidate?.operationalDetail ?? "", /mock-tested only/i);
+  assert.equal(candidate?.operational, false, "fixture proof does not claim a live employer integration");
+  assert.match(candidate?.operationalDetail ?? "", /controlled local ATS fixtures/i);
+  assert.match(candidate?.operationalDetail ?? "", /not marked operational/i);
 
   const missing = await integrations.testIntegrationConnection("greenhouse");
   assert.equal(missing.status, "blocked");

@@ -12,6 +12,7 @@ import {
   scrubProviderError,
   setGatewayCooldown,
 } from "./providers";
+import { AiSpendingPolicyError } from "./ai-spending-policy";
 
 /**
  * Durable advisory AI queue.
@@ -116,22 +117,16 @@ function markTaskAi(
 ): void {
   if (!taskId) return;
   if (ok) {
-    run(
-      "UPDATE tasks SET execution_mode = 'ai', ai_outcome = 'ok', provider = COALESCE(?, provider), model = COALESCE(?, model), attempts = attempts + 1 WHERE id = ?",
-      [provider, model, taskId],
-    );
+    // recordUsage() already recorded the call and updated the task metadata.
     if (text) {
       run(
         "UPDATE tasks SET output = substr(COALESCE(output, '') || ?, 1, 6000) WHERE id = ?",
         [` AI advisory (${provider ?? "freellmapi"}/${model ?? "pinned"}): ${text.replace(/\s+/g, " ").slice(0, 300)}`, taskId],
       );
     }
-  } else {
-    run(
-      "UPDATE tasks SET execution_mode = 'ai', ai_outcome = CASE WHEN ai_outcome = 'ok' THEN 'ok' ELSE 'failed' END, attempts = attempts + 1 WHERE id = ?",
-      [taskId],
-    );
   }
+  // A failed call is persisted by recordUsage(); this helper only appends the
+  // successful advisory text to the task output.
 }
 
 async function executeJob(job: AiJobRow): Promise<{ text: string; provider: string; model: string }> {
@@ -270,11 +265,9 @@ async function pumpAiQueue(): Promise<void> {
   try {
     for (;;) {
       heartbeatRuntimeWorker("ai_queue");
-      const cooling = gatewayCooldownStatus();
-      if (cooling.remainingMs > 0) {
-        schedulePump(cooling.remainingMs + 100);
-        return;
-      }
+      // A FreeLLMAPI cooldown pauses only that provider. The router may still
+      // use the other verified free tier or loopback Ollama, so the whole queue
+      // must not stall while one free route is cooling down.
 
       const job = one<AiJobRow>(
         "SELECT * FROM ai_jobs WHERE status IN ('queued', 'rate_limited') AND available_at <= ? ORDER BY priority ASC, created_at ASC LIMIT 1",
@@ -305,6 +298,20 @@ async function pumpAiQueue(): Promise<void> {
       } catch (error) {
         const message = scrubProviderError(error instanceof Error ? error.message : "AI job failed");
         const attempts = job.attempts + 1;
+
+        if (error instanceof AiSpendingPolicyError) {
+          run(
+            "UPDATE ai_jobs SET status = 'failed', attempts = ?, last_error = ?, finished_at = ? WHERE id = ?",
+            [attempts, message, nowIso(), job.id],
+          );
+          if (job.task_id) {
+            run(
+              "UPDATE tasks SET execution_mode = 'deterministic', ai_outcome = 'blocked', state_reason = ? WHERE id = ?",
+              [message, job.task_id],
+            );
+          }
+          return;
+        }
 
         if (error instanceof AiRateLimitedError) {
           setGatewayCooldown(error.retryAfterMs, message);

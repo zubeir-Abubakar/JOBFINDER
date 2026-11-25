@@ -15,8 +15,8 @@ import { audit } from "./audit";
  * silently raised or lowered.
  */
 
-export const DEFAULT_MAX_SUBMISSIONS_PER_DAY = 5;
-export const MAX_SUBMISSIONS_PER_DAY_LIMIT = 10;
+export const DEFAULT_MAX_SUBMISSIONS_PER_DAY = 3;
+export const MAX_SUBMISSIONS_PER_DAY_LIMIT = 3;
 export const FRESHNESS_DAYS = 7;
 export const RECRUITMENT_POLICY_ENGINE = "standing-authorisation-v1";
 
@@ -131,7 +131,7 @@ export function saveRecruitmentPolicy(input: {
   audit({
     action: "recruitment.policy_updated",
     entity: "settings",
-    detail: `Automatic submission ${input.autonomousSubmission ? "on" : "off"}; threshold ${minScore}%; cap ${maxPerDay}/day; freshness ${FRESHNESS_DAYS} days.`,
+    detail: `Automatic submission ${input.autonomousSubmission ? "on" : "off"}; threshold ${minScore}%; cap ${maxPerDay}/day; live-open verification required (age alone never rejects).`,
     userId: input.userId ?? null,
   });
   return getRecruitmentPolicy();

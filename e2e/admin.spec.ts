@@ -6,7 +6,7 @@ fs.mkdirSync("artifacts/redesign", { recursive: true });
 test("admin provider page shows configuration state but never secret values", async ({ page, diagnostics }) => {
   await gotoReady(page, "/admin/ai");
   await expect(page.getByText("AI provider health")).toBeVisible();
-  await expect(page.getByText("GEMINI_API_KEY")).toBeVisible();
+  await expect(page.getByText("GEMINI_API_KEY").first()).toBeVisible();
   await expect(page.getByText("Google OAuth")).toBeVisible();
   const body = await page.locator("body").innerText();
   expect(body).not.toContain("e2e-fake-google-secret-must-never-render");

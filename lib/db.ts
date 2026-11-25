@@ -268,6 +268,27 @@ CREATE TABLE IF NOT EXISTS provider_usage (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_provider_usage_created ON provider_usage(created_at);
+CREATE TABLE IF NOT EXISTS ai_policy_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  correlation_id TEXT NOT NULL,
+  agent_key TEXT,
+  workflow_id TEXT,
+  task_id TEXT,
+  session_id TEXT,
+  source TEXT,
+  operation TEXT,
+  provider TEXT NOT NULL,
+  model TEXT,
+  execution_type TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  block_reason TEXT,
+  verification_timestamp TEXT,
+  evidence_reference TEXT,
+  network_transmitted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_policy_created ON ai_policy_decisions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_policy_decision ON ai_policy_decisions(decision, created_at DESC);
 CREATE TABLE IF NOT EXISTS ai_jobs (
   id TEXT PRIMARY KEY,
   dedupe_key TEXT NOT NULL UNIQUE,
@@ -558,6 +579,26 @@ CREATE TABLE IF NOT EXISTS recruitment_recovery (
   finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_recruitment_recovery_due ON recruitment_recovery(status, available_at);
+CREATE TABLE IF NOT EXISTS recruitment_stage_checkpoints (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  job_id TEXT NOT NULL DEFAULT '',
+  stage TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempt INTEGER NOT NULL DEFAULT 0,
+  output_refs TEXT,
+  evidence TEXT,
+  decision TEXT,
+  reason TEXT,
+  next_stage TEXT,
+  heartbeat_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(run_id, job_id, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_run ON recruitment_stage_checkpoints(run_id, job_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_stage_checkpoints_status ON recruitment_stage_checkpoints(status, updated_at);
 `;
 
 type GlobalWithDb = typeof globalThis & { __atwDb?: DatabaseSync };
@@ -578,6 +619,58 @@ function restrictMode(target: string, mode: number): void {
     // Some filesystems (notably mounted volumes) cannot represent POSIX modes.
     // The health endpoint reports the actual mode instead of claiming success.
   }
+}
+
+/**
+ * Phase 2 registry backfill. Idempotent, additive and evidence-based.
+ *
+ * - fills the unique dedupe key for legacy rows that lacked one, so the same
+ *   listing cannot be inserted twice again;
+ * - derives the canonical identity using the documented precedence;
+ * - records the internal qualification outcome separately from the legacy
+ *   `status` bucket. No employer decision is invented: an employer rejection
+ *   only ever exists on `applications` with employer evidence.
+ */
+export function backfillJobRegistry(db: DatabaseSync): void {
+  db.exec(`
+    UPDATE jobs
+       SET dedupe_key = 'legacy:' || lower(source) || ':' || lower(external_id)
+     WHERE dedupe_key IS NULL AND external_id IS NOT NULL;
+
+    UPDATE jobs
+       SET employer_key = trim(lower(replace(replace(replace(replace(replace(company,
+             ' AG', ''), ' GmbH', ''), ' SA', ''), ' Ltd', ''), ' Inc', '')))
+     WHERE employer_key IS NULL;
+
+    UPDATE jobs
+       SET canonical_key = CASE
+             WHEN requisition_id IS NOT NULL AND requisition_id <> ''
+               THEN 'req:' || employer_key || ':' || lower(requisition_id)
+             WHEN employer_url IS NOT NULL AND employer_url <> ''
+               THEN 'url:' || employer_url
+             WHEN dedupe_key IS NOT NULL
+               THEN 'id:' || dedupe_key
+             WHEN external_id IS NOT NULL
+               THEN 'src:' || lower(source) || ':' || lower(external_id)
+             ELSE 'id:' || lower(trim(company)) || '|' || lower(trim(title)) || '|' || lower(trim(COALESCE(location, '')))
+           END
+     WHERE canonical_key IS NULL;
+
+    UPDATE jobs
+       SET qualification_status = CASE
+             WHEN qualified = 1 OR status IN ('applied', 'shortlisted', 'documents') THEN 'qualified'
+             WHEN status = 'rejected' AND eligibility = 'ineligible' THEN 'ineligible'
+             WHEN status = 'rejected' AND eligibility = 'needs_review' THEN 'needs_review'
+             WHEN status = 'rejected' AND match_score IS NOT NULL AND match_score < 85 THEN 'below_threshold'
+             WHEN status = 'rejected' THEN 'below_threshold'
+             ELSE 'pending'
+           END
+     WHERE qualification_status IS NULL;
+
+    UPDATE jobs
+       SET vacancy_status = 'verification_unknown'
+     WHERE vacancy_status IS NULL;
+  `);
 }
 
 export function getDb(): DatabaseSync {
@@ -659,7 +752,7 @@ const DEFAULT_SETTINGS: Record<string, unknown> = {
   approval_mode: false,
   autonomous_submission: true,
   min_match_score: 85,
-  max_applications_per_day: 5,
+  max_applications_per_day: 3,
   recruitment_dry_run: false,
   recruitment_submission_enabled: true,
   standing_authorisation_activated_at: null as string | null,
@@ -773,7 +866,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 24;
+export const SCHEMA_VERSION = 26;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -810,6 +903,10 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "provider_usage", "usage_source", "usage_source TEXT");
   ensureColumn(db, "provider_usage", "cached_tokens", "cached_tokens INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "provider_usage", "session_id", "session_id TEXT");
+  // Fallback provenance is additive: historical rows keep NULL, while new
+  // successful local fallbacks record why the primary route was not used.
+  ensureColumn(db, "provider_usage", "fallback_from", "fallback_from TEXT");
+  ensureColumn(db, "provider_usage", "fallback_reason", "fallback_reason TEXT");
   ensureColumn(db, "agent_sessions", "previous_agent_key", "previous_agent_key TEXT");
   ensureColumn(db, "agent_sessions", "context_summary", "context_summary TEXT");
   db.exec("CREATE INDEX IF NOT EXISTS idx_provider_usage_session ON provider_usage(session_id)");
@@ -854,12 +951,34 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "jobs", "published_at", "published_at TEXT");
   ensureColumn(db, "jobs", "eligibility", "eligibility TEXT");
   ensureColumn(db, "jobs", "eligibility_notes", "eligibility_notes TEXT");
+  // German is a hard exclusion at every proficiency level. Both the resolved
+  // status and the quoted evidence are persisted so a restart cannot lose it.
+  ensureColumn(db, "jobs", "german_requirement", "german_requirement TEXT");
+  ensureColumn(db, "jobs", "language_evidence", "language_evidence TEXT");
   ensureColumn(db, "jobs", "eligibility_checked_at", "eligibility_checked_at TEXT");
   ensureColumn(db, "jobs", "qualified", "qualified INTEGER NOT NULL DEFAULT 0");
   ensureColumn(db, "jobs", "run_id", "run_id TEXT");
   ensureColumn(db, "jobs", "dedupe_key", "dedupe_key TEXT");
   ensureColumn(db, "jobs", "company_domain", "company_domain TEXT");
+  // Phase 2 central vacancy registry. Additive and nullable: historical rows
+  // keep their values and are classified by the idempotent backfill below.
+  ensureColumn(db, "jobs", "canonical_key", "canonical_key TEXT");
+  ensureColumn(db, "jobs", "employer_key", "employer_key TEXT");
+  ensureColumn(db, "jobs", "requisition_id", "requisition_id TEXT");
+  ensureColumn(db, "jobs", "employer_url", "employer_url TEXT");
+  ensureColumn(db, "jobs", "ats_vendor", "ats_vendor TEXT");
+  ensureColumn(db, "jobs", "url_confidence", "url_confidence TEXT");
+  // Evidence for how the employer application URL was obtained. The URL and
+  // confidence alone cannot distinguish a redirect from an embedded apply link
+  // or explain an unresolved aggregator listing.
+  ensureColumn(db, "jobs", "url_provenance", "url_provenance TEXT");
+  ensureColumn(db, "jobs", "qualification_status", "qualification_status TEXT");
+  ensureColumn(db, "jobs", "duplicate_group", "duplicate_group TEXT");
+  ensureColumn(db, "jobs", "first_verified_at", "first_verified_at TEXT");
+  ensureColumn(db, "jobs", "last_verified_at", "last_verified_at TEXT");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe_key ON jobs(dedupe_key)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_canonical_key ON jobs(canonical_key)");
+  db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_qualification ON jobs(qualification_status)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_run ON jobs(run_id)");
   ensureColumn(db, "applications", "run_id", "run_id TEXT");
   ensureColumn(db, "applications", "submission_status", "submission_status TEXT");
@@ -983,40 +1102,15 @@ function ensureSchema(db: DatabaseSync): void {
 }
 
 /**
- * Links pre-v4 usage rows to the AI task that produced them when the match is
- * unambiguous (same agent, provider, model and a timestamp within five
- * minutes). Rows that cannot be matched are labelled `legacy` rather than
- * guessed into a task. No financial or task record is rewritten.
+ * Legacy rows keep the link they already have. They are never linked to a task
+ * by timestamp proximity or matching provider/model: that heuristic could turn
+ * a conversational Coordinator call into a specialist's task execution. A row
+ * with no persisted task id stays `legacy` (background) unless an explicit
+ * source exists; unknown attribution is never fabricated.
  */
 function backfillUsageAttribution(db: DatabaseSync): void {
-  const proximity = `ABS(
-      CAST(strftime('%s', COALESCE(t.finished_at, t.started_at, t.created_at)) AS INTEGER)
-      - CAST(strftime('%s', provider_usage.created_at) AS INTEGER)
-    )`;
-  db.exec(`
-    UPDATE provider_usage
-    SET task_id = (
-      SELECT t.id FROM tasks t
-      WHERE t.agent_key = provider_usage.agent_key
-        AND t.provider = provider_usage.provider
-        AND t.model = provider_usage.model
-        AND t.execution_mode = 'ai'
-        AND ${proximity} <= 300
-      ORDER BY ${proximity} ASC
-      LIMIT 1
-    )
-    WHERE task_id IS NULL
-      AND EXISTS (
-        SELECT 1 FROM tasks t
-        WHERE t.agent_key = provider_usage.agent_key
-          AND t.provider = provider_usage.provider
-          AND t.model = provider_usage.model
-          AND t.execution_mode = 'ai'
-          AND ${proximity} <= 300
-      )
-  `);
-  db.exec("UPDATE provider_usage SET source = 'task' WHERE task_id IS NOT NULL AND source IS NULL");
-  db.exec("UPDATE provider_usage SET source = 'legacy' WHERE source IS NULL");
+  db.exec("UPDATE provider_usage SET source = 'legacy' WHERE source IS NULL AND task_id IS NULL");
+  db.exec("UPDATE provider_usage SET source = 'task' WHERE source IS NULL AND task_id IS NOT NULL");
 }
 
 /**
@@ -1029,11 +1123,11 @@ function reconcileAgentAiCounters(db: DatabaseSync): void {
   db.exec(`
     UPDATE agents SET
       ai_success_count = (
-        SELECT COUNT(*) FROM provider_usage u
+        SELECT COUNT(*) FROM provider_usage u JOIN tasks t ON t.id = u.task_id AND t.agent_key = u.agent_key
         WHERE u.agent_key = agents.key AND u.source = 'task' AND u.status = 'ok'
       ),
       ai_failure_count = (
-        SELECT COUNT(*) FROM provider_usage u
+        SELECT COUNT(*) FROM provider_usage u JOIN tasks t ON t.id = u.task_id AND t.agent_key = u.agent_key
         WHERE u.agent_key = agents.key AND u.source = 'task' AND u.status = 'error'
       )
   `);
@@ -1076,6 +1170,7 @@ function migrate(db: DatabaseSync) {
   migrateAutonomousSubmissionPolicy(db);
   migrateLegacyApprovalQueue(db);
   migrateWeeklyScheduleDefaults(db);
+  backfillJobRegistry(db);
   enforceThresholdFloor(db);
 
   // Normalise legacy statuses written by earlier builds.
@@ -1316,9 +1411,9 @@ function migrateStandingAuthorisationDefaults(db: DatabaseSync) {
     if (exists) db.prepare("UPDATE settings SET value = ?, updated_at = ? WHERE key = ?").run(JSON.stringify(value), nowIso(), key);
     else db.prepare("INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)").run(key, JSON.stringify(value), nowIso());
   };
-  // Preserve an existing stored cap (including a deliberate 3/day or 5/day).
-  // Only ensure a missing value is created; never rewrite the owner's choice.
-  if (read("max_applications_per_day") === undefined) write("max_applications_per_day", 5);
+  // The owner-authorised maximum is three verified submissions per day. Only a
+  // missing value is created here; an older stored value is clamped at read time.
+  if (read("max_applications_per_day") === undefined) write("max_applications_per_day", 3);
   // Never rewrite approval_mode or autonomous_submission here either.
   if (read("standing_authorisation_activated_at") === undefined) write("standing_authorisation_activated_at", null);
   if (read("authorised_answers") === undefined) write("authorised_answers", {});
@@ -1381,10 +1476,10 @@ function migrateLegacyApprovalQueue(db: DatabaseSync) {
 }
 
 /**
- * Initial schedule: Monday–Saturday, main recruitment discovery at 10:00 with
- * persisted incremental slots at 12:00, 14:00, 16:00, 18:00 and 20:00, and the
- * daily report at 16:00 Monday–Friday in Europe/Zurich. Existing custom times or
- * weekday sets are preserved; only rows with no weekday list are initialised.
+ * Initial schedule: one recruitment discovery per calendar day (Monday–Sunday)
+ * at 12:00 Europe/Zurich, and the daily report at 16:00 Monday–Friday. Existing
+ * custom times or weekday sets are preserved; only rows with no weekday list
+ * are initialised.
  */
 function migrateWeeklyScheduleDefaults(db: DatabaseSync) {
   const marker = db.prepare("SELECT value FROM settings WHERE key = 'schedule_defaults_v1'").get();
@@ -1392,12 +1487,12 @@ function migrateWeeklyScheduleDefaults(db: DatabaseSync) {
   const update = db.prepare(
     "UPDATE schedule_jobs SET time = ?, timezone = ?, weekdays = ?, updated_at = ? WHERE key = ? AND (weekdays IS NULL OR weekdays = '')",
   );
-  update.run("10:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5, 6]), nowIso(), "daily_recruitment");
+  update.run("12:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5, 6, 7]), nowIso(), "daily_recruitment");
   update.run("16:00", "Europe/Zurich", JSON.stringify([1, 2, 3, 4, 5]), nowIso(), "daily_executive_brief");
   // Legacy rows may already have a weekday value after this build; fix only the
   // known old clock defaults when the row still has no explicit weekday list.
   db.prepare("INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES ('schedule_defaults_v1', ?, ?)").run(
-    JSON.stringify({ applied_at: nowIso(), version: 1, recruitmentTime: "10:00", reportTime: "16:00" }),
+    JSON.stringify({ applied_at: nowIso(), version: 1, recruitmentTime: "12:00", reportTime: "16:00" }),
     nowIso(),
   );
 }

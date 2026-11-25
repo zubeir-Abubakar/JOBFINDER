@@ -1,6 +1,5 @@
 import os from "node:os";
 import { all, getDb, nowIso, one, run } from "./db";
-import { randomId } from "./security";
 
 /**
  * Durable runtime coordination for background work.
@@ -15,9 +14,14 @@ import { randomId } from "./security";
 export const RUNTIME_LOCK_TTL_MS = 120_000;
 export const WORKER_STALE_AFTER_MS = 120_000;
 
+/**
+ * Stable for the life of this process, including Next.js development hot
+ * reloads. A random suffix created a new identity whenever this module was
+ * re-evaluated, leaving healthy idle workers recorded under an old identity.
+ * Host + PID is unique for the live process and does not change on reload.
+ */
 const processInstanceId =
-  process.env.INSTANCE_ID?.trim() ||
-  `${os.hostname()}:${process.pid}:${randomId().slice(0, 8)}`;
+  process.env.INSTANCE_ID?.trim() || `${os.hostname()}:${process.pid}`;
 
 export type RuntimeLockRow = {
   key: string;
@@ -114,7 +118,15 @@ export function heartbeatRuntimeWorker(name: string, detail: string | null = nul
        WHERE name = ? AND instance_id = ?`,
     )
     .run(at, detail, at, name, processInstanceId);
-  if (Number(result.changes) === 0) startRuntimeWorker(name, detail);
+  if (Number(result.changes) === 0) {
+    startRuntimeWorker(name, detail);
+    return;
+  }
+  // A heartbeat is also proof that this process still owns a live worker.
+  // Re-arm the shared timer so an idle queue cannot remain marked stale after
+  // a prior timer shutdown, a module reload, or an initial startup heartbeat.
+  heartbeatState().names.add(name);
+  ensureRuntimeHeartbeat();
 }
 
 export function stopRuntimeWorker(name: string, detail: string | null = null): void {
@@ -136,11 +148,11 @@ export function runtimeWorkerSnapshot(now: Date = new Date()): RuntimeWorkerView
     const heartbeat = Date.parse(row.heartbeat_at);
     const heartbeatAgeSeconds = Number.isFinite(heartbeat)
       ? Math.max(0, Math.round((now.getTime() - heartbeat) / 1000))
-      : 0;
+      : WORKER_STALE_AFTER_MS / 1000 + 1;
     const effectiveStatus: RuntimeWorkerView["effectiveStatus"] =
       row.status !== "running"
         ? "stopped"
-        : heartbeatAgeSeconds * 1000 > WORKER_STALE_AFTER_MS
+        : !Number.isFinite(heartbeat) || heartbeatAgeSeconds * 1000 > WORKER_STALE_AFTER_MS
           ? "stale"
           : "running";
     return { ...row, effectiveStatus, heartbeatAgeSeconds };

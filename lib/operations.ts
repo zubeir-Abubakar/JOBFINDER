@@ -3,6 +3,7 @@ import { AGENT_DEFINITIONS, agentDefinition, type AgentKey } from "./agent-defin
 import { agentIdentity } from "./agent-identity";
 import { agentAvailability } from "./agent-availability";
 import { configuredTextProvider, gatewayCooldownStatus, providerHealth, providerStatusSnapshot, type ProviderHealth } from "./providers";
+import { evaluateAiPolicy } from "./ai-spending-policy";
 import { getRecruitmentPolicy, dailySubmissionUsage } from "./recruitment-policy";
 import { formatInZone, scheduleSnapshot } from "./recruitment-schedule";
 import { sourceHealth } from "./recruitment-discovery";
@@ -63,7 +64,14 @@ export type OperationalAgent = {
   tokenUsageToday: number;
   tools: string[];
   voice: ReturnType<typeof effectiveVoiceProfileForAgent>;
-  availability: { available: boolean; dependency: string | null; reason: string | null };
+  availability: {
+    available: boolean;
+    dependency: string | null;
+    reason: string | null;
+    cause?: "configuration" | "health" | null;
+    restricted?: boolean;
+    restriction?: "ai_inference" | "email_access" | null;
+  };
   capabilities: AgentCapability[];
   usageSource: string | null;
 };
@@ -230,6 +238,7 @@ type UsageRow = {
   total_tokens: number;
   status: string;
   error: string | null;
+  fallback_reason: string | null;
   created_at: string;
   usage_source: string | null;
   routed_platform: string | null;
@@ -241,7 +250,7 @@ function latestUsage(): Map<string, { last: UsageRow; success: UsageRow | null; 
   // OpenRouter text rows are retained in the database but cannot masquerade as
   // the current text assignment or current provider error.
   const rows = all<UsageRow>(
-    "SELECT agent_key, provider, model, total_tokens, status, error, created_at, usage_source, routed_platform, routed_model FROM provider_usage WHERE provider IN ('freellmapi','ollama') ORDER BY id DESC LIMIT 800",
+    "SELECT agent_key, provider, model, total_tokens, status, error, created_at, usage_source, routed_platform, routed_model FROM provider_usage WHERE provider IN ('freellmapi','ollama','gemini') ORDER BY id DESC LIMIT 800",
   );
   const map = new Map<string, { last: UsageRow; success: UsageRow | null; error: UsageRow | null }>();
   for (const row of rows) {
@@ -297,7 +306,7 @@ function tokenTotals(where = "created_at >= ?", params: unknown[] = [startOfToda
     externalTokens: Number(row?.external ?? 0),
     costChf: Number(row?.cost ?? 0),
     costStatus: "unverified",
-    costDetail: "FreeLLMAPI publishes no pricing metadata. Cost is unverified; Ollama local inference is not a paid API cost.",
+    costDetail: "Gemini and FreeLLMAPI do not return a billing amount in these API responses. Cost is unverified and never invented; Ollama local inference is not a paid API cost.",
   };
 }
 
@@ -305,7 +314,8 @@ function providerHealthFor(health: ProviderHealth[], provider: string | null): s
   if (!provider) return "not used yet";
   const item = health.find((entry) => entry.name === provider);
   if (!item) return "unknown";
-  if (item.available) return item.name === "ollama" ? "connected (local fallback)" : "connected";
+  if (item.policyBlocked) return "external · blocked by zero-spend policy";
+  if (item.available) return item.name === "ollama" ? "connected (local only)" : "connected";
   if (item.configured) return "configured but unavailable";
   return "not configured";
 }
@@ -346,7 +356,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
     ).map((row) => [row.agent_key, Number(row.attempts)]),
   );
   const fallbackRows = all<UsageRow>(
-    `SELECT agent_key, provider, model, total_tokens, status, error, created_at, usage_source,
+    `SELECT agent_key, provider, model, total_tokens, status, error, fallback_reason, created_at, usage_source,
             routed_platform, routed_model
      FROM provider_usage
      WHERE provider = 'ollama' AND status = 'ok' AND created_at >= ?
@@ -356,7 +366,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   const fallbackHistory = new Map<string, OperationalAgent["fallbackHistory"]>();
   for (const row of fallbackRows) {
     const history = fallbackHistory.get(row.agent_key) ?? [];
-    if (history.length < 3) history.push({ at: row.created_at, model: row.model, reason: row.error });
+    if (history.length < 3) history.push({ at: row.created_at, model: row.model, reason: row.fallback_reason ?? row.error });
     fallbackHistory.set(row.agent_key, history);
   }
   const byProvider = all<{ provider: string; tokens: number; requests: number }>(
@@ -417,6 +427,8 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
         dependency: availability.dependency,
         reason: availability.reason,
         cause: availability.cause ?? null,
+        restricted: availability.restricted ?? false,
+        restriction: availability.restriction ?? null,
       },
       capabilities: capabilitiesForAgent(row.key).map((capability) => ({ ...capability, usedInLastTask: null })),
       usageSource: use?.usage_source ?? null,
@@ -428,7 +440,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
 
   const tokensToday = tokenTotals();
   const lastUsage = one<{ provider: string; model: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; created_at: string }>(
-    "SELECT provider, model, prompt_tokens, completion_tokens, total_tokens, created_at FROM provider_usage WHERE provider IN ('freellmapi','ollama') ORDER BY id DESC LIMIT 1",
+    "SELECT provider, model, prompt_tokens, completion_tokens, total_tokens, created_at FROM provider_usage WHERE provider IN ('freellmapi','ollama','gemini') ORDER BY id DESC LIMIT 1",
   );
   const providerCooldowns = providerHealthSnapshot();
   const notificationQueue = notificationQueueSnapshot();
@@ -557,18 +569,27 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   }));
   const liveConfigured = Boolean(process.env.GEMINI_API_KEY?.trim());
   const liveModel = (process.env.GEMINI_LIVE_MODEL ?? "gemini-3.8-live").trim() || "gemini-3.8-live";
+  const liveDecision = evaluateAiPolicy({ provider: "gemini-live", model: liveModel });
   const liveLast = getSetting<string | null>("live_voice_last_session", null);
 
+  // Overall health is the health of deterministic operations, not the state of
+  // an optional external inference route. Blocked AI is reported separately so
+  // a zero-spend policy decision cannot present the scheduler or workforce as
+  // failed.
   const overviewStatus: OperationalSnapshot["health"]["status"] = !db.ok
     ? "down"
-    : route.available === true && agents.some((agent) => agent.availability.available)
-      ? "operational"
-      : "degraded";
+    : runtime.status === "down"
+      ? "down"
+      : runtime.status === "degraded"
+        ? "degraded"
+        : "operational";
+  const aiRestricted = route.available !== true;
+  const deterministicAgents = agents.filter((agent) => agent.availability.available).length;
   const healthDetail = overviewStatus === "operational"
-    ? `${agents.length} agents registered; ${active} active, ${idle} idle. ${route.activeProvider ? `${route.activeProvider} is the active text route.` : "Text provider availability is not confirmed."}`
+    ? `${agents.length} agents registered; ${active} active, ${idle} idle; ${deterministicAgents} can perform deterministic work. ${runtime.detail}${aiRestricted ? " AI-assisted work is restricted; deterministic coordination, discovery and document checks remain operational." : ""}`
     : overviewStatus === "down"
       ? db.detail
-      : "One or more dependencies are degraded; inspect provider and agent details.";
+      : runtime.detail;
 
   return {
     generatedAt: new Date().toISOString(),
@@ -592,7 +613,11 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
       configured: liveConfigured,
       model: liveModel,
       lastSessionAt: liveLast,
-      detail: liveConfigured ? `Gemini Live is configured for ${liveModel}. An active socket is not claimed without a live session.` : "GEMINI_API_KEY is not configured; live voice is unavailable.",
+      detail: liveConfigured
+        ? liveDecision.allowed
+          ? `Gemini Live is configured for ${liveModel} on the declared free tier under the CHF 0.00 policy. Chief speaks as Charon; no paid voice fallback exists. An active socket is not claimed without a live session.`
+          : liveDecision.block_reason ?? "Gemini Live is configured but its free tier is not verified."
+        : "GEMINI_API_KEY is not configured; live voice is unavailable.",
       connectedClaim: liveConfigured ? "configured" : "not configured",
     },
     tokens: {
@@ -726,8 +751,8 @@ export function operationsBrief(snapshot: OperationalSnapshot): string {
     `Sources: ${sources}.`,
     `Health: ${snapshot.health.status}; ${snapshot.health.detail} Failed tasks today ${snapshot.health.failedTasksToday}. Notification provider: ${snapshot.health.notificationProvider.detail} Backup: ${snapshot.health.backup.status} — ${snapshot.health.backup.detail}`,
     `Latest recruitment run: ${snapshot.recruitment.lastRun ? `${snapshot.recruitment.lastRun.id} ${snapshot.recruitment.lastRun.status}, failures ${snapshot.recruitment.lastRun.failures}, warnings ${snapshot.recruitment.lastRun.warnings}, error ${snapshot.recruitment.lastRun.error ?? "none"}` : "none"}. Recovery pending ${snapshot.recovery.pending}; next retry ${snapshot.nextProviderRetryAt ?? snapshot.recovery.nextRetryAt ?? "none"}.`,
-    `Runtime: database ${snapshot.runtime.database.integrity} v${snapshot.runtime.database.schemaVersion}; scheduler worker ${snapshot.runtime.scheduler.worker?.effectiveStatus ?? "missing"}; workers ${snapshot.runtime.workers.map((worker) => `${worker.name}=${worker.effectiveStatus}`).join(", ") || "none"}; running tasks ${snapshot.runtime.queues.runningTasks.length}; failed tasks today ${snapshot.runtime.agents.failedTasksToday}; notification failures ${snapshot.runtime.recruitment.notificationFailures}; submission failures ${snapshot.runtime.recruitment.submissionFailures}; unknown ${snapshot.runtime.recruitment.submissionUnknown}; last successful inference ${snapshot.runtime.providers.lastSuccessfulInferenceAt ?? "never"}.`,
-    `Notification outbox: pending ${snapshot.notifications.counts.pending}, retry ${snapshot.notifications.counts.retry_scheduled}, accepted-by-Gmail ${snapshot.notifications.counts.sent}, failed ${snapshot.notifications.counts.failed}; last accepted ${snapshot.notifications.lastAccepted?.finished_at ?? "never"}; last error ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
+    `Runtime: database ${snapshot.runtime.database.integrity} v${snapshot.runtime.database.schemaVersion}; scheduler worker ${snapshot.runtime.scheduler.worker?.effectiveStatus ?? "missing"}; executive brief ${snapshot.runtime.executiveBrief.last_status ?? "never"} (${snapshot.runtime.executiveBrief.stale ? "tick stale" : "tick fresh"}); workers ${snapshot.runtime.workers.map((worker) => `${worker.name}=${worker.effectiveStatus}`).join(", ") || "none"}; running tasks ${snapshot.runtime.queues.runningTasks.length}; failed tasks today ${snapshot.runtime.agents.failedTasksToday}; notification failures ${snapshot.runtime.recruitment.notificationFailures}; submission failures ${snapshot.runtime.recruitment.submissionFailures}; unknown ${snapshot.runtime.recruitment.submissionUnknown}; last successful inference ${snapshot.runtime.providers.lastSuccessfulInferenceAt ?? "never"}.`,
+    `Notification outbox: pending ${snapshot.notifications.counts.pending}, retry ${snapshot.notifications.counts.retry_scheduled}, Gmail accepted (not delivery-confirmed) ${snapshot.notifications.deliveryCounts.accepted_by_gmail}, Sent-folder observed ${snapshot.notifications.deliveryCounts.sent_folder_observed}, delivery confirmed ${snapshot.notifications.deliveryCounts.delivery_confirmed}, failed ${snapshot.notifications.counts.failed}; last accepted ${snapshot.notifications.lastAccepted?.finished_at ?? "never"}; last error ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
     `Executive Brief delivery: state=${snapshot.executiveBrief.state}; report=${snapshot.executiveBrief.reportId}; outbox=${snapshot.executiveBrief.outboxId ?? "none"}; gmailMessage=${snapshot.executiveBrief.messageId ?? "none"}; sentFolderObserved=${snapshot.executiveBrief.sentObservedAt ?? "no"}; evidence=${snapshot.executiveBrief.deliveryEvidence ?? "none"}; error=${snapshot.executiveBrief.lastError ?? "none"}. ${deliveryStateMessage(snapshot.executiveBrief.state, snapshot.executiveBrief.lastError ?? snapshot.executiveBrief.detail)}`,
     `Permissions: ${snapshot.permissions.summary}`,
   ].join("\n");
@@ -789,7 +814,7 @@ export function answerFromOperations(
       `Sent-folder verification: ${brief.sentObservedAt ? `observed at ${brief.sentObservedAt} — ${brief.sentVerification ?? "presence recorded"}` : brief.sentVerification ?? "not observed"}. Delivery evidence: ${brief.deliveryEvidence ?? "none"}.`,
       `Last error: ${brief.lastError ?? "none"}. Next retry: ${brief.nextRetryAt ?? "none"}. Bounce evidence: ${brief.bounceInfo ?? "none"}.`,
       `Gmail: ${snapshot.health.notificationProvider.connected ? "connected" : "not connected"}; OAuth configuration ${snapshot.health.notificationProvider.configured ? "ready" : "incomplete"}. ${snapshot.health.notificationProvider.detail}`,
-      `Outbox: ${snapshot.notifications.counts.pending} pending, ${snapshot.notifications.counts.retry_scheduled} retry scheduled, ${snapshot.notifications.counts.sent} accepted by Gmail, ${snapshot.notifications.counts.failed} failed.`,
+      `Outbox: ${snapshot.notifications.counts.pending} pending, ${snapshot.notifications.counts.retry_scheduled} retry scheduled, ${snapshot.notifications.deliveryCounts.accepted_by_gmail} accepted by Gmail (not delivery-confirmed), ${snapshot.notifications.deliveryCounts.sent_folder_observed} Sent-folder observed, ${snapshot.notifications.deliveryCounts.delivery_confirmed} delivery confirmed, ${snapshot.notifications.counts.failed} failed.`,
     ].join("\n");
   }
 

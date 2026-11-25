@@ -154,14 +154,26 @@ test("provider status is truthful and exposes fallback state separately", async 
   const status = (await response.json()) as {
     state: string;
     label: string;
-    primary: { provider: string; model: string };
-    fallback: { configured: boolean };
+    detail: string;
+    primary: { provider: string; model: string; availability: string; statusLabel: string; policyBlocked?: boolean };
+    fallback: { configured: boolean; availability: string; statusLabel: string };
     lastFallback: unknown;
   };
-  expect(["primary", "fallback", "degraded", "unavailable"]).toContain(status.state);
+  expect(["primary", "unknown", "fallback", "degraded", "unavailable"]).toContain(status.state);
   expect(status.primary.provider).toBe("freellmapi");
   expect(status.primary.model).toBe("e2e-model");
+  expect(["available", "unknown", "not_configured"]).toContain(status.primary.availability);
+  if (status.primary.availability === "not_configured") {
+    // The harness does not declare FreeLLMAPI's free tier, so the policy refuses
+    // it before transmission. That is a deliberate refusal, not a health result
+    // or a silent fallback.
+    expect(status.primary.policyBlocked).toBe(true);
+    expect(status.primary.statusLabel).toBe("UNVERIFIED");
+  }
   expect(status.fallback.configured).toBe(false);
+  expect(status.fallback.availability).toBe("not_configured");
+  expect(status.fallback.statusLabel).toBe("Not configured");
+  expect(status.detail).not.toMatch(/Local fallback is ready/i);
 });
 
 test("all eight agents read structured context and explain a chart without screen sharing", async ({ page, diagnostics }) => {

@@ -3,6 +3,8 @@ import { randomId } from "./security";
 import { htmlToText } from "./scoring";
 import { classifyVacancy } from "./vacancy-classification";
 import { requestJson, type SourceAttemptDiagnostic, type SourceErrorCategory } from "./source-http";
+import { dedupeKeyFor } from "./recruitment-discovery";
+import { vacancyIdentity } from "./job-identity";
 
 export type JobRow = {
   id: string;
@@ -29,9 +31,17 @@ export type JobRow = {
   last_seen_at: string | null;
   last_seen_source: string | null;
   requirements?: string | null;
+  eligibility?: string | null;
+  eligibility_notes?: string | null;
+  german_requirement?: string | null;
+  language_evidence?: string | null;
+  url_provenance?: string | null;
+  employer_url?: string | null;
+  url_confidence?: string | null;
+  ats_vendor?: string | null;
 };
 
-const QA_TITLE = /\b(qa|quality assurance|test(ing)? engineer|test automation|sdet|software test|test lead|test manager|automation engineer)\b/i;
+const QA_TITLE = /\b(qa|quality assurance(?: engineer| analyst)?|quality engineer|test(?:ing)? engineer|test automation|test architect|automation (?:test(?:ing)? )?engineer|sdet|software test|software qa|test lead|test manager|testmanager|qa analyst|qa specialist|qa tester|api test(?:er|ing)? engineer|mobile qa(?: engineer)?|test specialist|test consultant|teamlead(?:er)? (?:test|testing|qa|quality)|testingenieur)\b/i;
 const SWISS = /(switzerland|schweiz|suisse|svizzera|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.? gallen|lugano|fribourg|vaud|ticino|neuch)/i;
 
 type ArbeitnowJob = {
@@ -162,7 +172,7 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
     for (const item of batch) {
       if (result.inserted >= maxInserts) break;
       const created = item.created_at ? new Date(item.created_at * 1000) : null;
-      if (!created || Date.now() - created.getTime() <= 7 * 86400_000) result.fresh += 1;
+      if (created && Date.now() - created.getTime() <= 7 * 86400_000) result.fresh += 1;
       const location = item.location ?? "";
       const remote = Boolean(item.remote);
       const plain = htmlToText(item.description ?? "");
@@ -245,9 +255,22 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
       }
 
       const id = `job_${randomId()}`;
+      // This insert path previously omitted dedupe_key entirely, so the unique
+      // index could never stop an Arbeitnow repeat. It now writes the same
+      // identity fields as every other discovery adapter.
+      const dedupeKey = dedupeKeyFor(item.company_name, item.title, location || null);
+      const identity = vacancyIdentity({
+        source: "arbeitnow",
+        externalId: item.slug,
+        company: item.company_name,
+        title: item.title,
+        location: location || null,
+        listingUrl: item.url,
+        applicationUrl: item.url,
+      });
       run(
-        `INSERT INTO jobs (id, source, external_id, title, company, location, remote, employment_type, salary, url, description, posted_at, discovered_at, status, raw, last_seen_at, last_seen_source, source_updated_at)
-         VALUES (?, 'arbeitnow', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, 'new', ?, ?, 'arbeitnow', ?)`,
+        `INSERT INTO jobs (id, source, external_id, title, company, location, remote, employment_type, salary, url, application_url, description, posted_at, discovered_at, status, dedupe_key, canonical_key, employer_key, requisition_id, employer_url, ats_vendor, url_confidence, vacancy_status, qualification_status, raw, last_seen_at, last_seen_source, source_updated_at)
+         VALUES (?, 'arbeitnow', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, 'new', 'pending', ?, ?, 'arbeitnow', ?)`,
         [
           id,
           item.slug,
@@ -257,9 +280,17 @@ export async function researchJobs(pages = 2, maxInserts = 40): Promise<Research
           v(remote),
           (item.job_types ?? []).join(", ") || null,
           item.url,
+          identity.applicationUrl,
           plain.slice(0, 24000),
           postedIso,
           nowIso(),
+          dedupeKey,
+          identity.canonicalKey,
+          identity.employerKey,
+          identity.requisitionId,
+          identity.employerUrl,
+          identity.atsVendor,
+          identity.urlConfidence,
           JSON.stringify(item).slice(0, 20000),
           nowIso(),
           postedIso,

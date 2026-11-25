@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { getSetting, setSetting } from "./settings";
+import { authorizeAiRequest, evaluateAiPolicy, markPolicyNetworkTransmitted } from "./ai-spending-policy";
 
 /**
  * Visual understanding provider.
@@ -14,6 +15,7 @@ import { getSetting, setSetting } from "./settings";
 export type VisionConfig = {
   enabled: boolean;
   configured: boolean;
+  blockedByPolicy: boolean;
   provider: "gemini" | null;
   model: string;
   maxImageBytes: number;
@@ -31,11 +33,13 @@ const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 export function visionConfig(): VisionConfig {
   const enabled = (process.env.VISION_ENABLED ?? "true") !== "false";
   const key = process.env.GEMINI_API_KEY?.trim();
-  const model = (process.env.VISION_MODEL ?? process.env.GEMINI_MODEL ?? "gemini-3.8-flash").trim() || "gemini-3.8-flash";
+  const model = (process.env.VISION_MODEL ?? process.env.GEMINI_MODEL ?? "gemini-3.6-flash").trim() || "gemini-3.6-flash";
+  const decision = evaluateAiPolicy({ provider: "gemini", model });
   if (!enabled) {
     return {
       enabled: false,
       configured: false,
+      blockedByPolicy: false,
       provider: null,
       model,
       maxImageBytes: MAX_IMAGE_BYTES,
@@ -46,6 +50,7 @@ export function visionConfig(): VisionConfig {
     return {
       enabled: true,
       configured: false,
+      blockedByPolicy: false,
       provider: null,
       model,
       maxImageBytes: MAX_IMAGE_BYTES,
@@ -55,10 +60,13 @@ export function visionConfig(): VisionConfig {
   return {
     enabled: true,
     configured: true,
+    blockedByPolicy: !decision.allowed,
     provider: "gemini",
     model,
     maxImageBytes: MAX_IMAGE_BYTES,
-    detail: `Gemini ${model} handles single-frame interpretation. Screen content is never sent unless the owner asks about it.`,
+    detail: decision.allowed
+      ? `Gemini ${model} is configured on the verified free tier. A frame is transmitted only when you explicitly ask about one; paid models are never used.`
+      : decision.block_reason ?? "Gemini vision is configured but its free tier is not available. No frame is transmitted.",
   };
 }
 
@@ -66,7 +74,7 @@ export function visionCapability(): VisionCapability {
   const config = visionConfig();
   const verifiedAt = config.configured ? getSetting<string | null>("vision_last_success", null) : null;
   const lastError = getSetting<string | null>("vision_last_error", null);
-  return { ...config, verified: Boolean(verifiedAt), verifiedAt, lastError };
+  return { ...config, verified: Boolean(verifiedAt) && !config.blockedByPolicy, verifiedAt, lastError };
 }
 
 export class VisionUnavailableError extends Error {
@@ -109,6 +117,10 @@ export async function analyzeScreenFrame(input: {
   if (!config.enabled || !config.configured || !config.provider) {
     throw new VisionUnavailableError(config.detail.replace("VISION_ENABLED is false", "set VISION_ENABLED=true to enable it"), 503);
   }
+  const decision = authorizeAiRequest({ provider: "gemini", model: config.model, operation: "vision.analyze", source: "manual" });
+  if (!decision.allowed) {
+    throw new VisionUnavailableError(decision.block_reason ?? "Gemini vision is not authorised.", 503);
+  }
   const image = parseImageDataUrl(input.imageDataUrl);
   const question =
     typeof input.question === "string" && input.question.trim()
@@ -116,6 +128,7 @@ export async function analyzeScreenFrame(input: {
       : "Describe the visible application screen and what the highlighted area represents.";
   const key = process.env.GEMINI_API_KEY?.trim() as string;
   try {
+    markPolicyNetworkTransmitted(decision.correlation_id);
     const ai = new GoogleGenAI({ apiKey: key });
     const response = await ai.models.generateContent({
       model: config.model,

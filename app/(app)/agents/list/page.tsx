@@ -39,6 +39,7 @@ type TaskRow = {
   finished_at: string | null;
   execution_mode: string | null;
   ai_outcome: string | null;
+  fallback_reason: string | null;
 };
 function clipTaskResult(value: string | null | undefined): string {
   if (!value) return "—";
@@ -75,7 +76,8 @@ export default async function AgentsPage({
       : "WHERE (w.started_by = ? OR (w.started_by IS NULL AND (SELECT COUNT(*) FROM users WHERE role = 'owner' AND status = 'active') = 1) OR t.workflow_id IS NULL)";
   const scopeParams = user.role === "admin" ? [] : [user.id];
   const tasks = all<TaskRow>(
-    `SELECT t.id, t.workflow_id, t.agent_key, t.title, t.status, t.output, t.error, t.provider, t.model, t.created_at, t.finished_at, t.execution_mode, t.ai_outcome
+    `SELECT t.id, t.workflow_id, t.agent_key, t.title, t.status, t.output, t.error, t.provider, t.model, t.created_at, t.finished_at, t.execution_mode, t.ai_outcome,
+            (SELECT u.fallback_reason FROM provider_usage u WHERE u.task_id = t.id AND u.fallback_reason IS NOT NULL ORDER BY u.id DESC LIMIT 1) AS fallback_reason
      FROM tasks t LEFT JOIN workflows w ON w.id = t.workflow_id ${workflowScope} ORDER BY t.created_at DESC LIMIT 80`,
     scopeParams,
   );
@@ -257,7 +259,10 @@ export default async function AgentsPage({
                         </div>
                       </td>
                       <td><span className={`badge ${task.status === "completed" ? "badge-good" : task.status === "failed" ? "badge-bad" : task.status === "running" || task.status === "working" ? "badge-info" : "badge-neutral"}`}>{task.status}</span></td>
-                      <td className="cell-sub" style={{ maxWidth: 300 }} title={task.error ?? task.output ?? undefined}>{clipTaskResult(task.error ?? task.output)}</td>
+                      <td className="cell-sub" style={{ maxWidth: 300 }} title={task.error ?? task.output ?? undefined}>
+                        {clipTaskResult(task.error ?? task.output)}
+                        {task.fallback_reason ? <div className="text-[10px]" style={{ color: "var(--warn)" }}>Local fallback: {task.fallback_reason.slice(0, 150)}</div> : null}
+                      </td>
                       <td className="cell-sub">{formatDateTime(task.created_at)}</td>
                     </tr>
                   ))}

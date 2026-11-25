@@ -17,7 +17,7 @@ test.beforeAll(() => {
   originalApproval = one<{ value: string }>("SELECT value FROM settings WHERE key = 'approval_mode'")?.value ?? "true";
   originalAutonomous = one<{ value: string }>("SELECT value FROM settings WHERE key = 'autonomous_submission'")?.value ?? "false";
   originalMinScore = one<{ value: string }>("SELECT value FROM settings WHERE key = 'min_match_score'")?.value ?? "85";
-  originalMaxApps = one<{ value: string }>("SELECT value FROM settings WHERE key = 'max_applications_per_day'")?.value ?? "5";
+  originalMaxApps = one<{ value: string }>("SELECT value FROM settings WHERE key = 'max_applications_per_day'")?.value ?? "3";
   originalFrequency = one<{ value: string }>("SELECT value FROM settings WHERE key = 'search_frequency'")?.value ?? "daily";
   originalRecipient = one<{ email: string | null }>("SELECT email FROM profiles WHERE id = 1")?.email ?? null;
 });
@@ -64,7 +64,7 @@ test("professional preferences are saved, readable after reload and stored in SQ
   diagnostics.assertClean();
 });
 
-test("automation save enforces the 85 percent floor and five-application limit remains configurable", async ({ page, diagnostics }) => {
+test("automation save enforces the 85 percent floor and the three-application hard cap", async ({ page, diagnostics }) => {
   await gotoReady(page, "/settings#automation");
   const form = page.locator("#automation form");
   await form.locator("#min_match_score").fill("40");
@@ -80,7 +80,7 @@ test("automation save enforces the 85 percent floor and five-application limit r
   const maxApps = one<{ value: string }>("SELECT value FROM settings WHERE key = 'max_applications_per_day'")?.value;
   const frequency = one<{ value: string }>("SELECT value FROM settings WHERE key = 'search_frequency'")?.value;
   expect(Number(minScore)).toBe(85);
-  expect(Number(maxApps)).toBe(5);
+  expect(Number(maxApps)).toBe(3);
   expect(frequency?.replace(/^"|"$/g, "")).toBe("manual");
   await expect(page.locator("#automation #min_match_score")).toHaveValue("85");
   diagnostics.assertClean();

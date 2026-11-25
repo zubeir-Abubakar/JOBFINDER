@@ -193,7 +193,7 @@ export default async function JobsPage({
                         <Link href={`/jobs/${job.id}`} className="job-card-title">{job.title}</Link>
                         <div className="job-card-company">{job.company}{job.salary ? ` · ${job.salary}` : ""}</div>
                       </div>
-                      <span className={`badge ${job.status === "shortlisted" ? "badge-good" : job.status === "rejected" ? "badge-bad" : "badge-neutral"}`}>{job.status}</span>
+                      <span className={`badge ${job.status === "shortlisted" ? "badge-good" : job.status === "rejected" ? "badge-bad" : "badge-neutral"}`}>{job.status === "rejected" ? "Not selected" : job.status}</span>
                     </div>
                     <div className="job-meta-row">
                       <span className="job-meta"><Icon name="target" size={12} /> {job.location ?? "Location not stated"}</span>

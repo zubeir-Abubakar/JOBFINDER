@@ -1,4 +1,5 @@
 import type { JobAnalysis } from "./scoring";
+import { MANDATORY_GERMAN_REQUIREMENT, analyseVacancyGermanRequirement } from "./language-requirements";
 import {
   hasSwissPermitB,
   normaliseClaimText,
@@ -48,6 +49,8 @@ export type ReadinessResult = {
   engine: string;
 };
 
+import { isAggregatorUrl } from "./job-identity";
+
 export type ReadinessDocument = {
   id: string | null;
   text: string | null;
@@ -63,10 +66,15 @@ export type ReadinessInput = {
     location: string | null;
     application_url: string | null;
     url: string | null;
+    /** Discovery provenance: an aggregator listing is not an employer endpoint. */
+    urlConfidence?: string | null;
     published_at: string | null;
     description: string | null;
     eligibility: string | null;
     eligibilityNotes: string | null;
+    /** Live HTTP/Schema.org verification, stronger than publication age. */
+    vacancyStatus?: string | null;
+    vacancyVerifiedAt?: string | null;
     matchScore: number | null;
     analysis: JobAnalysis | null;
     coverLetterRequirements?: CoverLetterRequirements;
@@ -117,12 +125,31 @@ function titleReferenced(coverText: string, title: string): boolean {
   return hits / tokens.length >= 0.6;
 }
 
-function freshness(publishedAt: string | null, now: Date): { passed: boolean; detail: string } {
-  if (!publishedAt) return { passed: false, detail: "No publication date is recorded, so the seven-day rule cannot be verified." };
-  const time = Date.parse(publishedAt);
-  if (!Number.isFinite(time)) return { passed: false, detail: `Publication date "${publishedAt}" could not be parsed.` };
+function vacancyCurrentness(
+  job: ReadinessInput["job"],
+  now: Date,
+): { passed: boolean; detail: string } {
+  // The live vacancy check reads the employer/listing page. When it is present,
+  // it decides currentness; an old publication date alone is not evidence that
+  // the role is closed. Direct callers without verification retain the legacy
+  // age fallback rather than being silently treated as verified.
+  if (job.vacancyStatus) {
+    if (job.vacancyStatus === "open") {
+      return {
+        passed: true,
+        detail: `Live vacancy verification recorded open${job.vacancyVerifiedAt ? ` at ${job.vacancyVerifiedAt}` : ""}; publication age is not treated as expiry.`,
+      };
+    }
+    if (job.vacancyStatus === "closed") {
+      return { passed: false, detail: "The live vacancy check recorded the posting as closed or removed." };
+    }
+    return { passed: false, detail: "The live vacancy check is unverified; currentness is not established." };
+  }
+  if (!job.published_at) return { passed: false, detail: "No publication date is recorded and no live vacancy verification exists." };
+  const time = Date.parse(job.published_at);
+  if (!Number.isFinite(time)) return { passed: false, detail: `Publication date "${job.published_at}" could not be parsed.` };
   const days = Math.floor((now.getTime() - time) / 86_400_000);
-  if (days > 7) return { passed: false, detail: `The vacancy was published ${days} day(s) ago; the limit is seven.` };
+  if (days > 7) return { passed: false, detail: `The vacancy was published ${days} day(s) ago; the seven days age fallback applies only when no live verification exists.` };
   return { passed: true, detail: `Published ${Math.max(0, days)} day(s) ago.` };
 }
 
@@ -149,17 +176,26 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
     ),
   );
 
-  const fresh = freshness(job.published_at, input.now);
-  items.push(item("freshness", "No older than seven days", fresh.passed, fresh.detail));
+  const current = vacancyCurrentness(job, input.now);
+  items.push(item("freshness", "Vacancy verified open", current.passed, current.detail));
 
   let employerOk = false;
   let employerDetail = "The employer name is missing or a placeholder.";
   if (job.company.trim().length >= 2 && !PLACEHOLDER_COMPANY.test(job.company.trim())) {
     const url = job.application_url ?? job.url;
+    const aggregatorOnly =
+      !job.application_url &&
+      (job.urlConfidence === "aggregator" || job.urlConfidence === "unresolved" || job.urlConfidence === "missing"
+        ? true
+        : isAggregatorUrl(job.url));
     try {
       const parsed = new URL(url ?? "");
-      employerOk = /^https?:$/.test(parsed.protocol) && parsed.hostname.includes(".");
-      employerDetail = employerOk ? `Employer ${job.company} and application URL ${parsed.hostname} are present.` : "The application URL is not a usable http(s) address.";
+      employerOk = !aggregatorOnly && /^https?:$/.test(parsed.protocol) && parsed.hostname.includes(".");
+      employerDetail = aggregatorOnly
+        ? `Only the aggregation page ${parsed.hostname} is recorded; the employer application URL has not been resolved.`
+        : employerOk
+          ? `Employer ${job.company} and application URL ${parsed.hostname} are present.`
+          : "The application URL is not a usable http(s) address.";
     } catch {
       employerDetail = "No valid application URL is recorded for this vacancy.";
     }
@@ -184,6 +220,14 @@ export function evaluateReadiness(input: ReadinessInput): ReadinessResult {
     eligibilityBlockers = [];
   }
   const mandatory = [...eligibilityBlockers, ...(job.analysis?.mandatoryBlockers ?? [])];
+  // Defence in depth: readiness re-reads the posting rather than trusting an
+  // older eligibility row that may predate the German hard exclusion.
+  const german = analyseVacancyGermanRequirement(job.title, job.description);
+  if (german.status === "required") {
+    mandatory.push(`${MANDATORY_GERMAN_REQUIREMENT}: ${german.detail}`);
+  } else if (german.status === "ambiguous" || german.status === "unknown") {
+    mandatory.push(`German requirement unresolved: ${german.detail}`);
+  }
   items.push(
     item(
       "mandatory_blockers",
