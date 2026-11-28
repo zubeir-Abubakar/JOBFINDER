@@ -157,10 +157,12 @@ graft() {
   if command -v git-filter-repo >/dev/null 2>&1; then
     git filter-repo --force --invert-paths --paths-from-file "$PATHS_FILE" --replace-text "$SCRATCH/expressions.txt"
   else
+    # filter-branch runs its index filters from .git-rewrite/t, so both the
+    # script and the replacements file must be absolute paths.
+    REMOVE="git rm -r --cached --ignore-unmatch $(printf '%s ' "${PATHS[@]}")"
+    git filter-branch --force --index-filter "$REMOVE" --prune-empty -- --all
     git filter-branch --force --index-filter \
-      "git rm -r --cached --ignore-unmatch ${PATHS[*]}" --prune-empty -- --all
-    git filter-branch --force --index-filter \
-      "node scripts/purge-index.mjs '$EXPR_FILE'" --prune-empty -- --all
+      "node '$ORIG_ROOT/scripts/purge-index.mjs' '$EXPR_FILE'" --prune-empty -- --all
     rm -rf .git/refs/original
   fi
 }
