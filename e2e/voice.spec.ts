@@ -1,7 +1,7 @@
 import { test, expect, gotoReady } from "./support/fixtures";
 
 test.describe.configure({ mode: "serial" });
-test.setTimeout(150_000);
+test.setTimeout(180_000);
 
 test("live voice starts a real audio pipeline, transmits mic audio, plays TTS and supports interruption", async ({ page, diagnostics }, testInfo) => {
   await page.addInitScript(() => {
@@ -97,10 +97,15 @@ test("live voice starts a real audio pipeline, transmits mic audio, plays TTS an
     "INPUT_FRAMES_GENERATED",
     "INPUT_FRAMES_SENT",
     "OUTPUT_AUDIO_RECEIVED",
-    "AUDIO_PLAYBACK_STARTED",
   ]) {
     await expect.poll(async () => (await diagnosticEvents()).includes(stage), { timeout: 30_000 }).toBe(true);
   }
+  // AUDIO_PLAYBACK_STARTED is deliberately not asserted here. It depends on the
+  // provider sending its first spoken turn, which can trail the input pipeline
+  // by tens of seconds while the model consumes the microphone audio. Asserting
+  // it in this fixed-order stage loop raced that first turn and failed even
+  // though the pipeline was healthy. Playback is asserted below, after input
+  // frames are provably sent, with a provider-sized budget.
   const safeDiagnostics = await page.evaluate(() =>
     JSON.stringify((window as unknown as { __atwVoiceDiagnostics?: unknown }).__atwVoiceDiagnostics ?? {}),
   );
@@ -139,9 +144,12 @@ test("live voice starts a real audio pipeline, transmits mic audio, plays TTS an
         page.evaluate(
           () => (window as unknown as { __e2eAudio: { playbackStarts: number } }).__e2eAudio.playbackStarts,
         ),
-      { timeout: 35_000 },
+      { timeout: 60_000 },
     )
     .toBeGreaterThan(0);
+  await expect
+    .poll(async () => (await diagnosticEvents()).includes("AUDIO_PLAYBACK_STARTED"), { timeout: 30_000 })
+    .toBe(true);
   await expect
     .poll(async () => await page.locator(".lv-panel").innerText(), { timeout: 35_000 })
     .toMatch(/Chief —/);

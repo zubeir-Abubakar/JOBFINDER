@@ -217,7 +217,7 @@ the presence of the files.
 | B4 | Screenshots and investigation notes contain owner PII | **Resolved** | 78 PNGs of the owner dashboard/profile/CVs, two live-call recordings and a note containing the owner's address were tracked. No credential found. All 81 files are now untracked, kept on disk, and ignored (`.gitignore`). The files remain in published history until D1 rewrites it. |
 | B5 | Rate limiting is single-host | Low | Durable across processes that share the SQLite file, but not a distributed limiter for horizontally scaled replicas. The deployment is a single host; a shared store would be required to scale out. |
 | B6 | Pre-purge backup bundle holds the old history | Medium (local) | `backups/pre-purge-20261128T132506Z.bundle` contains the exposed key by design, so the purge is reversible. It is gitignored and must be deleted once the rewrite is accepted. |
-| B7 | Full Playwright suite not run | Low | Auth, admin and schedules projects were run. Mobile, visual, voice and integration projects were not, because no UI or voice code changed. Run `npm run test:e2e` before release. |
+| B7 | Desktop-chromium Playwright project not re-run | Low | Auth, admin, schedules, mobile, visual, voice and integration projects pass (17 passed, 3 skipped by design, 0 failed, 0 flaky with retries disabled). The `desktop-chromium` project was not part of this run; `npm run test:e2e` covers everything but `integration`. |
 | B8 | Other remote branches | Info | `checkpoint/*`, `feature/oracle-mobile-migration` and tag `phase2-baseline-2026-11-19` were checked: no `.tmp`/backups path at their tips and no key-shaped value in their histories. No action needed. |
 | B9 | A `git fetch` restores the old objects until D1 | Medium (local) | A background fetch during this audit reset `origin/main` to the published `2b847142` and brought the old blobs back into `.git`. The scanner correctly flagged it. `origin/main` was re-pointed and the objects re-pruned, but **do not fetch between the purge and the force-push**; if you do, re-point `refs/remotes/origin/main` and re-run `git gc --prune=now`. |
 
@@ -286,6 +286,8 @@ old key as compromised in any external copy until C1 is resolved.
 | `.env.example` | `git ls-files .env.example` | Tracked, not ignored |
 | Ignore rules | `git check-ignore -v …` | `.tmp/`, `artifacts/backups/`, `artifacts/**/*.png`, `artifacts/**/*.wav`, `artifacts/investigations/`, `.env` ignored; `.env.example` not |
 | Personal artifacts | `git ls-files artifacts/` | 0 PNG, 0 WAV, 0 investigation notes tracked; `artifacts/security/security-audit-2026-11-28.md` still tracked |
+| E2E mobile/visual/voice/integration | `npx playwright test --project=setup --project=mobile-chromium --project=visual-chromium --project=voice-chromium --project=integration --retries=0` | 17 passed, 3 skipped (opt-in `GEMINI_REAL_E2E`), 0 failed, 0 flaky |
+| Voice pipeline stability | `--project=voice-chromium e2e/voice.spec.ts --repeat-each=3 --retries=0` | 3/3 passed before the full run |
 | Dependencies | `npm audit --audit-level=high` | 0 vulnerabilities |
 | Typecheck | `npm run typecheck` | exit 0 |
 | Unit tests | `npm run test:unit` | 753 tests, 749 pass, 4 skipped, **0 fail** |
@@ -311,6 +313,7 @@ Playwright projects for mobile, visual, voice and integration were not run (B7).
 | `scripts/purge-history-secrets.sh` | Absolute filter path, shared value selector, new purged path |
 | `tests/oauth-state.test.ts`, `tests/session-security.test.ts` | New unit coverage |
 | `e2e/auth.spec.ts` | Session expiry, CSRF, document isolation, OAuth start/callback |
+| `e2e/voice.spec.ts` | Playback assertion removed from the fixed-order stage loop; first spoken turn gets a 60s budget |
 | `artifacts/backups/**` | Untracked (files kept locally) |
 | `artifacts/**/*.png`, `artifacts/**/*.wav`, `artifacts/investigations/**` | Untracked and ignored (files kept locally) |
 | `.gitignore` | Ignore the personal captures; keep the security report tracked |
