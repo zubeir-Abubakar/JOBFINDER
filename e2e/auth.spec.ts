@@ -155,11 +155,16 @@ test("Gmail OAuth callback rejects a forged state and stays unconnected", async 
   await login(page, E2E.owner.email, E2E.owner.password);
   await expectDashboard(page);
 
-  await page.goto("/api/gmail/oauth/callback?code=synthetic-code&state=forged-state", {
-    waitUntil: "domcontentloaded",
-  });
-  await expect(page).toHaveURL(/\/inbox\?error=/);
-  await expect(page.getByText(/OAuth state validation failed/i)).toBeVisible();
+  // Assert the callback's own response rather than the followed page: the
+  // framework derives the redirect origin from the request, which can differ
+  // from the 127.0.0.1 the session cookie is scoped to.
+  const response = await page
+    .context()
+    .request.get("/api/gmail/oauth/callback?code=synthetic-code&state=forged-state", { maxRedirects: 0 });
+  expect(response.status()).toBe(307);
+  const location = response.headers()["location"] ?? "";
+  expect(location).toContain("/inbox?error=");
+  expect(decodeURIComponent(location)).toContain("OAuth state validation failed");
 
   const connectedAfter = one<{ c: number }>("SELECT COUNT(*) AS c FROM gmail_accounts");
   expect(Number(connectedAfter?.c ?? 0)).toBe(Number(connectedBefore?.c ?? 0));
