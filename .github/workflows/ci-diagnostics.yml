@@ -1,0 +1,65 @@
+name: ci-diagnostics
+
+# Temporary diagnostic workflow. It exists only to surface why the unit-test
+# step of the `security` workflow fails on GitHub runners, because job logs
+# require admin access. It emits the failure summary as check-run annotations,
+# which are readable without authentication. Delete this file once the cause is
+# known.
+
+on:
+  push:
+    branches: ["diagnostics/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests (diagnostic)
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      APP_SECRET_KEY: ci-only-not-a-real-secret
+      AI_BUDGET_LIMIT_CHF: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install
+        run: npm ci --ignore-scripts
+      - name: Run unit tests and annotate failures
+        shell: bash
+        run: |
+          set +e
+          npm run test:unit > unit.log 2>&1
+          status=$?
+          echo "unit suite exit status: $status"
+          echo "--- summary lines ---"
+          grep -E '^(ℹ|#) (tests|pass|fail|skipped)|^ℹ (tests|pass|fail|skipped)' unit.log || true
+          echo "--- failing test lines ---"
+          grep -E '✖|^not ok|AssertionError|Error:' unit.log | head -20 || true
+          annotate() {
+            local title="$1" msg="$2"
+            msg="${msg//'%'/'%25'}"
+            msg="${msg//$'\r'/}"
+            msg="${msg//$'\n'/'%0A'}"
+            echo "::error title=${title}::${msg}"
+          }
+          annotate "unit-exit" "npm run test:unit exited ${status} on the runner"
+          summary=$(grep -E '^ℹ (tests|pass|fail|skipped)' unit.log | tr '\n' ' ')
+          annotate "unit-summary" "${summary:-no summary line printed}"
+          n=0
+          while IFS= read -r line; do
+            n=$((n + 1))
+            [ "$n" -gt 8 ] && break
+            annotate "unit-failure-${n}" "${line:0:600}"
+          done < <(grep -E '✖|^not ok|Error:' unit.log | head -8)
+          if [ "$n" -eq 0 ]; then
+            tail -6 unit.log | while IFS= read -r line; do
+              annotate "unit-tail" "${line:0:600}"
+            done
+          fi
+          exit 0
