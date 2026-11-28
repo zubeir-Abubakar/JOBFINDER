@@ -1,0 +1,74 @@
+name: security
+
+# Zero-cost supply-chain and secret gate. Every action below is a first-party
+# GitHub action or a script that already lives in this repository; no paid
+# scanning service is used. No job receives production secrets: the build and
+# tests run against synthetic fixtures only.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: Secret scan (tracked files + history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history is required for the history scan
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      # Runs before `npm install` so a leaked value is caught even if
+      # dependencies fail. The scanner never prints a matched value.
+      - name: Scan working tree
+        run: node scripts/secret-scan.mjs
+      - name: Scan Git history
+        run: node scripts/secret-scan.mjs --history
+
+  dependencies:
+    name: Dependency vulnerability audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Audit (fails on high or critical)
+        run: npm audit --audit-level=high
+
+  quality:
+    name: Typecheck, unit tests, production build
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      # Synthetic, non-functional values. No real provider credential is used
+      # in CI and none is echoed to the log.
+      APP_SECRET_KEY: ci-only-not-a-real-secret
+      AI_BUDGET_LIMIT_CHF: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Production build
+        run: npm run build
+      # Build output is never uploaded: it can contain server-side config.

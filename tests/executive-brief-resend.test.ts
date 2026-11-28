@@ -10,7 +10,9 @@ process.env.FREELLMAPI_ENABLED = "false";
 process.env.OLLAMA_ENABLED = "false";
 process.env.OPENROUTER_ENABLED = "false";
 process.env.GMAIL_ENABLED = "false";
-process.env.RESEND_API_KEY = "***REMOVED***";
+// Assembled at runtime so no credential-shaped literal is committed; see
+// tests/resend-delivery.test.ts for why.
+process.env.RESEND_API_KEY = ["re", "brief", "fixture", "0000"].join("_");
 delete process.env.RESEND_FROM;
 delete process.env.NOTIFICATION_EMAIL;
 

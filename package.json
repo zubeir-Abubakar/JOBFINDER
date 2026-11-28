@@ -25,7 +25,9 @@
     "backup:encrypt": "node scripts/encrypt-backup.mjs",
     "backup:decrypt": "node scripts/decrypt-backup.mjs",
     "restore": "node scripts/restore.mjs",
-    "secret-scan": "node scripts/secret-scan.mjs"
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "secret-scan:history": "node scripts/secret-scan.mjs --history",
+    "prepare": "node scripts/install-hooks.mjs"
   },
   "engines": {
     "node": ">=24 <26"

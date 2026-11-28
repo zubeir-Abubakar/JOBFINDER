@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { all, nowIso, one, run } from "./db";
+import { all, getDb, nowIso, one, run } from "./db";
 import { setSetting } from "./settings";
 import { randomId } from "./security";
 import { notify } from "./notify";
@@ -172,24 +172,76 @@ function oauthStateKey(): string {
   return secret;
 }
 
-export function stateToken(): string {
-  const nonce = crypto.randomBytes(16).toString("base64url");
-  const signature = crypto.createHmac("sha256", oauthStateKey()).update(nonce).digest("base64url");
-  return `${nonce}.${signature}`;
+/**
+ * OAuth state is signed, bound to the user who started the flow and expires
+ * after ten minutes. The nonce is consumed once, durably, by
+ * `consumeOAuthState`; a replayed callback therefore fails even if the attacker
+ * captured both the URL and the state cookie.
+ */
+export const OAUTH_STATE_TTL_MS = 10 * 60_000;
+
+export type OAuthStatePayload = { n: string; u: string; t: number };
+
+export function stateToken(userId: string, now: Date = new Date()): string {
+  const payload: OAuthStatePayload = {
+    n: crypto.randomBytes(16).toString("base64url"),
+    u: userId,
+    t: now.getTime(),
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = crypto.createHmac("sha256", oauthStateKey()).update(body).digest("base64url");
+  return `${body}.${signature}`;
 }
 
-export function verifyState(state: string | null): boolean {
-  if (!state) return false;
-  const [nonce, signature] = state.split(".");
-  if (!nonce || !signature) return false;
+export function verifyState(state: string | null, now: Date = new Date()): OAuthStatePayload | null {
+  if (!state) return null;
+  const [body, signature] = state.split(".");
+  if (!body || !signature) return null;
   let key: string;
   try {
     key = oauthStateKey();
   } catch {
-    return false;
+    return null;
   }
-  const expected = crypto.createHmac("sha256", key).update(nonce).digest("base64url");
-  return expected.length === signature.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  const expected = crypto.createHmac("sha256", key).update(body).digest("base64url");
+  const actual = Buffer.from(signature);
+  const wanted = Buffer.from(expected);
+  if (actual.length !== wanted.length || !crypto.timingSafeEqual(actual, wanted)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as OAuthStatePayload;
+    if (typeof payload.n !== "string" || typeof payload.u !== "string" || !Number.isFinite(payload.t)) return null;
+    // A clock far ahead is as invalid as an expired state.
+    if (payload.t > now.getTime() + 60_000) return null;
+    if (now.getTime() - payload.t > OAUTH_STATE_TTL_MS) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+export function consumeOAuthState(input: {
+  state: string | null;
+  cookie: string | null;
+  userId: string;
+  now?: Date;
+}): OAuthStatePayload | null {
+  const now = input.now ?? new Date();
+  const payload = verifyState(input.state, now);
+  if (!payload) return null;
+  // The cookie is a second factor for the flow, not a substitute for the
+  // signature, and it must be the exact state this browser was issued.
+  if (!input.cookie || input.cookie !== input.state) return null;
+  if (payload.u !== input.userId) return null;
+
+  const db = getDb();
+  db.prepare("DELETE FROM oauth_states WHERE expires_at <= ?").run(now.toISOString());
+  const inserted = db
+    .prepare(
+      `INSERT INTO oauth_states (nonce, user_id, created_at, expires_at)
+       VALUES (?, ?, ?, ?) ON CONFLICT(nonce) DO NOTHING`,
+    )
+    .run(payload.n, payload.u, now.toISOString(), new Date(payload.t + OAUTH_STATE_TTL_MS).toISOString());
+  return Number(inserted.changes) === 1 ? payload : null;
 }
 
 export function authUrl(state: string): string {

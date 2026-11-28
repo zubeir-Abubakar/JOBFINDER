@@ -240,6 +240,13 @@ CREATE TABLE IF NOT EXISTS api_rate_limits (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_api_rate_limits_reset ON api_rate_limits(reset_at);
+CREATE TABLE IF NOT EXISTS oauth_states (
+  nonce TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_oauth_states_expires ON oauth_states(expires_at);
 CREATE TABLE IF NOT EXISTS job_sources (
   key TEXT PRIMARY KEY,
   name TEXT NOT NULL,

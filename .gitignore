@@ -1,17 +1,88 @@
+# --- Dependencies and vendored sandboxes ------------------------------------
 node_modules/
 .agent-reach/
+
+# --- Environment and local secrets ------------------------------------------
+# Every .env variant is ignored, including .env.local / .env.production /
+# .env.development. Only the placeholder template is allowed.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+*.crt
+certs/
+.secrets/
+.credentials/
+.vercel/
+.netlify/
+
+# --- Temporary, scratch and debug output ------------------------------------
+# Saved pages, curl dumps, probe HTML, diagnostic tokens and one-off phase
+# scripts live here. This directory leaked a live Google API key at
+# .tmp/phase5/digt_kontakt.html line 491 (commit 2b847142).
+temp/
+tmp/
+*.tmp
+# Keep this last so the directory rule wins over the *.tmp file glob.
+.tmp/
+.checkpoints/
+*.patch
+*.orig
+*.rej
+
+# --- Build output -----------------------------------------------------------
 .next/
 out/
-data/
-reset-backups/
-.e2e-runtime/
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# --- Test, coverage and browser artifacts -----------------------------------
+.playwright/
+blob-report/
 playwright-report/
 test-results/
-blob-report/
-certs/
+coverage/
+*.lcov
+.e2e-runtime/
+.harness/
+
+# --- Runtime data, uploads, backups -----------------------------------------
+data/
+reset-backups/
+backups/
+# Database dumps under artifacts/ were committed at d43cb94 and contained real
+# user, session, Gmail-account, document and application rows. Never tracked.
+artifacts/backups/
+uploads/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# --- Logs and diagnostics ---------------------------------------------------
 *.log
-.env
-.env.local
+logs/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.pid
+*.seed
+
+# --- Editor / OS ------------------------------------------------------------
 .DS_Store
-next-env.d.ts
-tsconfig.tsbuildinfo
+Thumbs.db
+.idea/
+.vscode/
+*.swp

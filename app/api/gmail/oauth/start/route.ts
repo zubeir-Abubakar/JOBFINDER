@@ -15,7 +15,7 @@ export async function GET(request: Request) {
   if (!config.redirectUri) {
     return NextResponse.redirect(new URL("/inbox?error=Redirect+URI+is+not+configured", request.url));
   }
-  const state = stateToken();
+  const state = stateToken(user.id);
   const response = NextResponse.redirect(authUrl(state));
   response.cookies.set("atw_gmail_state", state, {
     httpOnly: true,
