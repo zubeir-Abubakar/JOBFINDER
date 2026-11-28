@@ -20,7 +20,13 @@ export const STRONG = [
   { name: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: "Supabase key", re: /\bsb[p]_[A-Za-z0-9_-]{20,}/ },
   { name: "private key", re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/ },
-  { name: "database URL with password", re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?):\/\/[^\s"'<>:@/]{1,64}:[^\s"'<>@/]{2,64}@/ },
+  { name: "database URL with password", re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?):\/\/[^\s"'<>:@/]{1,64}:[^\s"'<>@/]{2,64}@/ },
+  // Any scheme with a password segment in the authority, not just databases.
+  // The password must be long and URL-safe, so documentation such as
+  // `https://user:password@host` is not reported.
+  { name: "credential in URL", re: /\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>/:@]{1,64}:[A-Za-z0-9._~%+!-]{16,64}@/i },
+  // A signed JWT is a bearer credential on its own, with no `token =` prefix.
+  { name: "JSON Web Token", re: /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/ },
 ];
 
 /**

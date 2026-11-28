@@ -32,7 +32,6 @@ const SKIP_PATHS = [
   /^coverage\//,
   /^playwright-report\//,
   /^test-results\//,
-  /^package-lock\.json$/, // hashes only; audited by npm audit
 ];
 
 /**
@@ -45,7 +44,11 @@ const GENERIC = {
   re: /\b(?:api[_-]?key|apikey|secret|token|password|passwd|client[_-]?secret|access[_-]?key|private[_-]?key)\b\s*[:=]\s*["'`]([A-Za-z0-9_+/=.-]{20,})["'`]/i,
 };
 
-const GENERIC_SKIP = /^(?:tests?|e2e|docs?|artifacts|deploy\/.*\.example)/;
+// Test/documentation trees and the lockfile legitimately contain prose and
+// package metadata that trips the broad assignment heuristic. Strong provider
+// formats are still enforced in every one of them, including the lockfile:
+// a registry URL with an embedded credential must not be silently skipped.
+const GENERIC_SKIP = /^(?:tests?|e2e|docs?|artifacts|package-lock\.json|deploy\/.*\.example)/;
 
 function sha(value) {
   return createHash("sha256").update(value).digest("hex").slice(0, 10);

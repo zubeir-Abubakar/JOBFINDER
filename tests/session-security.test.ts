@@ -71,6 +71,42 @@ test("a disabled account's session is rejected and deleted", () => {
   assert.equal(Number(remaining?.c ?? 0), 0);
 });
 
+test("a password change revokes other sessions but keeps the current one", async () => {
+  user("u_pw");
+  const current = security.newToken();
+  const other = security.newToken();
+  session(current, "u_pw", future);
+  session(other, "u_pw", future);
+
+  const error = await auth.changePassword(
+    "u_pw",
+    "Correct-Horse!2026",
+    "New-Password!2026",
+    "New-Password!2026",
+    security.sha256(current),
+  );
+
+  assert.equal(error, null);
+  assert.equal(auth.sessionUserFromToken(current)?.id, "u_pw");
+  assert.equal(auth.sessionUserFromToken(other), null);
+  const row = db.one<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = ?", ["u_pw"]);
+  assert.equal(security.verifyPassword("New-Password!2026", String(row?.password_hash)), true);
+  assert.equal(security.verifyPassword("Correct-Horse!2026", String(row?.password_hash)), false);
+});
+
+test("a forced password change with no kept session revokes every session", async () => {
+  const first = security.newToken();
+  const second = security.newToken();
+  session(first, "u_pw", future);
+  session(second, "u_pw", future);
+
+  const error = await auth.changePassword("u_pw", "New-Password!2026", "Third-Password!2026", "Third-Password!2026");
+
+  assert.equal(error, null);
+  assert.equal(auth.sessionUserFromToken(first), null);
+  assert.equal(auth.sessionUserFromToken(second), null);
+});
+
 test("deleting one session does not invalidate another user's session", () => {
   db.run("DELETE FROM sessions WHERE token_hash = ?", [security.sha256(tokenB)]);
   assert.equal(auth.sessionUserFromToken(tokenB), null);

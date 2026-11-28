@@ -341,6 +341,14 @@ export async function currentUser(): Promise<SessionUser | null> {
   return token ? sessionUserFromToken(token) : null;
 }
 
+/** Hash of the caller's own session token, so a password change can revoke
+ * every other session without destroying the one the user is holding. */
+export async function currentSessionTokenHash(): Promise<string | null> {
+  const jar = await cookies();
+  const token = jar.get(SESSION_COOKIE)?.value;
+  return token ? sha256(token) : null;
+}
+
 export async function requireUser(): Promise<SessionUser> {
   const user = await currentUser();
   if (!user) redirect("/login");
@@ -370,7 +378,13 @@ export async function logout(): Promise<void> {
   redirect("/login");
 }
 
-export async function changePassword(userId: string, current: string, next: string, confirm: string): Promise<string | null> {
+export async function changePassword(
+  userId: string,
+  current: string,
+  next: string,
+  confirm: string,
+  keepTokenHash: string | null = null,
+): Promise<string | null> {
   const row = one<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = ?", [userId]);
   if (!row) return "Account not found.";
   if (!verifyPassword(current, row.password_hash)) return "Current password is incorrect.";
@@ -379,7 +393,13 @@ export async function changePassword(userId: string, current: string, next: stri
   if (next !== confirm) return "New passwords do not match.";
   const { hashPassword } = await import("./security");
   run("UPDATE users SET password_hash = ?, must_change_password = 0 WHERE id = ?", [hashPassword(next), userId]);
-  run("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", [userId, ""]);
+  // Revoke every other session. Without a kept token hash (a forced password
+  // change that redirects back to /login) every session is revoked.
+  if (keepTokenHash) {
+    run("DELETE FROM sessions WHERE user_id = ? AND token_hash != ?", [userId, keepTokenHash]);
+  } else {
+    run("DELETE FROM sessions WHERE user_id = ?", [userId]);
+  }
   audit({ action: "password.changed", entity: "user", entityId: userId, userId });
   return null;
 }

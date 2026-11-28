@@ -35,22 +35,12 @@ export function randomId(): string {
   return randomBytes(12).toString("hex");
 }
 
-const attempts = new Map<string, { count: number; resetAt: number }>();
-
-/** Simple in-process rate limiter for login attempts. */
-export function rateLimit(key: string, limit = 8, windowMs = 10 * 60 * 1000): { ok: boolean; retryAfter: number } {
-  const now = Date.now();
-  const entry = attempts.get(key);
-  if (!entry || entry.resetAt < now) {
-    attempts.set(key, { count: 1, resetAt: now + windowMs });
-    return { ok: true, retryAfter: 0 };
-  }
-  entry.count += 1;
-  if (entry.count > limit) {
-    return { ok: false, retryAfter: Math.ceil((entry.resetAt - now) / 1000) };
-  }
-  return { ok: true, retryAfter: 0 };
-}
+/**
+ * There is deliberately no in-process rate limiter here. Login attempts are
+ * counted from durable audit rows (lib/login-throttle.ts) and API calls from
+ * durable SQLite counters (lib/api-rate-limit.ts), so a restart or a second
+ * process cannot reset a throttle window.
+ */
 
 export function passwordIssues(password: string): string | null {
   if (password.length < 10) return "Password must be at least 10 characters.";

@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
-import { changePassword, currentUser, logout, requireUser } from "@/lib/auth";
+import { changePassword, currentSessionTokenHash, currentUser, logout, requireUser } from "@/lib/auth";
 
 export async function logoutAction(): Promise<void> {
   await logout();
@@ -18,6 +18,8 @@ export async function changePasswordAction(
     String(formData.get("current") ?? ""),
     String(formData.get("next") ?? ""),
     String(formData.get("confirm") ?? ""),
+    // Keep the session the owner is using; only the other sessions are signed out.
+    await currentSessionTokenHash(),
   );
   if (error) return { error };
   revalidatePath("/settings");
