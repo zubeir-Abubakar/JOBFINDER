@@ -63,6 +63,14 @@ backups/
 # Database dumps under artifacts/ were committed at d43cb94 and contained real
 # user, session, Gmail-account, document and application rows. Never tracked.
 artifacts/backups/
+# Screenshots, voice recordings and investigation notes capture the owner's
+# dashboard, documents and correspondence. They stay local; the only artifact
+# published from artifacts/ is the security report.
+artifacts/**/*.png
+artifacts/*.png
+artifacts/**/*.wav
+artifacts/*.wav
+artifacts/investigations/
 uploads/
 *.db
 *.db-journal

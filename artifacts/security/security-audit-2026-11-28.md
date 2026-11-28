@@ -214,7 +214,7 @@ the presence of the files.
 | B1 | Exposed key still valid | **Critical** | Only the owner can confirm the project and rotate/restrict it. If it is Digt's, rotation is theirs; revocation is unverifiable from here. |
 | B2 | Remote `main` still contains the key and the DB backups | **Critical** | Local history is purged; publishing the rewrite is a force-push (section D), which was explicitly not authorised. |
 | B3 | GitHub protections not enabled | Medium | Secret scanning, push protection, Dependabot and branch protection are repository settings, not files. |
-| B4 | Tracked screenshots and investigation notes contain owner PII | Low | 78 PNGs of the owner dashboard/profile/CVs plus notes containing the owner's address. No credential found. Left tracked deliberately as project evidence; review before making the repository public (`git rm -r --cached artifacts` if you decide they should not ship). |
+| B4 | Screenshots and investigation notes contain owner PII | **Resolved** | 78 PNGs of the owner dashboard/profile/CVs, two live-call recordings and a note containing the owner's address were tracked. No credential found. All 81 files are now untracked, kept on disk, and ignored (`.gitignore`). The files remain in published history until D1 rewrites it. |
 | B5 | Rate limiting is single-host | Low | Durable across processes that share the SQLite file, but not a distributed limiter for horizontally scaled replicas. The deployment is a single host; a shared store would be required to scale out. |
 | B6 | Pre-purge backup bundle holds the old history | Medium (local) | `backups/pre-purge-20261128T132506Z.bundle` contains the exposed key by design, so the purge is reversible. It is gitignored and must be deleted once the rewrite is accepted. |
 | B7 | Full Playwright suite not run | Low | Auth, admin and schedules projects were run. Mobile, visual, voice and integration projects were not, because no UI or voice code changed. Run `npm run test:e2e` before release. |
@@ -235,9 +235,12 @@ commit `2b847142` still contains the key (and `d43cb94` contains the database
 dump). Rotation is the only control that makes copies harmless; the history
 rewrite only removes our copy.
 
-**C3 — Decide on tracked artifacts.** If the repository will be public, consider
-untracking `artifacts/` screenshots and investigation notes (B4). They are
-evidence, not application code.
+**C3 — Tracked artifacts (done).** The screenshots, voice recordings and
+investigation notes are untracked and ignored (B4). They stay in published
+history until D1; only then are they gone from the remote. Anything still under
+`artifacts/` that names the owner (`artifacts/reset/` manifests the CV filenames
+and host details) can be untracked the same way if the repository becomes
+public.
 
 **C4 — Delete the backup bundle** after accepting the rewrite:
 `rm backups/pre-purge-20261128T132506Z.bundle`. Until then it is the rollback.
@@ -281,7 +284,8 @@ old key as compromised in any external copy until C1 is resolved.
 | Rewrite scope | `git diff <pre-purge> HEAD` (excluding purged paths) | **Empty** — no unrelated content changed |
 | Identifier integrity | `git grep '\*\*\*REMOVED\*\*\*' -- lib tests app components` | None at HEAD |
 | `.env.example` | `git ls-files .env.example` | Tracked, not ignored |
-| Ignore rules | `git check-ignore -v …` | `.tmp/`, `artifacts/backups/`, `.env` ignored; `.env.example` not |
+| Ignore rules | `git check-ignore -v …` | `.tmp/`, `artifacts/backups/`, `artifacts/**/*.png`, `artifacts/**/*.wav`, `artifacts/investigations/`, `.env` ignored; `.env.example` not |
+| Personal artifacts | `git ls-files artifacts/` | 0 PNG, 0 WAV, 0 investigation notes tracked; `artifacts/security/security-audit-2026-11-28.md` still tracked |
 | Dependencies | `npm audit --audit-level=high` | 0 vulnerabilities |
 | Typecheck | `npm run typecheck` | exit 0 |
 | Unit tests | `npm run test:unit` | 753 tests, 749 pass, 4 skipped, **0 fail** |
@@ -308,6 +312,8 @@ Playwright projects for mobile, visual, voice and integration were not run (B7).
 | `tests/oauth-state.test.ts`, `tests/session-security.test.ts` | New unit coverage |
 | `e2e/auth.spec.ts` | Session expiry, CSRF, document isolation, OAuth start/callback |
 | `artifacts/backups/**` | Untracked (files kept locally) |
+| `artifacts/**/*.png`, `artifacts/**/*.wav`, `artifacts/investigations/**` | Untracked and ignored (files kept locally) |
+| `.gitignore` | Ignore the personal captures; keep the security report tracked |
 
 ## Recovery
 
