@@ -34,6 +34,19 @@ test("reconnect backoff is bounded, jittered and only reset after stability", ()
   assert.equal(isStableConnection(Number.NaN), false);
 });
 
+test("time spent offline does not consume the bounded reconnect budget", () => {
+  const source = readFileSync("components/CoordinatorLiveVoice.tsx", "utf8");
+  // Both the reconnect scheduler and a failed in-flight attempt defer while the
+  // browser reports offline, so a transient loss cannot exhaust all attempts.
+  assert.match(source, /RECONNECT_DEFERRED_OFFLINE/);
+  assert.match(source, /if \(!navigator\.onLine\) \{/);
+  assert.match(source, /reconnectAttempts\.current >= 3/);
+  // The server's short session throttle is reported honestly, not as a quota
+  // exhaustion, and the online handler does not start a duplicate session.
+  assert.match(source, /LIVE_RATE_LIMIT/);
+  assert.match(source, /if \(starting\.current\) return;/);
+});
+
 test("the voice client keeps one microphone stream and exposes stop controls", () => {
   const source = readFileSync("components/CoordinatorLiveVoice.tsx", "utf8");
   assert.match(source, /async function ensureMicrophone/);

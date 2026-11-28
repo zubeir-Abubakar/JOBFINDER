@@ -20,6 +20,8 @@ import {
   type SourceAttemptDiagnostic,
   type SourceErrorCategory,
 } from "./source-http";
+import { researchVacancyEvidence } from "./recruitment-research";
+import { agentReachStatus, type ReachRunner } from "./agent-reach";
 
 /**
  * Vacancy discovery for the autonomous daily run.
@@ -155,7 +157,167 @@ export type DiscoveryResult = {
   sourcesPartial?: number;
   discoveryState?: "ok" | "empty" | "partial" | "failed" | "not_configured";
   allSourcesFailed?: boolean;
+  /** Bounded, read-only Agent Reach evidence for the newest stored vacancies. */
+  research?: DiscoveryResearchSummary;
 };
+
+/** Hard ceiling on external research reads per run. */
+export const DISCOVERY_RESEARCH_CAP = 3;
+
+export type DiscoveryResearchEvidence = {
+  jobId: string;
+  title: string;
+  company: string;
+  sourceUrl: string;
+  employerUrl: string | null;
+  ok: boolean;
+  channel: string | null;
+  backend: string | null;
+  retrievedAt: string;
+  identityMentioned: boolean;
+  closedSignal: string | null;
+  injectionSignals: string[];
+  reason: string | null;
+};
+
+export type DiscoveryResearchSummary = {
+  /** The cap actually applied to this run. */
+  cap: number;
+  enabled: boolean;
+  attempted: number;
+  succeeded: number;
+  /** New vacancies beyond the cap (or without a readable URL) that were not researched. */
+  skipped: number;
+  reason: string | null;
+  evidence: DiscoveryResearchEvidence[];
+};
+
+/**
+ * Read public evidence for at most `cap` vacancies this run just stored.
+ *
+ * Evidence is an audit input only: it cannot insert a vacancy, change a score,
+ * alter eligibility, satisfy the qualification threshold or reach submission.
+ * A missing Agent Reach install, a failed read or an injected page is recorded
+ * and never raises into the discovery result.
+ */
+export async function enrichDiscoveredVacancies(input: {
+  jobIds: string[];
+  cap?: number;
+  runner?: ReachRunner;
+  now?: Date;
+  timeoutMs?: number;
+  /** Installation override for tests; production reads the real install state. */
+  installed?: boolean;
+}): Promise<DiscoveryResearchSummary> {
+  const cap = Math.min(DISCOVERY_RESEARCH_CAP, Math.max(0, input.cap ?? DISCOVERY_RESEARCH_CAP));
+  const jobIds = [...new Set(input.jobIds.filter(Boolean))];
+  const summary: DiscoveryResearchSummary = {
+    cap,
+    enabled: true,
+    attempted: 0,
+    succeeded: 0,
+    skipped: Math.max(0, jobIds.length - cap),
+    reason: null,
+    evidence: [],
+  };
+  if (jobIds.length === 0) {
+    summary.reason = "This run stored no vacancy, so no research evidence was requested.";
+    return summary;
+  }
+  if (!(input.installed ?? agentReachStatus().installed)) {
+    summary.enabled = false;
+    summary.reason = "Agent Reach is not installed in this deployment; discovery continues without external evidence.";
+    return summary;
+  }
+  if (cap === 0) {
+    summary.reason = "Bounded research enrichment is disabled for this run.";
+    return summary;
+  }
+
+  for (const jobId of jobIds.slice(0, cap)) {
+    const job = one<{
+      id: string;
+      title: string;
+      company: string;
+      url: string | null;
+      application_url: string | null;
+      employer_url: string | null;
+    }>("SELECT id, title, company, url, application_url, employer_url FROM jobs WHERE id = ?", [jobId]);
+    if (!job?.url) {
+      summary.skipped += 1;
+      continue;
+    }
+    summary.attempted += 1;
+    try {
+      const evidence = await researchVacancyEvidence(
+        {
+          sourceUrl: job.url,
+          employerUrl: job.employer_url ?? job.application_url,
+          title: job.title,
+          company: job.company,
+        },
+        { runner: input.runner, now: input.now, timeoutMs: input.timeoutMs ?? 15_000 },
+      );
+      if (evidence.ok) summary.succeeded += 1;
+      summary.evidence.push({
+        jobId: job.id,
+        title: job.title,
+        company: job.company,
+        sourceUrl: evidence.sourceUrl,
+        employerUrl: evidence.employerUrl,
+        ok: evidence.ok,
+        channel: evidence.channel,
+        backend: evidence.backend,
+        retrievedAt: evidence.retrievedAt,
+        identityMentioned: evidence.identityMentioned,
+        closedSignal: evidence.closedSignal,
+        injectionSignals: evidence.injectionSignals,
+        reason: evidence.reason,
+      });
+    } catch (error) {
+      summary.evidence.push({
+        jobId: job.id,
+        title: job.title,
+        company: job.company,
+        sourceUrl: job.url,
+        employerUrl: null,
+        ok: false,
+        channel: null,
+        backend: null,
+        retrievedAt: (input.now ?? new Date()).toISOString(),
+        identityMentioned: false,
+        closedSignal: null,
+        injectionSignals: [],
+        reason: error instanceof Error ? error.message : "The research read failed.",
+      });
+    }
+  }
+
+  if (summary.attempted > 0) {
+    recordSourceCheck({
+      key: "agent_reach",
+      employer: "Newly stored vacancies (bounded evidence sample)",
+      endpoint: "agent-reach://vacancy-evidence",
+      method: `Agent Reach read-only page evidence (max ${DISCOVERY_RESEARCH_CAP} per run)`,
+      ok: summary.succeeded > 0,
+      postings: summary.attempted,
+      fresh: 0,
+      relevant: summary.succeeded,
+      error:
+        summary.succeeded === summary.attempted
+          ? null
+          : summary.evidence.find((item) => !item.ok)?.reason ?? "Evidence could not be read for at least one vacancy.",
+      attempts: summary.attempted,
+      durationMs: 0,
+    });
+  }
+
+  summary.reason =
+    summary.skipped > 0
+      ? `Bounded to ${cap} newly stored vacancy(ies); ${summary.skipped} further vacancy(ies) were not researched.`
+      : null;
+  return summary;
+}
 
 const QA_TITLE =
   /\b(qa|quality assurance(?: engineer| analyst)?|quality engineer|quality manager|test(?:ing)? engineer|test automation|test architect|automation test(?:ing)? engineer|automation engineer|sdet|software (?:development )?engineer in test|software test|test lead|test manager|testmanager|lead qa|qa lead|qa automation|qa engineer|qa analyst|qa specialist|qa tester|api test(?:er|ing)? engineer|mobile qa(?: engineer)?|software qa|test analyst|test specialist|test consultant|teamlead(?:er)? (?:test|testing|qa|quality)|head of (?:test|testing|qa|quality)|testingenieur|ing[ée]nieur (?:test|qa|qualit[ée])|testeur|testeuse|analyste qa|responsable (?:test|qa))\b/i;
@@ -1291,6 +1453,55 @@ export function sourceHealth(): SourceHealth[] {
   return all<SourceHealth>("SELECT * FROM discovery_source_status ORDER BY source_key, employer");
 }
 
+export type DiscoveryResearchReport = {
+  cap: number;
+  attempted: number;
+  succeeded: number;
+  lastCheckedAt: string | null;
+  ok: boolean | null;
+  error: string | null;
+  /** True when the counters describe this run rather than an earlier one. */
+  fromRun: boolean;
+};
+
+/**
+ * Read the persisted bounded-research evidence for display. It reports only what
+ * was recorded; it never re-runs research and never implies a vacancy was
+ * changed by it.
+ */
+export function discoveryResearchReport(runId?: string | null): DiscoveryResearchReport | null {
+  const row = one<{ ok: number; postings: number; relevant: number; error: string | null; last_checked_at: string }>(
+    "SELECT ok, postings, relevant, error, last_checked_at FROM discovery_source_status WHERE source_key = 'agent_reach' AND endpoint = 'agent-reach://vacancy-evidence'",
+  );
+  const stage = runId
+    ? one<{ evidence: string | null }>(
+        "SELECT evidence FROM recruitment_stage_checkpoints WHERE run_id = ? AND job_id = '' AND stage = 'discovery' LIMIT 1",
+        [runId],
+      )
+    : null;
+  let runAttempted = 0;
+  let runSucceeded = 0;
+  try {
+    const parsed = JSON.parse(stage?.evidence ?? "{}") as { researchAttempted?: unknown; researchEvidence?: unknown };
+    runAttempted = Number(parsed.researchAttempted ?? 0);
+    runSucceeded = Number(parsed.researchEvidence ?? 0);
+  } catch {
+    runAttempted = 0;
+    runSucceeded = 0;
+  }
+  const fromRun = runAttempted > 0;
+  if (!row && !fromRun) return null;
+  return {
+    cap: DISCOVERY_RESEARCH_CAP,
+    attempted: fromRun ? runAttempted : Number(row?.postings ?? 0),
+    succeeded: fromRun ? runSucceeded : Number(row?.relevant ?? 0),
+    lastCheckedAt: row?.last_checked_at ?? null,
+    ok: row ? row.ok === 1 : null,
+    error: row?.error ?? null,
+    fromRun,
+  };
+}
+
 /**
  * jobs.ch public search API. Verified 2026-11-18: HTTP 200 JSON, with a
  * schema.org JobPosting block on each detail page carrying the full description.
@@ -1669,6 +1880,8 @@ export async function discoverJobSources(options: {
   greenhouseBoards?: string[];
   leverSites?: string[];
   jobsChQueries?: string[];
+  /** Opt out, or inject a test runner, for bounded evidence enrichment. */
+  research?: false | { cap?: number; runner?: ReachRunner };
 }): Promise<DiscoveryResult> {
   const scope = options.scope ?? "full";
   const since = options.since ?? (scope === "incremental" ? previousSuccessfulDiscoveryAt(options.runId) : null);
@@ -1973,7 +2186,13 @@ export async function discoverJobSources(options: {
     errorCategory: careers.errorCategory,
     ...rejectionSummary(careers),
   });
-  if (careers.error) result.warnings.push(`Employer pages: ${careers.error}`);
+  if (careers.error) {
+    result.warnings.push(
+      careers.responses > 0
+        ? `Employer page component failed while the source remained reachable: ${careers.error}`
+        : `Employer pages: ${careers.error}`,
+    );
+  }
   recordSourceCheck({
     key: "career_pages",
     employer: pagesConfig.map((page) => {
@@ -1985,11 +2204,15 @@ export async function discoverJobSources(options: {
     }).join(", ") || null,
     endpoint: "https://employer-careers (configured pages)",
     method: "schema.org JobPosting on employer pages",
-    ok: !careers.error && careers.responses > 0,
+    // A career page is one component of this source. If at least one page
+    // responded, the source itself is reachable and the run must not describe
+    // it as a source-level failure; the component error is preserved as a
+    // warning and in the error category.
+    ok: careers.responses > 0,
     postings: careers.fetched,
     fresh: careers.fresh,
     relevant: Math.max(0, careers.fetched - careers.filtered),
-    error: careers.error,
+    error: careers.responses > 0 ? null : careers.error,
     errorCategory: careers.errorCategory,
     attempts: careers.attempts,
     durationMs: careers.durationMs,
@@ -2037,6 +2260,25 @@ export async function discoverJobSources(options: {
   for (const source of result.sources) {
     run("UPDATE discovery_source_status SET last_run_id = ? WHERE source_key = ?", [options.runId, source.key]);
   }
+  // Bounded, read-only evidence for the newest stored vacancies. This runs after
+  // the source counters are final, so it cannot change discovery accounting,
+  // eligibility, scoring or the qualification gate.
+  result.research =
+    options.research === false
+      ? {
+          cap: 0,
+          enabled: false,
+          attempted: 0,
+          succeeded: 0,
+          skipped: 0,
+          reason: "Bounded research enrichment was disabled for this run.",
+          evidence: [],
+        }
+      : await enrichDiscoveredVacancies({
+          jobIds: result.jobIds,
+          cap: options.research?.cap,
+          runner: options.research?.runner,
+        });
   result.discovered = result.inserted;
   return result;
 }

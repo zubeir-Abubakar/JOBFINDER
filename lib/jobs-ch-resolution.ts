@@ -8,6 +8,78 @@ import {
 } from "./employer-links";
 import { isAggregatorUrl } from "./job-identity";
 
+export type EmailDestinationInput = {
+  email: string;
+  employerVacancyUrl: string | null;
+  employerSite: string | null;
+  reason: string;
+  evidence: Record<string, unknown>;
+  verifiedAt?: string;
+};
+
+/**
+ * Persist a verified employer email application destination. No web form is
+ * invented: `application_url` stays NULL, `url_confidence` becomes `email`, and
+ * the queue treats the vacancy as a human email handoff.
+ */
+/** Clears a previously stored email destination when fresh evidence rejects it. */
+export function clearEmployerEmailDestination(jobId: string, reason: string): void {
+  const job = one<{
+    application_email: string | null;
+    url_confidence: string | null;
+    application_url: string | null;
+    ats_vendor: string | null;
+  }>("SELECT application_email, url_confidence, application_url, ats_vendor FROM jobs WHERE id = ?", [jobId]);
+  if (!job?.application_email) return;
+  // A verified web destination survives the email cleanup; only a vacancy with
+  // no web form returns to `unresolved`.
+  const restored = job.application_url ? (job.ats_vendor ? "ats" : "direct") : "unresolved";
+  run(
+    `UPDATE jobs SET application_email = NULL, application_email_source = NULL, application_email_verified_at = NULL,
+       url_confidence = ?, url_provenance = ? WHERE id = ?`,
+    [restored, JSON.stringify({ version: 1, resolver: "employer_email", method: "unresolved", reason, resolvedAt: nowIso() }), jobId],
+  );
+}
+
+export function persistEmployerEmailDestination(
+  jobId: string,
+  input: EmailDestinationInput,
+): { stored: boolean } {
+  const email = input.email.trim().toLowerCase();
+  if (!/^[^@\s]+@[^@\s]+\.[a-z]{2,}$/i.test(email)) return { stored: false };
+  const verifiedAt = input.verifiedAt ?? nowIso();
+  const provenance = {
+    version: 1,
+    resolver: "employer_email",
+    method: "verified_employer_page",
+    employerUrl: input.employerVacancyUrl ?? input.employerSite,
+    applicationEmail: email,
+    confidence: "email",
+    reason: input.reason,
+    evidence: input.evidence,
+    resolvedAt: verifiedAt,
+  };
+  run(
+    `UPDATE jobs SET application_email = ?, application_email_source = 'verified_employer_page',
+       application_email_verified_at = ?, employer_url = COALESCE(?, employer_url),
+       url_confidence = CASE
+         WHEN application_url IS NOT NULL AND url_confidence IN ('direct','ats') THEN url_confidence
+         ELSE 'email'
+       END,
+       url_provenance = ?, last_verified_at = ?
+     WHERE id = ?`,
+    [
+      email,
+      verifiedAt,
+      input.employerVacancyUrl ?? input.employerSite,
+      JSON.stringify(provenance).slice(0, 12000),
+      verifiedAt,
+      jobId,
+    ],
+  );
+  return { stored: true };
+}
+
 /**
  * Persist the evidence behind a jobs.ch employer-link resolution.
  *

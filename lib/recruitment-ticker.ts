@@ -7,7 +7,7 @@ import {
   occurrenceAlreadyExecuted,
   recordScheduleRun,
   scheduleSnapshot,
-  catchUpWindowHours,
+  RECRUITMENT_EXECUTION_TOLERANCE_MS,
   formatInZone,
   localDateKey,
 } from "./recruitment-schedule";
@@ -120,7 +120,9 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
     // and "the process is not running" without relying on in-memory state.
     run("UPDATE schedule_jobs SET last_checked_at = ? WHERE key = ?", [now.toISOString(), RECRUITMENT_SCHEDULE_KEY]);
     const snapshot = scheduleSnapshot(now);
-    if (!snapshot.due) {
+    // A missed occurrence is handled below, so it must not be short-circuited as
+    // "not due". `due` and `missed` are mutually exclusive.
+    if (!snapshot.due && !snapshot.missed) {
       return {
         checkedAt: now.toISOString(),
         enabled: true,
@@ -167,18 +169,20 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
     if (snapshot.missed) {
       const scheduledAt = snapshot.nextRunAt;
       const missedId = `run_${randomId()}`;
-      const reason = `The scheduled run at ${formatInZone(scheduledAt)} was missed by more than ${catchUpWindowHours()} hour(s). The host or application was not running. It was not silently executed late.`;
+      const toleranceMinutes = RECRUITMENT_EXECUTION_TOLERANCE_MS / 60_000;
+      const reason = `The scheduled recruitment occurrence at ${formatInZone(scheduledAt)} (${snapshot.timezone}) was missed: the application was not running within ${toleranceMinutes} minutes of its slot. It is recorded as missed with this scheduled timestamp and was not executed late. No catch-up run or compensating execution was created.`;
       const missedScope = snapshot.nextRunMode ?? "full";
       // One slot per day means this can only ever record the single missed
-      // occurrence; recordScheduleRun below rolls next_run_at to tomorrow.
+      // occurrence; recordScheduleRun below rolls next_run_at to tomorrow, so a
+      // later tick cannot turn the same occurrence into a late run.
       run(
         `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, failures, warnings, error, report, created_at, finished_at, discovery_scope)
-         VALUES (?, ?, ?, 'catch_up', 'failed', ?, 0, 0, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, 'missed', 'missed', ?, 0, 0, ?, ?, ?, ?, ?)`,
         [
           missedId,
           `${localDateKey(new Date(scheduledAt ?? now.toISOString()))}#missed-${missedScope}-${randomId().slice(0, 6)}`,
           scheduledAt,
-          JSON.stringify([{ state: "scheduled", at: scheduledAt }, { state: "failed", at: now.toISOString(), message: reason }]),
+          JSON.stringify([{ state: "scheduled", at: scheduledAt }, { state: "missed", at: now.toISOString(), message: reason }]),
           reason,
           reason,
           now.toISOString(),
@@ -186,14 +190,17 @@ export async function tickRecruitmentSchedule(now: Date = new Date()): Promise<T
           missedScope,
         ],
       );
-      recordScheduleRun({ runId: missedId, status: "failed", error: reason, now, scheduledFor: scheduledAt });
+      recordScheduleRun({ runId: missedId, status: "missed", error: reason, now, scheduledFor: scheduledAt });
       notify({ kind: "recruitment_missed", subject: "A scheduled recruitment run was missed", body: reason });
       audit({ action: "recruitment.run_missed", entity: "recruitment_run", entityId: missedId, detail: reason });
       return { checkedAt: now.toISOString(), enabled: true, started: false, runId: missedId, reason, executiveBrief };
     }
 
+    // Inside the tick tolerance this is still the 12:00 occurrence, started by
+    // the ticker a few seconds late — not a catch-up. No catch-up trigger is
+    // produced for recruitment any more.
     const created = createRecruitmentRun({
-      trigger: snapshot.overdueMs > 0 ? "catch_up" : "schedule",
+      trigger: "schedule",
       now,
       scheduledFor: snapshot.nextRunAt,
       discoveryScope: snapshot.nextRunMode ?? "full",

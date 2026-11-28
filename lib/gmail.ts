@@ -6,10 +6,20 @@ import { notify } from "./notify";
 import { audit } from "./audit";
 import { recordApplicationEvent } from "./application-events";
 import { existingVerifiedSubmission } from "./submission";
-import { GMAIL_IDENTITY_SCOPES, REQUIRED_GMAIL_SCOPES, GmailProfileError, gmailApiError, missingGrantedScopes, parseGmailProfile } from "./gmail-profile";
+import {
+  GMAIL_IDENTITY_SCOPES,
+  REQUIRED_GMAIL_SCOPES,
+  GmailProfileError,
+  GmailTokenError,
+  gmailApiError,
+  gmailFailureCode,
+  gmailTokenRefreshError,
+  missingGrantedScopes,
+  parseGmailProfile,
+} from "./gmail-profile";
 import { generateText, type AiCallSource } from "./providers";
 import { enqueueAiJob, isQueueableAiError } from "./ai-queue";
-import { buildEmailMime } from "./email-mime";
+import { buildEmailMime, buildOutreachMime, type OutreachAttachment } from "./email-mime";
 import { renderNotificationEmail } from "./email-template";
 
 /**
@@ -55,7 +65,7 @@ export type GmailSentObservation = {
 
 export type GmailSendReadiness = {
   ok: boolean;
-  code: "ready" | "missing_configuration" | "authentication_failed" | "permission_denied";
+  code: "ready" | "missing_configuration" | "authentication_failed" | "permission_denied" | "transient";
   detail: string;
   email: string | null;
 };
@@ -69,6 +79,8 @@ export type GmailBounceCheck = {
 
 export type GmailTestResult = {
   status: GmailTestStatus;
+  /** Stable reason code for the outbox; null when the call succeeded. */
+  failureCode: string | null;
   provider: "gmail";
   recipientMasked: string;
   messageId: string | null;
@@ -213,7 +225,12 @@ async function tokenRequest(body: Record<string, string>) {
     error_description?: string;
   };
   if (!response.ok || !payload.access_token) {
-    throw new Error(payload.error_description ?? payload.error ?? `Google token endpoint returned ${response.status}`);
+    // Google's own error code is kept so `invalid_grant` and a transient 5xx
+    // are never collapsed into one message that only prose can distinguish.
+    throw new GmailTokenError(
+      payload.error_description ?? payload.error ?? `Google token endpoint returned ${response.status}`,
+      { code: payload.error ?? null, status: response.status },
+    );
   }
   return payload;
 }
@@ -276,16 +293,36 @@ async function accessToken(): Promise<string> {
   const row = one<GmailAccount>("SELECT * FROM gmail_accounts WHERE id = 1");
   if (!row) throw new Error("Gmail is not connected.");
   if (new Date(row.expires_at).getTime() > Date.now() + 60_000) return decrypt(row.access_token);
-  if (!row.refresh_token) throw new Error("Gmail refresh token is missing. Reconnect the account.");
+  if (!row.refresh_token) {
+    throw new GmailProfileError(
+      "config",
+      "Gmail has no stored refresh token. Reconnect the account so sending does not depend on an expiring access token.",
+      null,
+    );
+  }
   let payload: Awaited<ReturnType<typeof tokenRequest>>;
   try {
     payload = await tokenRequest({ refresh_token: decrypt(row.refresh_token), grant_type: "refresh_token" });
   } catch (cause) {
-    const message = cause instanceof Error ? cause.message : "";
-    if (/invalid_grant|expired|revoked|invalid refresh/i.test(message)) {
-      throw new Error("Gmail authorisation expired or was revoked. Reconnect Gmail to continue.");
+    if (cause instanceof GmailProfileError) throw cause;
+    if (cause instanceof GmailTokenError) {
+      throw gmailTokenRefreshError(cause.status, cause.code, cause.message);
     }
-    throw cause;
+    const message = cause instanceof Error ? cause.message : "";
+    // A missing or undecryptable stored token is a configuration fault that a
+    // retry cannot fix; everything else here is a network/Google-side condition.
+    if (/decrypt|token format|APP_SECRET_KEY|unable to authenticate/i.test(message)) {
+      throw new GmailProfileError(
+        "config",
+        `Gmail stored credentials cannot be used: ${message}. Reconnect the account.`,
+        null,
+      );
+    }
+    throw new GmailProfileError(
+      "transient",
+      `Gmail token refresh could not reach Google${message ? ` (${message.slice(0, 160)})` : ""}. This is a transient network condition; the outbox retries it automatically and no reconnection is required yet.`,
+      null,
+    );
   }
   const expiresAt = new Date(Date.now() + (payload.expires_in ?? 3600) * 1000).toISOString();
   run("UPDATE gmail_accounts SET access_token = ?, expires_at = ? WHERE id = 1", [encrypt(payload.access_token as string), expiresAt]);
@@ -664,11 +701,17 @@ function draftEmail(to: string, subject: string, body: string) {
   return Buffer.from(message, "utf8").toString("base64url");
 }
 
-function sendFailure(recipient: string, status: GmailTestStatus, detail: string): GmailTestResult {
+function sendFailure(
+  recipient: string,
+  status: GmailTestStatus,
+  detail: string,
+  failureCode: string | null,
+): GmailTestResult {
   return {
     provider: "gmail",
     recipientMasked: maskEmail(recipient),
     status,
+    failureCode,
     messageId: null,
     threadId: null,
     delivery: null,
@@ -724,8 +767,17 @@ export async function gmailSendReadiness(): Promise<GmailSendReadiness> {
       email: profile.emailAddress,
     };
   } catch (cause) {
-    if (cause instanceof GmailProfileError && cause.kind === "scope") {
-      return { ok: false, code: "permission_denied", detail: cause.message, email: row.email };
+    if (cause instanceof GmailProfileError) {
+      if (cause.kind === "scope") {
+        return { ok: false, code: "permission_denied", detail: cause.message, email: row.email };
+      }
+      if (cause.kind === "transient") {
+        return { ok: false, code: "transient", detail: cause.message, email: row.email };
+      }
+      if (cause.kind === "api_disabled") {
+        return { ok: false, code: "missing_configuration", detail: cause.message, email: row.email };
+      }
+      return { ok: false, code: "authentication_failed", detail: cause.message, email: row.email };
     }
     return {
       ok: false,
@@ -784,6 +836,37 @@ export async function verifyGmailSentMessage(
     detail: "The message was not found in the connected mailbox's Sent label.",
     checkedAt,
   };
+}
+
+/**
+ * Find a manually sent outreach message in Gmail's Sent label. The query is
+ * constrained by recipient, exact subject and a lower time bound; a draft or
+ * inbox copy can never satisfy it.
+ */
+export async function findGmailSentOutreach(input: {
+  to: string;
+  subject: string;
+  after: string;
+}): Promise<{ id: string; threadId: string | null; labels: string[] } | null> {
+  try {
+    const afterSeconds = Math.floor(new Date(input.after).getTime() / 1000) - 86_400;
+    const query = encodeURIComponent(
+      `label:sent to:${input.to} subject:"${input.subject.replace(/["\r\n]/g, " ").slice(0, 180)}" after:${afterSeconds}`,
+    );
+    const listed = await gmailFetch<{ messages?: Array<{ id: string }> }>(`/messages?maxResults=10&q=${query}`);
+    for (const candidate of listed.messages ?? []) {
+      const message = await gmailFetch<{ id?: string; threadId?: string; labelIds?: string[] }>(
+        `/messages/${encodeURIComponent(candidate.id)}?format=minimal`,
+      );
+      const labels = message.labelIds ?? [];
+      if (message.id && labels.includes("SENT")) {
+        return { id: message.id, threadId: message.threadId ?? null, labels };
+      }
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 export async function findGmailSentByRfcMessageId(
@@ -878,18 +961,30 @@ export async function sendGmailEmail(
   options: { html?: string | null; rfcMessageId?: string | null; from?: string | null; verifySentFolder?: boolean; inspectBounce?: boolean } = {},
 ): Promise<GmailTestResult> {
   const recipient = to.trim();
-  if (!validRecipient(recipient)) return sendFailure(recipient, "invalid_recipient", "Enter a valid notification email address.");
+  if (!validRecipient(recipient)) {
+    return sendFailure(recipient, "invalid_recipient", "Enter a valid notification email address.", "invalid_recipient");
+  }
 
   const missing = gmailMissing();
-  if (missing.length > 0) return sendFailure(recipient, "missing_configuration", `Gmail is not ready: ${missing.join(" ")}`);
+  if (missing.length > 0) {
+    return sendFailure(recipient, "missing_configuration", `Gmail is not ready: ${missing.join(" ")}`, "missing_configuration");
+  }
 
   const account = accountStatus();
-  if (!account.connected) return sendFailure(recipient, "missing_configuration", "Gmail is not connected. Connect the mailbox from Admin → Email.");
+  if (!account.connected) {
+    return sendFailure(
+      recipient,
+      "missing_configuration",
+      "Gmail is not connected. Connect the mailbox from Admin → Email.",
+      "missing_configuration",
+    );
+  }
   if (account.needsReconnect) {
     return sendFailure(
       recipient,
       "permission_denied",
       `Gmail is missing required permissions: ${account.missingScopes.map((scope) => scope.split("/").pop()).join(", ")}. Reconnect Gmail and approve read, draft and send access.`,
+      gmailFailureCode("scope"),
     );
   }
 
@@ -907,7 +1002,14 @@ export async function sendGmailEmail(
       method: "POST",
       body: JSON.stringify({ raw: mime.raw }),
     });
-    if (!sent?.id) return sendFailure(recipient, "unverified", "Gmail returned a successful response without a message ID. Delivery cannot be confirmed.");
+    if (!sent?.id) {
+      return sendFailure(
+        recipient,
+        "unverified",
+        "Gmail returned a successful response without a message ID. Delivery cannot be confirmed.",
+        "unverified_without_message_id",
+      );
+    }
     const observation = options.verifySentFolder === false
       ? null
       : await verifyGmailSentMessage(sent.id, mime.rfcMessageId).catch(() => null);
@@ -918,6 +1020,7 @@ export async function sendGmailEmail(
       provider: "gmail",
       recipientMasked: maskEmail(recipient),
       status: "accepted",
+      failureCode: null,
       messageId: sent.id,
       threadId: sent.threadId ?? null,
       delivery: "unverified",
@@ -937,17 +1040,27 @@ export async function sendGmailEmail(
       at: nowIso(),
     };
   } catch (cause) {
+    const message = cause instanceof Error ? cause.message.slice(0, 500) : "Gmail send failed.";
     if (cause instanceof GmailProfileError) {
-      if (cause.kind === "expired") return sendFailure(recipient, "authentication_failed", cause.message);
-      if (cause.kind === "scope") return sendFailure(recipient, "permission_denied", cause.message);
-      if (cause.kind === "api_disabled") return sendFailure(recipient, "missing_configuration", cause.message);
-      return sendFailure(recipient, "api_error", cause.message);
+      const failureCode = gmailFailureCode(cause.kind);
+      // A rejected access token or a dead refresh grant needs a human
+      // reconnection. A transient refresh failure is retryable and is reported
+      // as an API error so the outbox schedules it instead of blocking it.
+      if (cause.kind === "expired" || cause.kind === "invalid_grant" || cause.kind === "config") {
+        return sendFailure(recipient, "authentication_failed", message, failureCode);
+      }
+      if (cause.kind === "transient") return sendFailure(recipient, "api_error", message, failureCode);
+      if (cause.kind === "scope") return sendFailure(recipient, "permission_denied", message, failureCode);
+      if (cause.kind === "api_disabled") return sendFailure(recipient, "missing_configuration", message, failureCode);
+      return sendFailure(recipient, "api_error", message, failureCode);
     }
-    const message = cause instanceof Error ? cause.message : "Gmail send failed.";
-    if (/invalid_grant|expired|revoked|refresh token|authorisation|decrypt|unable to authenticate|stored gmail token/i.test(message)) {
-      return sendFailure(recipient, "authentication_failed", message.slice(0, 500));
+    if (/invalid_grant|expired|revoked|decrypt|unable to authenticate|stored gmail token/i.test(message)) {
+      return sendFailure(recipient, "authentication_failed", message, "invalid_grant");
     }
-    return sendFailure(recipient, "api_error", message.slice(0, 500));
+    if (/fetch failed|timed? ?out|ECONNRESET|ENOTFOUND|socket|aborted|HTTP 5\d\d|HTTP 429/i.test(message)) {
+      return sendFailure(recipient, "api_error", message, "refresh_transient");
+    }
+    return sendFailure(recipient, "api_error", message, "api_error");
   }
 }
 
@@ -1006,6 +1119,168 @@ export async function runGmailTestEmail(to: string, userId?: string | null): Pro
       .slice(0, 1000),
   });
   return result;
+}
+
+export type GmailOutreachDraftResult = {
+  draftId: string;
+  messageId: string | null;
+  threadId: string | null;
+  rfcMessageId: string;
+};
+
+/**
+ * Create a real Gmail draft with the validated CV and cover letter attached.
+ * Draft creation is never a send, and the caller still has to store the draft
+ * ID and reconcile any later owner send explicitly.
+ */
+export async function createGmailDraftWithAttachments(input: {
+  to: string;
+  subject: string;
+  body: string;
+  attachments: OutreachAttachment[];
+}): Promise<GmailOutreachDraftResult> {
+  if (!validRecipient(input.to)) throw new Error("The verified recipient is not a valid email address.");
+  const account = accountStatus();
+  if (!account.connected) throw new Error("Gmail is not connected; no outreach draft was created.");
+  if (account.needsReconnect) throw new Error("Gmail must be reconnected before creating an outreach draft.");
+  const from = account.email ?? "";
+  const mime = buildOutreachMime({
+    from,
+    to: input.to,
+    subject: input.subject,
+    text: input.body,
+    attachments: input.attachments,
+  });
+  const created = await gmailFetch<{ id?: string; message?: { id?: string; threadId?: string } }>("/drafts", {
+    method: "POST",
+    body: JSON.stringify({ message: { raw: mime.raw } }),
+  });
+  if (!created.id) throw new Error("Gmail did not return a draft id.");
+  return {
+    draftId: created.id,
+    messageId: created.message?.id ?? null,
+    threadId: created.message?.threadId ?? null,
+    rfcMessageId: mime.rfcMessageId,
+  };
+}
+
+/** Replaces the content of an existing draft; it never creates a second draft. */
+export async function updateGmailDraftWithAttachments(
+  draftId: string,
+  input: { to: string; subject: string; body: string; attachments: OutreachAttachment[] },
+): Promise<GmailOutreachDraftResult> {
+  if (!validRecipient(input.to)) throw new Error("The verified recipient is not a valid email address.");
+  const account = accountStatus();
+  if (!account.connected) throw new Error("Gmail is not connected; no draft was updated.");
+  if (account.needsReconnect) throw new Error("Gmail must be reconnected before updating an outreach draft.");
+  const mime = buildOutreachMime({
+    from: account.email ?? "",
+    to: input.to,
+    subject: input.subject,
+    text: input.body,
+    attachments: input.attachments,
+  });
+  const updated = await gmailFetch<{ id?: string; message?: { id?: string; threadId?: string } }>(
+    `/drafts/${encodeURIComponent(draftId)}`,
+    { method: "PUT", body: JSON.stringify({ message: { raw: mime.raw } }) },
+  );
+  if (!updated.id) throw new Error("Gmail did not return the updated draft.");
+  return {
+    draftId: updated.id,
+    messageId: updated.message?.id ?? null,
+    threadId: updated.message?.threadId ?? null,
+    rfcMessageId: mime.rfcMessageId,
+  };
+}
+
+export type GmailDraftInspection = {
+  exists: boolean;
+  draftId: string;
+  messageId: string | null;
+  threadId: string | null;
+  subject: string | null;
+  to: string | null;
+  attachmentNames: string[];
+  /** Gmail labels on the draft message. A DRAFT label without SENT is unsent. */
+  labelIds: string[];
+  /** Decoded text/plain body, so the stored wording can be read back. */
+  bodyText: string | null;
+  detail: string;
+};
+
+type GmailMimePart = {
+  filename?: string;
+  mimeType?: string;
+  body?: { data?: string; size?: number };
+  headers?: Array<{ name: string; value: string }>;
+  parts?: GmailMimePart[];
+};
+
+function headerValue(part: GmailMimePart | undefined, name: string): string | null {
+  return part?.headers?.find((header) => header.name.toLowerCase() === name.toLowerCase())?.value ?? null;
+}
+
+function collectAttachmentNames(part: GmailMimePart | undefined, names: string[]): void {
+  if (!part) return;
+  if (part.filename) names.push(part.filename);
+  for (const child of part.parts ?? []) collectAttachmentNames(child, names);
+}
+
+function decodeBase64Url(data: string): string {
+  return Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+}
+
+function collectPlainText(part: GmailMimePart | undefined, sink: string[]): void {
+  if (!part) return;
+  if (part.mimeType === "text/plain" && part.body?.data) sink.push(decodeBase64Url(part.body.data));
+  for (const child of part.parts ?? []) collectPlainText(child, sink);
+}
+
+/**
+ * Reads one draft back from the mailbox. This is the only proof that a stored
+ * draft id still exists: a local row alone is not evidence.
+ */
+export async function inspectGmailDraft(draftId: string): Promise<GmailDraftInspection> {
+  const empty: GmailDraftInspection = {
+    exists: false,
+    draftId,
+    messageId: null,
+    threadId: null,
+    subject: null,
+    to: null,
+    attachmentNames: [],
+    labelIds: [],
+    bodyText: null,
+    detail: "",
+  };
+  try {
+    const draft = await gmailFetch<{
+      id?: string;
+      message?: { id?: string; threadId?: string; labelIds?: string[]; payload?: GmailMimePart };
+    }>(`/drafts/${encodeURIComponent(draftId)}?format=full`);
+    if (!draft.id) throw new Error("Gmail returned no draft for that id.");
+    const attachmentNames: string[] = [];
+    collectAttachmentNames(draft.message?.payload, attachmentNames);
+    const textParts: string[] = [];
+    collectPlainText(draft.message?.payload, textParts);
+    return {
+      exists: true,
+      draftId: draft.id,
+      messageId: draft.message?.id ?? null,
+      threadId: draft.message?.threadId ?? null,
+      subject: headerValue(draft.message?.payload, "Subject"),
+      to: headerValue(draft.message?.payload, "To"),
+      attachmentNames,
+      labelIds: draft.message?.labelIds ?? [],
+      bodyText: textParts.length > 0 ? textParts.join("\n") : null,
+      detail: "Draft was read back from the connected Gmail mailbox.",
+    };
+  } catch (error) {
+    return {
+      ...empty,
+      detail: error instanceof Error ? error.message.slice(0, 400) : "Gmail draft inspection failed.",
+    };
+  }
 }
 
 export async function createDraft(emailId: string, draftBody: string): Promise<void> {

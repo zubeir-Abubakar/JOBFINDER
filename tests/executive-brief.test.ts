@@ -268,7 +268,7 @@ test("the Coordinator queues exactly one persisted copy per local day", async ()
   });
   assert.equal(sent.sent, 1);
   const history = brief.executiveBriefHistory();
-  assert.equal(history[0]?.delivery_status, "accepted_by_gmail");
+  assert.equal(history[0]?.delivery_status, "accepted_by_provider");
   assert.equal(history[0]?.provider_message_id, "brief-test-id");
   notifications.stopNotificationQueue();
 });
@@ -292,7 +292,7 @@ test("a missing dashboard URL omits the CTA but does not block the brief", async
     send: async () => ({ messageId: "brief-no-url-id", threadId: "brief-no-url-thread" }),
   });
   const history = brief.executiveBriefHistory();
-  assert.equal(history[0]?.delivery_state, "accepted_by_gmail");
+  assert.equal(history[0]?.delivery_state, "accepted_by_provider");
   notifications.stopNotificationQueue();
 });
 

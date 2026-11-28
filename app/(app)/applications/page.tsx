@@ -123,6 +123,7 @@ export default async function ApplicationsPage({
         actions={
           <>
             <a href="/api/export/applications" className="btn"><Icon name="docs" /> Export CSV</a>
+            <Link href="/handoff" className="btn"><Icon name="mail" /> Email handoffs</Link>
             <Link href="/jobs" className="btn btn-primary">Find vacancies</Link>
           </>
         }

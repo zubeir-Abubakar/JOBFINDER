@@ -113,7 +113,7 @@ export function agentAvailability(key: string): AgentAvailability {
         restriction: "email_access",
         dependency: "Gmail OAuth",
         reason:
-          "Gmail is not connected. In-app tracking and report preparation remain available; mailbox scanning, drafts and sending are blocked until Gmail is connected.",
+          "Gmail is not connected. In-app tracking and report preparation remain available; mailbox scanning, recruiter-reply matching and drafts are blocked until Gmail is connected. Notification email is sent by Resend and is unaffected.",
         cause: "configuration",
       };
     }

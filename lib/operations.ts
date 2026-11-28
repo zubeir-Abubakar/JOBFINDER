@@ -7,7 +7,8 @@ import { evaluateAiPolicy } from "./ai-spending-policy";
 import { getRecruitmentPolicy, dailySubmissionUsage } from "./recruitment-policy";
 import { formatInZone, scheduleSnapshot } from "./recruitment-schedule";
 import { sourceHealth } from "./recruitment-discovery";
-import { accountStatus, gmailMissing } from "./gmail";
+import { accountStatus } from "./gmail";
+import { resendConfig, resendConfigured, resendMissing, senderAddress } from "./resend";
 import { getSetting } from "./settings";
 import { effectiveVoiceProfileForAgent } from "./agent-voice-settings";
 import { capabilitiesForAgent, permissionBrief, type AgentCapability } from "./agent-capabilities";
@@ -193,7 +194,7 @@ export type OperationalSnapshot = {
     openInterventions: number;
     failedTasksToday: number;
     recentErrors: Array<{ agentKey: string; title: string; error: string | null; at: string }>;
-    notificationProvider: { provider: "gmail"; connected: boolean; configured: boolean; detail: string; lastSyncAt: string | null; lastAcceptedAt: string | null; lastError: string | null };
+    notificationProvider: { provider: "resend"; connected: boolean; configured: boolean; detail: string; lastSyncAt: string | null; lastAcceptedAt: string | null; lastError: string | null };
     backup: { enabled: boolean; lastBackupAt: string | null; status: "healthy" | "stale" | "never" | "disabled"; detail: string };
   };
   permissions: {
@@ -265,8 +266,7 @@ function latestUsage(): Map<string, { last: UsageRow; success: UsageRow | null; 
   return map;
 }
 
-function startOfToday(): string {
-  const now = new Date();
+function startOfToday(now: Date = new Date()): string {
   const start = new Date(now);
   start.setHours(0, 0, 0, 0);
   return start.toISOString();
@@ -330,7 +330,10 @@ function currentStatus(row: { enabled: number; status: string }, availability: {
   return "idle";
 }
 
-export async function getOperationalSnapshot(options: { forceHealth?: boolean } = {}): Promise<OperationalSnapshot> {
+export async function getOperationalSnapshot(
+  options: { forceHealth?: boolean; now?: Date } = {},
+): Promise<OperationalSnapshot> {
+  const currentTime = options.now ?? new Date();
   const health = await providerHealth(Boolean(options.forceHealth));
   const tasks = latestTasks();
   const usage = latestUsage();
@@ -344,7 +347,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   const byAgentToday = all<{ agent_key: string; tokens: number; requests: number }>(
     `SELECT agent_key, COALESCE(SUM(total_tokens), 0) AS tokens, COUNT(*) AS requests
      FROM provider_usage WHERE created_at >= ? GROUP BY agent_key ORDER BY tokens DESC`,
-    [startOfToday()],
+    [startOfToday(currentTime)],
   );
   const byAgentMap = new Map(byAgentToday.map((row) => [row.agent_key, row]));
   const retryToday = new Map(
@@ -352,7 +355,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
       `SELECT agent_key, COUNT(*) AS attempts FROM provider_usage
        WHERE status = 'error' AND source = 'task' AND created_at >= ?
        GROUP BY agent_key`,
-      [startOfToday()],
+      [startOfToday(currentTime)],
     ).map((row) => [row.agent_key, Number(row.attempts)]),
   );
   const fallbackRows = all<UsageRow>(
@@ -361,7 +364,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
      FROM provider_usage
      WHERE provider = 'ollama' AND status = 'ok' AND created_at >= ?
      ORDER BY id DESC LIMIT 240`,
-    [startOfToday()],
+    [startOfToday(currentTime)],
   );
   const fallbackHistory = new Map<string, OperationalAgent["fallbackHistory"]>();
   for (const row of fallbackRows) {
@@ -372,7 +375,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   const byProvider = all<{ provider: string; tokens: number; requests: number }>(
     `SELECT provider, COALESCE(SUM(total_tokens), 0) AS tokens, COUNT(*) AS requests
      FROM provider_usage WHERE created_at >= ? GROUP BY provider ORDER BY tokens DESC`,
-    [startOfToday()],
+    [startOfToday(currentTime)],
   );
   const route = providerStatusSnapshot();
   const configured = configuredTextProvider();
@@ -438,7 +441,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   const active = agents.filter((agent) => ["working", "thinking", "waiting"].includes(agent.status)).length;
   const idle = agents.filter((agent) => agent.status === "idle").length;
 
-  const tokensToday = tokenTotals();
+  const tokensToday = tokenTotals("created_at >= ?", [startOfToday(currentTime)]);
   const lastUsage = one<{ provider: string; model: string; prompt_tokens: number; completion_tokens: number; total_tokens: number; created_at: string }>(
     "SELECT provider, model, prompt_tokens, completion_tokens, total_tokens, created_at FROM provider_usage WHERE provider IN ('freellmapi','ollama','gemini') ORDER BY id DESC LIMIT 1",
   );
@@ -516,14 +519,13 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
   });
 
   const failedTasks = all<{ agent_key: string; title: string; error: string | null; created_at: string }>(
-    "SELECT agent_key, title, error, created_at FROM tasks WHERE status = 'failed' ORDER BY created_at DESC LIMIT 8",
+    "SELECT agent_key, title, error, created_at FROM tasks WHERE status = 'failed' AND COALESCE(error_class, '') != 'blocked' ORDER BY created_at DESC LIMIT 8",
   );
   const failedToday = one<{ c: number }>(
-    "SELECT COUNT(*) AS c FROM tasks WHERE status = 'failed' AND created_at >= ?",
-    [startOfToday()],
+    "SELECT COUNT(*) AS c FROM tasks WHERE status = 'failed' AND COALESCE(error_class, '') != 'blocked' AND created_at >= ?",
+    [startOfToday(currentTime)],
   )?.c ?? 0;
   const gmail = accountStatus();
-  const gmailIssues = gmailMissing();
   const backupSetting = getSetting<{ enabled?: boolean; last_backup_at?: string | null }>("backup", { enabled: true, last_backup_at: null });
   const backupEnabled = backupSetting.enabled !== false;
   const backupAge = backupSetting.last_backup_at ? Date.now() - Date.parse(backupSetting.last_backup_at) : Number.POSITIVE_INFINITY;
@@ -546,11 +548,19 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
           ? "The last recorded backup is older than seven days."
           : "A backup was recorded within the last seven days.",
   };
+  // Outbound notification email is owned by Resend. Gmail remains the mailbox
+  // integration for reading employer replies and approval-gated drafts, so its
+  // connection state is reported separately and no longer blocks delivery.
+  const resendIssues = resendMissing();
   const notificationProvider = {
-    provider: "gmail" as const,
-    connected: gmail.connected,
-    configured: gmail.enabled && gmailIssues.length === 0,
-    detail: !gmail.enabled ? "Gmail is disabled." : gmail.connected ? "Gmail account connected for reading, drafts and notification delivery." : "Gmail is not connected.",
+    provider: "resend" as const,
+    connected: resendConfigured(),
+    configured: notificationQueue.configured,
+    detail: (() => {
+      if (resendIssues.length > 0) return `Resend is not ready: ${resendIssues.join(" ")}`;
+      const config = resendConfig();
+      return `Resend delivery via ${senderAddress(config.from)}${config.usingTestSender ? " (testing sender; owner-only delivery)" : ""}. Gmail ${gmail.connected ? "is connected for reading and drafts" : "is not connected; inbound mail sync is unavailable and does not affect sending"}.`;
+    })(),
     lastSyncAt: gmail.lastSyncAt,
     lastAcceptedAt: notificationQueue.lastAccepted?.finished_at ?? null,
     lastError: notificationQueue.lastError?.last_error ?? null,
@@ -592,7 +602,7 @@ export async function getOperationalSnapshot(options: { forceHealth?: boolean } 
       : runtime.detail;
 
   return {
-    generatedAt: new Date().toISOString(),
+    generatedAt: currentTime.toISOString(),
     server: { status: "operational", uptimeSeconds: Math.round(process.uptime()), node: process.version, pid: process.pid },
     database: db,
     agents,
@@ -752,8 +762,9 @@ export function operationsBrief(snapshot: OperationalSnapshot): string {
     `Health: ${snapshot.health.status}; ${snapshot.health.detail} Failed tasks today ${snapshot.health.failedTasksToday}. Notification provider: ${snapshot.health.notificationProvider.detail} Backup: ${snapshot.health.backup.status} — ${snapshot.health.backup.detail}`,
     `Latest recruitment run: ${snapshot.recruitment.lastRun ? `${snapshot.recruitment.lastRun.id} ${snapshot.recruitment.lastRun.status}, failures ${snapshot.recruitment.lastRun.failures}, warnings ${snapshot.recruitment.lastRun.warnings}, error ${snapshot.recruitment.lastRun.error ?? "none"}` : "none"}. Recovery pending ${snapshot.recovery.pending}; next retry ${snapshot.nextProviderRetryAt ?? snapshot.recovery.nextRetryAt ?? "none"}.`,
     `Runtime: database ${snapshot.runtime.database.integrity} v${snapshot.runtime.database.schemaVersion}; scheduler worker ${snapshot.runtime.scheduler.worker?.effectiveStatus ?? "missing"}; executive brief ${snapshot.runtime.executiveBrief.last_status ?? "never"} (${snapshot.runtime.executiveBrief.stale ? "tick stale" : "tick fresh"}); workers ${snapshot.runtime.workers.map((worker) => `${worker.name}=${worker.effectiveStatus}`).join(", ") || "none"}; running tasks ${snapshot.runtime.queues.runningTasks.length}; failed tasks today ${snapshot.runtime.agents.failedTasksToday}; notification failures ${snapshot.runtime.recruitment.notificationFailures}; submission failures ${snapshot.runtime.recruitment.submissionFailures}; unknown ${snapshot.runtime.recruitment.submissionUnknown}; last successful inference ${snapshot.runtime.providers.lastSuccessfulInferenceAt ?? "never"}.`,
-    `Notification outbox: pending ${snapshot.notifications.counts.pending}, retry ${snapshot.notifications.counts.retry_scheduled}, Gmail accepted (not delivery-confirmed) ${snapshot.notifications.deliveryCounts.accepted_by_gmail}, Sent-folder observed ${snapshot.notifications.deliveryCounts.sent_folder_observed}, delivery confirmed ${snapshot.notifications.deliveryCounts.delivery_confirmed}, failed ${snapshot.notifications.counts.failed}; last accepted ${snapshot.notifications.lastAccepted?.finished_at ?? "never"}; last error ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
-    `Executive Brief delivery: state=${snapshot.executiveBrief.state}; report=${snapshot.executiveBrief.reportId}; outbox=${snapshot.executiveBrief.outboxId ?? "none"}; gmailMessage=${snapshot.executiveBrief.messageId ?? "none"}; sentFolderObserved=${snapshot.executiveBrief.sentObservedAt ?? "no"}; evidence=${snapshot.executiveBrief.deliveryEvidence ?? "none"}; error=${snapshot.executiveBrief.lastError ?? "none"}. ${deliveryStateMessage(snapshot.executiveBrief.state, snapshot.executiveBrief.lastError ?? snapshot.executiveBrief.detail)}`,
+    `Notification outbox: pending ${snapshot.notifications.counts.pending}, retry ${snapshot.notifications.counts.retry_scheduled}, provider accepted (not delivery-confirmed) ${snapshot.notifications.deliveryCounts.accepted_by_provider + snapshot.notifications.deliveryCounts.accepted_by_gmail}, Sent-folder observed ${snapshot.notifications.deliveryCounts.sent_folder_observed}, delivery confirmed ${snapshot.notifications.deliveryCounts.delivery_confirmed}, failed ${snapshot.notifications.counts.failed}; last accepted ${snapshot.notifications.lastAccepted?.finished_at ?? "never"}; last error ${snapshot.notifications.lastError?.last_error ?? "none"}.`,
+      snapshot.executiveBrief.message,
+      `Executive Brief: report ${snapshot.executiveBrief.reportId}; provider ${snapshot.executiveBrief.provider ?? "not recorded"}; outbox ${snapshot.executiveBrief.outboxId ?? "not created"}; state ${snapshot.executiveBrief.state}; provider message ${snapshot.executiveBrief.messageId ?? "none"}; thread ${snapshot.executiveBrief.threadId ?? "none"}; attempts ${snapshot.executiveBrief.attempts}.`,
     `Permissions: ${snapshot.permissions.summary}`,
   ].join("\n");
 }
@@ -809,12 +820,12 @@ export function answerFromOperations(
   if (/\b(gmail|email|notification|daily report|executive brief|delivery)\b/.test(text) && /\b(sent|delivery|delivered|authenticated|auth|error|status|report|accepted|bounce|queued|folder)\b/.test(text)) {
     const brief = snapshot.executiveBrief;
     return [
-      deliveryStateMessage(brief.state, brief.lastError ?? brief.detail),
-      `Executive Brief: report ${brief.reportId}; outbox ${brief.outboxId ?? "not created"}; state ${brief.state}; Gmail message ${brief.messageId ?? "none"}; thread ${brief.threadId ?? "none"}; attempts ${brief.attempts}.`,
+      brief.message,
+      `Executive Brief: report ${brief.reportId}; provider ${brief.provider ?? "not recorded"}; outbox ${brief.outboxId ?? "not created"}; state ${brief.state}; provider message ${brief.messageId ?? "none"}; thread ${brief.threadId ?? "none"}; attempts ${brief.attempts}.`,
       `Sent-folder verification: ${brief.sentObservedAt ? `observed at ${brief.sentObservedAt} — ${brief.sentVerification ?? "presence recorded"}` : brief.sentVerification ?? "not observed"}. Delivery evidence: ${brief.deliveryEvidence ?? "none"}.`,
       `Last error: ${brief.lastError ?? "none"}. Next retry: ${brief.nextRetryAt ?? "none"}. Bounce evidence: ${brief.bounceInfo ?? "none"}.`,
-      `Gmail: ${snapshot.health.notificationProvider.connected ? "connected" : "not connected"}; OAuth configuration ${snapshot.health.notificationProvider.configured ? "ready" : "incomplete"}. ${snapshot.health.notificationProvider.detail}`,
-      `Outbox: ${snapshot.notifications.counts.pending} pending, ${snapshot.notifications.counts.retry_scheduled} retry scheduled, ${snapshot.notifications.deliveryCounts.accepted_by_gmail} accepted by Gmail (not delivery-confirmed), ${snapshot.notifications.deliveryCounts.sent_folder_observed} Sent-folder observed, ${snapshot.notifications.deliveryCounts.delivery_confirmed} delivery confirmed, ${snapshot.notifications.counts.failed} failed.`,
+      `Email provider: ${snapshot.health.notificationProvider.detail} Delivery configuration ${snapshot.health.notificationProvider.configured ? "ready" : "incomplete"}.`,
+      `Outbox: ${snapshot.notifications.counts.pending} pending, ${snapshot.notifications.counts.retry_scheduled} retry scheduled, ${snapshot.notifications.deliveryCounts.accepted_by_provider} accepted by Resend (not delivery-confirmed), ${snapshot.notifications.deliveryCounts.accepted_by_gmail} legacy Gmail acceptance, ${snapshot.notifications.deliveryCounts.sent_folder_observed} Sent-folder observed, ${snapshot.notifications.deliveryCounts.delivery_confirmed} delivery confirmed, ${snapshot.notifications.counts.failed} failed.`,
     ].join("\n");
   }
 

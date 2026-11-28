@@ -1,4 +1,5 @@
 node_modules/
+.agent-reach/
 .next/
 out/
 data/

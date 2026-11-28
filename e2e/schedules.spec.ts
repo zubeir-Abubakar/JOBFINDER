@@ -43,6 +43,15 @@ test.afterAll(() => {
 });
 
 test("the two cards show the saved Monday–Sunday 12:00 default and change independently", async ({ page, diagnostics }) => {
+  // Retries reuse the E2E database, and the previous failed/successful test may
+  // have saved a different schedule. Reset this test's own rows so the default
+  // assertion is independent of both previous projects and prior attempts.
+  execute(
+    "UPDATE schedule_jobs SET time = '12:00', timezone = 'Europe/Zurich', enabled = 1, weekdays = '[1,2,3,4,5,6,7]' WHERE key = 'daily_recruitment'",
+  );
+  execute(
+    "UPDATE schedule_jobs SET time = '16:00', timezone = 'Europe/Zurich', enabled = 1, weekdays = '[1,2,3,4,5]' WHERE key = 'daily_executive_brief'",
+  );
   await gotoReady(page, "/settings#scheduling");
   const recruitment = page.getByTestId("recruitment-schedule-card");
   const report = page.getByTestId("report-schedule-card");
@@ -66,7 +75,7 @@ test("the two cards show the saved Monday–Sunday 12:00 default and change inde
     "SELECT key, time, timezone, enabled, weekdays, next_run_at, last_scheduled_for FROM schedule_jobs WHERE key = 'daily_recruitment'",
   );
   expect(savedRecruitment?.time).toBe("07:30");
-  expect(JSON.parse(savedRecruitment?.weekdays ?? "[]")).toEqual([2, 3, 4, 5, 6]);
+  expect(JSON.parse(savedRecruitment?.weekdays ?? "[]")).toEqual([2, 3, 4, 5, 6, 7]);
   expect(savedRecruitment?.timezone).toBe("Europe/Zurich");
 
   // The report card was not touched.
@@ -110,7 +119,7 @@ test("the two cards show the saved Monday–Sunday 12:00 default and change inde
     "SELECT key, time, timezone, enabled, weekdays, next_run_at, last_scheduled_for FROM schedule_jobs WHERE key = 'daily_recruitment'",
   );
   expect(recruitmentUnchanged?.time).toBe("07:30");
-  expect(JSON.parse(recruitmentUnchanged?.weekdays ?? "[]")).toEqual([2, 3, 4, 5, 6]);
+  expect(JSON.parse(recruitmentUnchanged?.weekdays ?? "[]")).toEqual([2, 3, 4, 5, 6, 7]);
 
   diagnostics.assertClean();
 });

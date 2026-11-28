@@ -74,8 +74,8 @@ A localhost endpoint works only while `npm run dev` or `npm run start` and Ollam
 ## Implementation status
 
 **Implemented and tested** — persistent recruitment schedule (one automated run
-per day, Monday–Sunday at 12:00 Europe/Zurich) with DST handling, a single
-catch-up window and missed-run records;
+per day, Monday–Sunday at 12:00 Europe/Zurich) with DST handling, a short
+ticker tolerance and explicit missed-occurrence records that are never replayed;
 the Chief Coordinator run with
 its ten-section report and agent assignments; deterministic eligibility rules;
 the 85% floor; tailored CV and cover-letter generation; the ATS/quality gate;
@@ -105,7 +105,7 @@ application has been submitted to a real employer.
 - Gmail sending is never automatic: drafts require the explicit **Approve & send** action, and the Gmail account must be connected first. The configured redirect URI must be replaced with a real Google Cloud callback.
 - Job discovery uses public, key-free feeds: Arbeitnow, Ashby job boards, Greenhouse job boards, Lever sites and employer pages that publish schema.org `JobPosting` JSON-LD. Ashby boards, Greenhouse boards, Lever sites and career-page URLs must be configured; jobs.ch is not scraped (terms of use). No vacancy is invented.
 - The assistant can converse naturally, but it cannot invent workspace facts and does not claim an action succeeded without a backend result. Its workspace actions remain deterministic. Eligible applications are submitted autonomously; only genuine blockers (CAPTCHA, MFA, unsupported portals, missing mandatory information, ambiguous declarations) enter the Human Intervention Queue. The owner-level pause switch remains available.
-- The daily run is started by an in-process scheduler while the application is running, and the same tick is exposed at `GET/POST /api/cron/recruitment` for a host cron. A switched-off machine cannot run it; a run outside the catch-up window is recorded as missed instead of being executed late. A restart marks interrupted workflow steps failed and pauses the run so it can be resumed.
+- The daily run is started by an in-process scheduler while the application is running, and the same tick is exposed at `GET/POST /api/cron/recruitment` for a host cron. A switched-off machine cannot run it; an occurrence the process was not running for is recorded as missed with its scheduled timestamp and reason, and is never executed late as a catch-up run. A restart marks interrupted workflow steps failed and pauses the run so it can be resumed.
 - API throttling is durable across processes sharing the SQLite file, but it is not a distributed limiter for horizontal scaling.
 - TOTP MFA is available per account but is not forced by policy. Enrol both the owner and administrator and store recovery codes offline before exposing the workspace.
 
@@ -174,8 +174,9 @@ not run and consume no scheduled inference tokens.
   is marked as submitted.
 - The scheduler runs inside this application. The Mac and the app/worker must be
   running at the configured recruitment time (default 12:00 Europe/Zurich,
-  Monday–Sunday). The database keeps the schedule and records a missed run
-  instead of silently skipping it; catch-up never adds a second run. For a future
+  Monday–Sunday). The database keeps the schedule; an occurrence the process was
+  not running for is recorded as missed, never replayed late and never
+  compensated by a second execution. For a future
   Vercel deployment the
   same tick is available at `GET/POST /api/cron/recruitment` (send
   `Authorization: Bearer $CRON_SECRET` when `CRON_SECRET` is set).
@@ -191,7 +192,7 @@ not run and consume no scheduled inference tokens.
 | `RECRUITMENT_SUBMISSION_ENDPOINT` | Form endpoint; placeholders `{job_id}`, `{application_url}`, `{company}`. |
 | `RECRUITMENT_SUBMISSION_ENABLED` | `false` disables automatic sending. |
 | `RECRUITMENT_DRY_RUN` | `true` prepares and verifies but sends nothing. |
-| `RECRUITMENT_CATCHUP_HOURS` | Catch-up window before a run is recorded as missed (default 6). |
+| `RECRUITMENT_CATCHUP_HOURS` | Recovery window for the daily report schedule only (default 6). Recruitment occurrences are never replayed. |
 | `RECRUITMENT_SCHEDULER` | `false` disables the in-process tick (and the daily executive brief tick). |
 
 `npx tsx --test tests/recruitment.test.ts` covers the DST-correct schedule,

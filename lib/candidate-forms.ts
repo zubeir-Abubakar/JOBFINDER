@@ -26,6 +26,12 @@ export type CandidateField = {
   accept: string | null;
   /** Preserved value for hidden inputs (CSRF tokens, form ids). */
   value: string | null;
+  /**
+   * Visible caption of the surrounding field wrapper, read without the control's
+   * own placeholder. Upload widgets often share one placeholder text; the
+   * wrapper caption is the only real evidence of which document belongs there.
+   */
+  context?: string;
 };
 
 export type CandidateQuestion = {
@@ -71,6 +77,8 @@ export type CandidateFormPlan = {
   questions: CandidateQuestion[];
   blockers: string[];
   cookies: string | null;
+  /** Separates a real form CAPTCHA from a transport-level challenge. */
+  externalRequirement?: string;
 };
 
 export type CandidateFormResult = {
@@ -145,10 +153,25 @@ export function detectSecurity(html: string): string | null {
   return null;
 }
 
+/**
+ * A dynamic ATS often builds its form inside a JavaScript string. That markup
+ * is not a server-rendered form: its action can be a concatenation fragment
+ * such as `' + "/ats/apply"`, and posting to it produces a real 404. Ignore
+ * script, style and comment content when deciding whether the page has a
+ * static form. The Playwright executor handles the hydrated form afterwards.
+ */
+function markupOnly(html: string): string {
+  return html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, "")
+    .replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, "");
+}
+
 function parseForms(html: string): Array<{ attrs: Record<string, string>; body: string }> {
   const forms: Array<{ attrs: Record<string, string>; body: string }> = [];
   const re = /<form\b([^>]*)>([\s\S]*?)<\/form>/gi;
-  for (const match of html.matchAll(re)) {
+  for (const match of markupOnly(html).matchAll(re)) {
     forms.push({ attrs: attributes(match[1]), body: match[2] });
   }
   return forms;
@@ -239,10 +262,17 @@ function parseFields(formHtml: string): CandidateField[] {
 }
 
 export function categoryFor(field: CandidateField): string {
-  const text = normalise(`${field.name} ${field.label} ${field.type} ${field.accept ?? ""}`);
+  const text = normalise(`${field.name} ${field.label} ${field.context ?? ""} ${field.type} ${field.accept ?? ""}`);
   if (field.type === "file") {
-    if (/cover|motivation|anschreiben/.test(text)) return "cover_file";
-    if (/resume|curriculum|\bcv\b|lebenslauf|attachment|upload/.test(text)) return "cv_file";
+    const cover = /cover|motivation|anschreiben/.test(text);
+    const cv = /resume|curriculum|\bcv\b|lebenslauf/.test(text);
+    // Text that names both documents does not identify either one.
+    if (cover && !cv) return "cover_file";
+    if (cv && !cover) return "cv_file";
+    if (cover && cv) return "unknown_file";
+    // A shared "Drop your files here to upload" placeholder is not evidence of
+    // which document a field accepts. It stays unknown instead of being filled
+    // with the CV by default.
     return "unknown_file";
   }
   if (/salary|compensation|remuneration|desired pay|gehalt|pay expectation/.test(text)) return "salary";
@@ -269,12 +299,29 @@ export function categoryFor(field: CandidateField): string {
   return "unknown";
 }
 
+/**
+ * An answer the owner typed for this exact question. Keys may be the field name,
+ * the field label or the category; the stored intervention answer uses the field
+ * name, so both a rendered DOM name and a human label must match.
+ */
+function ownerAnswer(authorised: Record<string, string>, field: CandidateField): string | null {
+  const keys = [field.name, field.label]
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  for (const key of keys) {
+    const value = authorised[key];
+    if (value?.trim()) return value.trim();
+  }
+  return null;
+}
+
 function authorisedValue(authorised: Record<string, string>, category: string): string | null {
   const aliases: Record<string, string[]> = {
     salary: ["salary", "salary_expectation", "expected_salary"],
     notice: ["notice", "notice_period", "availability"],
     relocation: ["relocation", "willing_to_relocate"],
     legal: ["legal", "legal_declaration", "declaration"],
+    referral: ["referral", "referral_source", "source"],
   };
   for (const key of aliases[category] ?? [category]) {
     const value = authorised[key];
@@ -335,6 +382,17 @@ export function answerFor(
     return { ...base, action: "answer", answer: String(value), reason };
   };
 
+  // A country control is answerable from the verified location only. If the
+  // stored location has no country, the field stays unanswered rather than
+  // guessing a jurisdiction.
+  if (category === "country" || /^country\b/i.test(field.label)) {
+    const location = profile.location?.trim() ?? "";
+    const parts = location.split(",").map((part) => part.trim()).filter(Boolean);
+    const last = parts.length > 1 ? parts[parts.length - 1] : location;
+    const known = /^(switzerland|schweiz|suisse|svizzera|liechtenstein)$/i.test(last) ? last : null;
+    return answer(known, "Country derived from the verified profile location.");
+  }
+
   if (["salary", "notice", "relocation", "legal"].includes(category)) {
     const allowed = authorisedValue(authorised, category);
     if (allowed) return answer(allowed, "Previously authorised answer supplied by the owner.");
@@ -379,8 +437,20 @@ export function answerFor(
       return answer(profile.summary, "Professional summary from the verified profile.");
     case "skills":
       return answer(profile.skills.join(", "), "Skills from the verified profile.");
-    case "languages":
+    case "languages": {
+      // A single-select language field accepts one option. Prefer a verified
+      // language that actually exists on the form instead of sending the whole
+      // joined profile, which no option can match.
+      if (field.options.length > 0) {
+        for (const language of profile.languages) {
+          const selected = matchOption(field, language);
+          if (selected) {
+            return { ...base, action: "answer", answer: selected, reason: `Verified profile language: ${language}.` };
+          }
+        }
+      }
       return answer(profile.languages.join(", "), "Languages from the verified profile.");
+    }
     case "experience":
       return answer(profile.experienceText, "Employment history from the verified profile.");
     case "education":
@@ -389,12 +459,26 @@ export function answerFor(
       return answer(documents.cv ? documents.cv.name : null, "Tailored CV file.");
     case "cover_file":
       return answer(documents.cover ? documents.cover.name : null, "Generated cover letter file.");
-    case "referral":
-      return { ...base, action: "blank", reason: "Optional referral source is not verified; left blank." };
-    default:
+    case "referral": {
+      const allowed = authorisedValue(authorised, "referral") ?? ownerAnswer(authorised, field);
+      if (allowed) return answer(allowed, "Previously authorised referral answer supplied by the owner.");
+      // A referral source is a fact about the candidate. A required one is a
+      // missing answer, not an optional blank that can be submitted empty.
+      return field.required
+        ? intervention(
+            "The employer requires a referral source, and no verified answer is stored. The owner must supply it; it is never guessed.",
+          )
+        : { ...base, action: "blank", reason: "Optional referral source is not verified; left blank." };
+    }
+    default: {
+      // Any other question is answerable only when the owner supplied a value for
+      // that exact field. The value is still checked against the rendered options.
+      const supplied = ownerAnswer(authorised, field);
+      if (supplied) return answer(supplied, "Answer supplied by the owner for this question.");
       return field.required
         ? intervention("This required question is not covered by verified profile data.")
         : { ...base, action: "blank", reason: "Optional unknown field left blank." };
+    }
   }
 }
 
@@ -464,9 +548,18 @@ export async function prepareCandidateForm(input: {
     return { ...empty, detail: `The application page could not be loaded: ${error instanceof Error ? error.message : "network error"}.` };
   }
   const html = await readLimitedText(response, 250_000).catch(() => "");
-  const security = detectSecurity(html);
-  if (security) return { ...empty, status: "security", detail: security, blockers: [security] };
+  // A non-2xx body is not the application form. An anti-bot interstitial can
+  // contain the word "captcha" while the real blocker is rate limiting, so the
+  // HTTP status decides the wording instead of the body alone.
   if (!response.ok) {
+    if (response.status === 429) {
+      const detail = "The employer's site rate-limited this automated request (HTTP 429). No form was completed and nothing was sent; it can be retried later or completed manually.";
+      return { ...empty, status: "security", detail, blockers: [detail], externalRequirement: "rate_limited" };
+    }
+    const challenge = detectSecurity(html);
+    if (challenge && (response.status === 403 || response.status === 503 || response.status === 401)) {
+      return { ...empty, status: "security", detail: challenge, blockers: [challenge], externalRequirement: "bot_challenge" };
+    }
     return {
       ...empty,
       status: "unsupported",
@@ -474,6 +567,8 @@ export async function prepareCandidateForm(input: {
       blockers: [`Application page returned HTTP ${response.status}.`],
     };
   }
+  const security = detectSecurity(html);
+  if (security) return { ...empty, status: "security", detail: security, blockers: [security], externalRequirement: "security_challenge" };
 
   const forms = parseForms(html);
   if (forms.length === 0) {

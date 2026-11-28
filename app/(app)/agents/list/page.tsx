@@ -20,7 +20,6 @@ import { activeWorkflow, latestPausedWorkflow } from "@/lib/workflow";
 import { AGENT_IDENTITY_KEYS, agentIdentity, agentNameList } from "@/lib/agent-identity";
 import { agentPresentation } from "@/lib/agent-presentation";
 import { getOperationalSnapshot } from "@/lib/operations";
-import { switchAgentAction } from "@/lib/actions/chat";
 import { startAutonomousRecruitmentAction } from "@/lib/actions/recruitment";
 import { AgentsViewSwitch } from "@/components/AgentsViewSwitch";
 
@@ -213,10 +212,9 @@ export default async function AgentsPage({
                     {agent.failureCount ? ` · ${agent.failureCount} failed` : ""} · {relativeTime(agent.lastActivityAt)}
                   </span>
                   <div className="flex items-center gap-1.5">
-                    <form action={switchAgentAction}>
-                      <input type="hidden" name="agent" value={agent.key} />
-                      <SubmitButton className="btn btn-sm" pendingLabel="Connecting…">Talk</SubmitButton>
-                    </form>
+                    <Link href={`/assistant?agent=${agent.key}`} className="btn btn-sm" data-testid={`talk-to-${agent.key}`}>
+                      Open conversation
+                    </Link>
                     <Link href={`/agents/list?agent=${agent.key}#activity`} className="btn btn-sm">Details &amp; history</Link>
                   </div>
                 </div>

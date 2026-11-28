@@ -6,6 +6,9 @@ const dbFile = path.join(process.cwd(), ".e2e-runtime/data/at-ai-workforce.db");
 export function query<T>(sql: string, ...params: Array<string | number | null>): T[] {
   const db = new DatabaseSync(dbFile, { readOnly: true });
   try {
+    // The Next server writes to the same SQLite file. Wait for its short
+    // transactions instead of failing the assertion with "database is locked".
+    db.exec("PRAGMA busy_timeout = 5000");
     return db.prepare(sql).all(...params) as T[];
   } finally {
     db.close();
@@ -19,6 +22,7 @@ export function one<T>(sql: string, ...params: Array<string | number | null>): T
 export function execute(sql: string, ...params: Array<string | number | null>): void {
   const db = new DatabaseSync(dbFile);
   try {
+    db.exec("PRAGMA busy_timeout = 5000");
     db.prepare(sql).run(...params);
   } finally {
     db.close();

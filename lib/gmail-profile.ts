@@ -15,7 +15,15 @@ export const REQUIRED_GMAIL_SCOPES = [
 /** Identity scopes let Google confirm who connected the mailbox. */
 export const GMAIL_IDENTITY_SCOPES = ["openid", "email"];
 
-export type GmailFailureKind = "expired" | "scope" | "api_disabled" | "api_error" | "missing_email";
+export type GmailFailureKind =
+  | "expired"
+  | "invalid_grant"
+  | "transient"
+  | "config"
+  | "scope"
+  | "api_disabled"
+  | "api_error"
+  | "missing_email";
 
 export class GmailProfileError extends Error {
   kind: GmailFailureKind;
@@ -32,6 +40,96 @@ export class GmailProfileError extends Error {
 function cleanMessage(value: unknown): string {
   return typeof value === "string" ? value.replace(/\s+/g, " ").trim().slice(0, 300) : "";
 }
+
+/**
+ * A failed token-endpoint exchange keeps Google's machine-readable error code
+ * so callers can separate a dead grant from a temporary outage. The message is
+ * never the classifier.
+ */
+export class GmailTokenError extends Error {
+  code: string | null;
+  status: number | null;
+
+  constructor(message: string, options: { code?: string | null; status?: number | null } = {}) {
+    super(message);
+    this.name = "GmailTokenError";
+    this.code = options.code ?? null;
+    this.status = options.status ?? null;
+  }
+}
+
+/**
+ * Classify a failed refresh-token exchange.
+ *
+ * `invalid_grant` means the grant itself is gone: only a human reconnection
+ * restores access, so it is blocked permanently. A 429/5xx or a network
+ * failure is transient and must stay retryable. These two must never share a
+ * stored error string.
+ */
+export function gmailTokenRefreshError(
+  status: number | null,
+  code?: string | null,
+  description?: string | null,
+): GmailProfileError {
+  const detail = cleanMessage(description);
+  const provider = (code ?? "").trim().toLowerCase();
+  const suffix = detail && detail.toLowerCase() !== provider ? ` Google said: ${detail}` : "";
+
+  if (provider === "invalid_grant") {
+    return new GmailProfileError(
+      "invalid_grant",
+      `Gmail refresh token was rejected (invalid_grant, HTTP ${status ?? 400}): the authorisation is expired or was revoked. Reconnect Gmail to grant access again; retrying this message cannot succeed.${suffix}`,
+      status,
+    );
+  }
+
+  if (provider === "invalid_client" || provider === "unauthorized_client") {
+    return new GmailProfileError(
+      "config",
+      `Gmail OAuth client configuration was rejected (${provider}, HTTP ${status ?? 400}). Check GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and GOOGLE_REDIRECT_URI; reconnecting will not help until the client matches.${suffix}`,
+      status,
+    );
+  }
+
+  if (status === null || status === 429 || status >= 500) {
+    return new GmailProfileError(
+      "transient",
+      `Gmail token refresh failed temporarily (${status === null ? "no HTTP response" : `HTTP ${status}`}${provider ? `, ${provider}` : ""}). This is a transient Google-side or network condition; the outbox retries it automatically and no reconnection is required yet.${suffix}`,
+      status,
+    );
+  }
+
+  return new GmailProfileError(
+    "config",
+    `Gmail token refresh was refused (HTTP ${status}${provider ? `, ${provider}` : ""}). The stored grant cannot be used and the account must be reconnected.${suffix}`,
+    status,
+  );
+}
+
+/** Stable, machine-readable reason persisted beside an outbox failure. */
+export function gmailFailureCode(kind: GmailFailureKind): string {
+  switch (kind) {
+    case "expired":
+      return "access_token_rejected";
+    case "invalid_grant":
+      return "invalid_grant";
+    case "transient":
+      return "refresh_transient";
+    case "config":
+      return "refresh_config";
+    case "scope":
+      return "scope_insufficient";
+    case "api_disabled":
+      return "api_disabled";
+    case "api_error":
+      return "api_error";
+    case "missing_email":
+      return "missing_email";
+  }
+}
+
+/** Failure codes whose cause is outside the account and may clear by itself. */
+export const TRANSIENT_GMAIL_FAILURE_CODES: ReadonlySet<string> = new Set(["refresh_transient", "api_error"]);
 
 /** Map a Gmail API status/message to a useful, credential-free error. */
 export function gmailApiError(status: number, rawMessage?: unknown): GmailProfileError {

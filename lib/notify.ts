@@ -3,14 +3,17 @@ import { all, getDb, nowIso, one, run } from "./db";
 import { getSetting, setSetting } from "./settings";
 import { heartbeatRuntimeWorker, startRuntimeWorker, stopRuntimeWorker } from "./runtime-state";
 import { renderNotificationEmail } from "./email-template";
+import { resendConfig, resendConfigured, sendResendEmail } from "./resend";
 
 /**
  * In-app notifications and durable email delivery are separate facts.
  *
- * `notify()` records the in-app row immediately. When Gmail is selected and
- * connected, it also inserts one deduplicated row in `notification_outbox`.
- * Only the outbox worker may record Gmail API acceptance, and acceptance is
- * never promoted to recipient inbox delivery without independent evidence.
+ * `notify()` records the in-app row immediately. When a notification recipient
+ * exists it also inserts one deduplicated row in `notification_outbox`. Resend
+ * is the only delivery provider for application-owned outbound email; Gmail is
+ * retained for reading employer mail and approval-gated drafts. The outbox
+ * worker records provider acceptance, and acceptance is never promoted to
+ * recipient inbox delivery without independent evidence.
  *
  * `notification_outbox.status` is the worker lifecycle. `delivery` is the
  * evidence state. Keeping those dimensions separate prevents a successful
@@ -21,6 +24,8 @@ export type DeliveryState =
   | "generated"
   | "queued"
   | "sending"
+  | "accepted_by_provider"
+  /** Legacy Gmail rows; new sends record `accepted_by_provider`. */
   | "accepted_by_gmail"
   | "sent_folder_observed"
   | "delivery_confirmed"
@@ -48,6 +53,8 @@ export type NotificationInput = {
    * operational report. Critical exception alerts leave this true.
    */
   email?: boolean;
+  /** Explicit clock for deterministic outbox scheduling (tests and replays). */
+  now?: Date;
 };
 
 export type OutboxRow = {
@@ -77,6 +84,8 @@ export type OutboxRow = {
   bounce_info: string | null;
   resend_count: number;
   last_error: string | null;
+  /** Stable Gmail failure reason, e.g. `invalid_grant` or `refresh_transient`. */
+  failure_code: string | null;
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
@@ -84,6 +93,7 @@ export type OutboxRow = {
 
 export type OutboxSendResult = {
   messageId: string;
+  provider?: string | null;
   threadId: string | null;
   rfcMessageId?: string | null;
   sentObserved?: boolean;
@@ -164,21 +174,24 @@ function emailEnabled(kind: string): boolean {
   return getSetting<boolean>("notify_immediate", true);
 }
 
+/**
+ * The owner's notification address. It is deliberately independent of the
+ * Gmail mailbox: outbound delivery is owned by Resend, so an expired Google
+ * grant can no longer block application email.
+ */
 export function notificationRecipient(): string | null {
-  const email = getSetting<{ provider?: string; connected?: boolean; sender?: string; account?: string }>("email", {});
-  if (email.provider !== "gmail") return null;
-  const account = one<{ id: number; email: string }>("SELECT id, email FROM gmail_accounts WHERE id = 1");
-  if (!account) return null;
+  const email = getSetting<{ sender?: string; account?: string }>("email", {});
   const profile = one<{ email: string | null }>("SELECT email FROM profiles WHERE id = 1");
-  const address = (profile?.email || email.account || email.sender || account.email || "").trim();
+  const address = (profile?.email || email.account || email.sender || process.env.NOTIFICATION_EMAIL || "").trim();
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(address) ? address : null;
 }
 
-/** Actual connected mailbox, never a user-supplied From header. */
+/** Verified Resend sender, never an arbitrary user-supplied From header. */
 export function notificationSender(): string | null {
-  const account = one<{ email: string }>("SELECT email FROM gmail_accounts WHERE id = 1");
+  const from = resendConfig().from;
+  if (from) return from;
   const email = getSetting<{ sender?: string }>("email", {});
-  return (account?.email || email.sender || "").trim() || null;
+  return (email.sender || "").trim() || null;
 }
 
 function newRfcMessageId(sender: string | null): string {
@@ -194,11 +207,13 @@ export function deliveryStateForRow(row: Pick<OutboxRow, "status" | "delivery"> 
   if (stored === "blocked") return "blocked";
   if (stored === "failed") return "failed";
   if (stored === "sent_folder_observed") return "sent_folder_observed";
-  if (stored === "accepted" || stored === "accepted_by_gmail") return "accepted_by_gmail";
+  if (stored === "accepted_by_provider") return "accepted_by_provider";
+  if (stored === "accepted") return "accepted_by_provider";
+  if (stored === "accepted_by_gmail") return "accepted_by_gmail";
   if (stored === "queued" || stored === "generated") return row.status === "sending" ? "sending" : "queued";
   if (row.status === "sending") return "sending";
   if (row.status === "pending" || row.status === "retry_scheduled") return "queued";
-  if (row.status === "sent") return "accepted_by_gmail";
+  if (row.status === "sent") return "accepted_by_provider";
   return "failed";
 }
 
@@ -211,9 +226,11 @@ export function deliveryStateMessage(state: DeliveryState, detail?: string | nul
     case "queued":
       return "Your Executive Brief has been added to the email outbox. Sending has not yet been confirmed.";
     case "sending":
-      return "Your email is currently being submitted to Gmail.";
+      return "Your email is currently being submitted to the email provider.";
+    case "accepted_by_provider":
+      return "Resend has accepted your message for delivery. Recipient inbox delivery has not yet been independently confirmed.";
     case "accepted_by_gmail":
-      return "Gmail has accepted your message for processing. Recipient delivery has not yet been independently confirmed.";
+      return "The Gmail API accepted this historical message. Recipient delivery was not independently confirmed.";
     case "sent_folder_observed":
       return "The message has been found in the connected Gmail Sent folder. Recipient inbox delivery is not yet confirmed.";
     case "delivery_confirmed":
@@ -246,7 +263,7 @@ function enqueue(input: NotificationInput, notificationId: number): {
   if (!emailEnabled(input.kind)) return { queued: false, reason: "email event disabled", outboxId: null, state: "blocked" };
   if (input.email === false) return { queued: false, reason: "email copy suppressed; recorded in-app", outboxId: null, state: "blocked" };
   const to = notificationRecipient();
-  if (!to) return { queued: false, reason: "Gmail is not connected", outboxId: null, state: "blocked" };
+  if (!to) return { queued: false, reason: "No notification recipient is configured", outboxId: null, state: "blocked" };
   const dedupe = input.dedupeKey ?? fallbackDedupe(input);
   const existing = one<OutboxRow>("SELECT * FROM notification_outbox WHERE dedupe_key = ?", [dedupe]);
   if (existing) {
@@ -261,12 +278,14 @@ function enqueue(input: NotificationInput, notificationId: number): {
   const html = input.html ?? renderNotificationEmail({ subject: input.subject, body: emailBody, kind: input.kind }).html;
   const sender = notificationSender();
   const outboxId = `mailout_${crypto.randomBytes(12).toString("hex")}`;
-  const now = nowIso();
+  // The caller's clock is honoured so a replayed or scheduled report is due
+  // exactly when its own timeline says it is, not when the wall clock says so.
+  const now = (input.now ?? new Date()).toISOString();
   run(
     `INSERT INTO notification_outbox
        (id, dedupe_key, notification_id, user_id, kind, recipient, subject, body, html_body, status, attempts,
-        available_at, delivery, report_id, sender, rfc_message_id, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, 'queued', ?, ?, ?, ?)`,
+        available_at, delivery, report_id, sender, rfc_message_id, provider, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, 'queued', ?, ?, ?, 'resend', ?)`,
     [
       outboxId,
       dedupe,
@@ -333,16 +352,26 @@ function backoffMs(attempt: number): number {
   return Math.round(Math.min(30 * 60_000, 60_000 * 2 ** Math.max(0, attempt - 1)) * (0.8 + Math.random() * 0.4));
 }
 
-function classifyFailure(message: string, error: unknown): { permanent: boolean; blocked: boolean } {
+function classifyFailure(
+  message: string,
+  error: unknown,
+): { permanent: boolean; blocked: boolean; code: string } {
   if (error instanceof EmailDeliveryError) {
     return {
       permanent: error.blocked || !error.retryable,
       blocked: error.blocked,
+      code: error.code,
     };
+  }
+  // A transient refresh failure is retried with backoff. Only a dead grant or
+  // a configuration/scope fault is recorded as a permanent block.
+  if (/transient|temporarily|temporarily unavailable|fetch failed|timed? ?out|ECONNRESET|ENOTFOUND|socket|aborted|HTTP 5\d\d|HTTP 429/i.test(message)) {
+    return { permanent: false, blocked: false, code: "refresh_transient" };
   }
   const blocked = /invalid_grant|revoked|permission|scope|not connected|missing configuration|invalid recipient|no stored refresh token/i.test(message);
   const permanent = blocked || /unverified without a message id/i.test(message);
-  return { permanent, blocked };
+  const code = /invalid_grant|revoked/i.test(message) ? "invalid_grant" : blocked ? "blocked" : "api_error";
+  return { permanent, blocked, code };
 }
 
 /**
@@ -368,11 +397,13 @@ export async function drainNotificationQueue(options: {
     "UPDATE notification_outbox SET status = 'retry_scheduled', delivery = 'queued', available_at = ? WHERE status = 'sending' AND started_at < ?",
     [nowIso(), new Date(now.getTime() - 5 * 60_000).toISOString()],
   );
+  // Resend is the only outbound path. Gmail is not used as a fallback: a
+  // missing Resend configuration is a blocked delivery, never a silent retry
+  // through a different provider.
   const send: OutboxSender =
     options.send ??
     (async (message) => {
-      const { sendGmailEmail } = await import("./gmail");
-      const result = await sendGmailEmail(message.to, message.subject, message.body, {
+      const result = await sendResendEmail(message.to, message.subject, message.body, {
         html: message.html,
         rfcMessageId: message.rfcMessageId,
         from: message.from,
@@ -380,20 +411,32 @@ export async function drainNotificationQueue(options: {
       if (result.status === "accepted" && result.messageId) {
         return {
           messageId: result.messageId,
-          threadId: result.threadId,
+          provider: "resend",
+          threadId: null,
           rfcMessageId: result.rfcMessageId,
-          sentObserved: result.sentObserved,
-          sentFolderDetail: result.sentFolderDetail,
-          sentFolderCheckedAt: result.sentFolderCheckedAt,
-          deliveryEvidence: result.sentFolderDetail,
-          bounceDetected: result.bounceDetected,
-          bounceEvidence: result.bounceEvidence,
+          sentObserved: false,
+          sentFolderDetail: null,
+          sentFolderCheckedAt: null,
+          deliveryEvidence: result.detail,
+          bounceDetected: false,
+          bounceEvidence: null,
         };
       }
-      const blocked = ["missing_configuration", "authentication_failed", "permission_denied", "invalid_recipient"].includes(result.status);
+      // Permanent configuration/verification faults are blocked, never retried;
+      // only a provider outage and an explicit rate limit are retryable.
+      const blocked = [
+        "missing_configuration",
+        "authentication_failed",
+        "permission_denied",
+        "unverified_domain",
+        "unverified_recipient",
+        "invalid_recipient",
+        "invalid_request",
+        "quota_exhausted",
+      ].includes(result.status);
       throw new EmailDeliveryError(result.detail, {
-        code: result.status,
-        retryable: result.status === "api_error",
+        code: result.failureCode ?? result.status,
+        retryable: result.status === "api_error" || result.status === "rate_limited",
         blocked,
       });
     });
@@ -421,7 +464,8 @@ export async function drainNotificationQueue(options: {
       // On a retry, prove whether a prior ambiguous attempt already reached the
       // Sent folder before making a second Gmail send request.
       let result: OutboxSendResult | null = null;
-      if (!options.send && attempts > 1 && row.rfc_message_id) {
+      // Only a legacy Gmail row can be recovered from Gmail's Sent label.
+      if (!options.send && attempts > 1 && row.rfc_message_id && row.provider === "gmail") {
         const { findGmailSentByRfcMessageId } = await import("./gmail");
         const found = await findGmailSentByRfcMessageId(row.rfc_message_id).catch(() => null);
         if (found) {
@@ -450,15 +494,17 @@ export async function drainNotificationQueue(options: {
         ? "bounced"
         : result.sentObserved
           ? "sent_folder_observed"
-          : "accepted_by_gmail";
+          : "accepted_by_provider";
+      const provider = result.provider ?? row.provider ?? "resend";
       const finishedAt = nowIso();
       run(
-        `UPDATE notification_outbox SET status = ?, provider = 'gmail', provider_message_id = ?, provider_thread_id = ?,
+        `UPDATE notification_outbox SET status = ?, provider = ?, provider_message_id = ?, provider_thread_id = ?,
            delivery = ?, rfc_message_id = COALESCE(?, rfc_message_id), gmail_response = ?,
            sent_observed_at = ?, sent_verification = ?, delivery_evidence = ?, bounce_info = ?,
-           last_error = ?, finished_at = ? WHERE id = ?`,
+           last_error = ?, failure_code = NULL, finished_at = ? WHERE id = ?`,
         [
           bounced ? "failed" : "sent",
+          provider,
           result.messageId,
           result.threadId,
           delivery,
@@ -472,7 +518,9 @@ export async function drainNotificationQueue(options: {
           }),
           result.sentObserved ? result.sentFolderCheckedAt ?? finishedAt : null,
           result.sentFolderDetail ?? null,
-          result.deliveryEvidence ?? result.sentFolderDetail ?? "Gmail API acceptance only; no independent delivery evidence is available.",
+          result.deliveryEvidence ??
+            result.sentFolderDetail ??
+            `${provider} provider acceptance only; no independent inbox evidence is available.`,
           result.bounceEvidence ?? null,
           bounced ? result.bounceEvidence ?? "A delivery-status notice was recorded." : null,
           finishedAt,
@@ -488,32 +536,33 @@ export async function drainNotificationQueue(options: {
       else sent += 1;
     } catch (error) {
       const message = (error instanceof Error ? error.message : "Notification delivery failed.").slice(0, 800);
-      const { permanent, blocked } = classifyFailure(message, error);
+      const { permanent, blocked, code } = classifyFailure(message, error);
       if (permanent || attempts >= 5) {
         const delivery: DeliveryState = blocked ? "blocked" : "failed";
         run(
-          "UPDATE notification_outbox SET status = 'failed', delivery = ?, last_error = ?, finished_at = ? WHERE id = ?",
-          [delivery, message, nowIso(), row.id],
+          "UPDATE notification_outbox SET status = 'failed', delivery = ?, last_error = ?, failure_code = ?, finished_at = ? WHERE id = ?",
+          [delivery, message, code, nowIso(), row.id],
         );
         run("UPDATE notifications SET delivery_status = ? WHERE id = ?", [delivery, row.notification_id]);
         failed += 1;
       } else {
         const available = new Date(now.getTime() + backoffMs(attempts)).toISOString();
         run(
-          "UPDATE notification_outbox SET status = 'retry_scheduled', delivery = 'queued', last_error = ?, available_at = ? WHERE id = ?",
-          [message, available, row.id],
+          "UPDATE notification_outbox SET status = 'retry_scheduled', delivery = 'queued', last_error = ?, failure_code = ?, available_at = ? WHERE id = ?",
+          [message, code, available, row.id],
         );
         run("UPDATE notifications SET delivery_status = 'retry_scheduled' WHERE id = ?", [row.notification_id]);
         retryScheduled += 1;
       }
       setSetting("email_delivery_last", {
-        provider: "gmail",
+        provider: row.provider ?? "resend",
         state: permanent ? (blocked ? "blocked" : "failed") : "queued",
         kind: row.kind,
         reportId: row.report_id,
         outboxId: row.id,
         recipientMasked: row.recipient.replace(/^(.).*(@.*)$/, "$1***$2"),
         error: message,
+        errorCode: code,
         at: nowIso(),
       });
     }
@@ -581,6 +630,7 @@ export function notificationQueueSnapshot() {
     generated: 0,
     queued: 0,
     sending: 0,
+    accepted_by_provider: 0,
     accepted_by_gmail: 0,
     sent_folder_observed: 0,
     delivery_confirmed: 0,
@@ -592,8 +642,13 @@ export function notificationQueueSnapshot() {
     deliveryCounts[deliveryStateForRow(row)] += 1;
   }
   const latest = all<OutboxRow>("SELECT * FROM notification_outbox ORDER BY created_at DESC LIMIT 10");
-  const lastError = one<{ last_error: string | null; kind: string | null; created_at: string | null }>(
-    "SELECT last_error, kind, created_at FROM notification_outbox WHERE last_error IS NOT NULL ORDER BY created_at DESC LIMIT 1",
+  const lastError = one<{
+    last_error: string | null;
+    failure_code: string | null;
+    kind: string | null;
+    created_at: string | null;
+  }>(
+    "SELECT last_error, failure_code, kind, created_at FROM notification_outbox WHERE last_error IS NOT NULL ORDER BY created_at DESC LIMIT 1",
   );
   const lastAccepted = one<{
     provider_message_id: string | null;
@@ -602,9 +657,16 @@ export function notificationQueueSnapshot() {
     delivery: string | null;
     report_id: string | null;
   }>(
-    "SELECT provider_message_id, kind, finished_at, delivery, report_id FROM notification_outbox WHERE delivery IN ('accepted_by_gmail','sent_folder_observed','delivery_confirmed') ORDER BY finished_at DESC LIMIT 1",
+    "SELECT provider_message_id, kind, finished_at, delivery, report_id FROM notification_outbox WHERE delivery IN ('accepted_by_provider','accepted_by_gmail','sent_folder_observed','delivery_confirmed') ORDER BY finished_at DESC LIMIT 1",
   );
-  return { counts, deliveryCounts, latest, lastError, lastAccepted, configured: Boolean(notificationRecipient()) };
+  return {
+    counts,
+    deliveryCounts,
+    latest,
+    lastError,
+    lastAccepted,
+    configured: Boolean(notificationRecipient()) && resendConfigured(),
+  };
 }
 
 export function outboxById(id: string): OutboxRow | null {
@@ -613,6 +675,16 @@ export function outboxById(id: string): OutboxRow | null {
 
 export function outboxByDedupeKey(dedupeKey: string): OutboxRow | null {
   return one<OutboxRow>("SELECT * FROM notification_outbox WHERE dedupe_key = ?", [dedupeKey]);
+}
+
+/** Provider event lookup. A provider id is unique per accepted message. */
+export function outboxByProviderMessageId(messageId: string): OutboxRow | null {
+  const id = messageId.trim();
+  if (!id) return null;
+  return one<OutboxRow>(
+    "SELECT * FROM notification_outbox WHERE provider_message_id = ? ORDER BY created_at DESC LIMIT 1",
+    [id],
+  );
 }
 
 /**
@@ -634,6 +706,17 @@ export async function refreshOutboxSentObservation(
   const row = outboxById(outboxId);
   if (!row) return { state: "generated", row: null, detail: "No outbox record exists.", checkedAt: nowIso() };
   const current = deliveryStateForRow(row);
+  if (!verify && row.provider && row.provider !== "gmail") {
+    // Resend has no Sent-folder equivalent. Inbox delivery is only confirmed by
+    // a provider delivery event or an independent inbound reply, so no probe is
+    // invented here.
+    return {
+      state: current,
+      row,
+      detail: `${row.provider} has no Sent-folder equivalent; delivery is confirmed only by provider event evidence or a reply.`,
+      checkedAt: nowIso(),
+    };
+  }
   if (!row.provider_message_id) {
     return { state: current, row, detail: "There is no Gmail message ID to verify.", checkedAt: nowIso() };
   }
@@ -720,7 +803,7 @@ export function resetOutboxForResend(input: {
        html_body = ?, sender = ?, report_id = ?, rfc_message_id = ?, attempts = 0, resend_count = resend_count + 1,
        available_at = ?, provider = NULL, provider_message_id = NULL, provider_thread_id = NULL,
        gmail_response = NULL, sent_observed_at = NULL, sent_verification = NULL, delivery_evidence = NULL,
-       bounce_info = NULL, last_error = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`,
+       bounce_info = NULL, last_error = NULL, failure_code = NULL, started_at = NULL, finished_at = NULL WHERE id = ?`,
     [
       input.to,
       input.subject,

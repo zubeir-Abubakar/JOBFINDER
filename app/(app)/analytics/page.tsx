@@ -3,7 +3,9 @@ import { requireUser } from "@/lib/auth";
 import { PageHead, Stat, Empty } from "@/components/ui";
 import { BarChart, Funnel, PieChart, RankingBars } from "@/components/charts";
 import { getAnalytics, resolveAnalyticsRange } from "@/lib/analytics";
+import { CANONICAL_OUTCOME_LABELS } from "@/lib/application-status";
 import { agentIdentity } from "@/lib/agent-identity";
+import { BUSINESS_TIMEZONE, businessDayBounds } from "@/lib/business-day";
 import { formatDate, param, pct } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -33,6 +35,19 @@ export default async function AnalyticsPage({
   const activeAgents = data.agentDistribution.find((slice) => slice.label === "Running")?.value ?? 0;
   const spanDays = Math.max(1, Math.round((Date.parse(`${range.to}T00:00:00Z`) - Date.parse(`${range.from}T00:00:00Z`)) / 86_400_000) + 1);
   const trendHeading = spanDays > 92 ? "Weekly activity" : "Daily activity";
+  // Explicit daily boundaries: a Zurich day is 23 or 25 hours around the DST
+  // changes, so the exact instants are shown instead of an assumed UTC offset.
+  const boundaries = businessDayBounds(range.from, range.to);
+  const businessStamp = new Intl.DateTimeFormat("en-GB", {
+    timeZone: BUSINESS_TIMEZONE,
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+    timeZoneName: "short",
+  });
 
   return (
     <>
@@ -76,6 +91,17 @@ export default async function AnalyticsPage({
               {formatDate(range.from)} — {formatDate(range.to)}
             </span>
           </form>
+          <p
+            className="text-[11px]"
+            data-testid="analytics-business-boundary"
+            style={{ color: "var(--muted)", margin: 0 }}
+          >
+            Daily reporting boundaries are {BUSINESS_TIMEZONE} calendar days, not UTC days: {" "}
+            <strong>{businessStamp.format(boundaries.start)}</strong> → <strong>{businessStamp.format(boundaries.end)}</strong>{" "}
+            <span className="num">
+              ({boundaries.startIso} → {boundaries.endIso})
+            </span>
+          </p>
         </div>
       </section>
 
@@ -215,6 +241,24 @@ export default async function AnalyticsPage({
           </div>
           <div className="card-body">
             <PieChart data={data.outcomes} label="applications" emptyLabel="No applications in this range" />
+            <div className="mt-4">
+              <p className="card-sub mb-2">Canonical outcome classes. A prepared or externally blocked application is never counted as submitted.</p>
+              <ul className="stack">
+                {data.submissionOutcomes.map((row) => (
+                  <li key={row.label} className="text-[12px]">
+                    <div className="between">
+                      <span style={{ color: "var(--muted)" }}>{row.label}</span>
+                      <span className="num">{row.value}</span>
+                    </div>
+                    {row.label === CANONICAL_OUTCOME_LABELS.submitted_verified && row.value > 0 ? (
+                      <p className="hint" data-testid="analytics-confirmation-source" style={{ margin: 0 }}>
+                        {row.detail}
+                      </p>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </div>
           </div>
         </section>
       </div>

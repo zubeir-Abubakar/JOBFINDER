@@ -137,7 +137,7 @@ export function operationalHealthSnapshot(now: Date = new Date()): RuntimeHealth
     "SELECT id, agent_key, title, status, started_at FROM tasks WHERE status IN ('running','working') ORDER BY started_at LIMIT 20",
   );
   const failedToday = one<{ c: number }>(
-    "SELECT COUNT(*) AS c FROM tasks WHERE status = 'failed' AND created_at >= ?",
+    "SELECT COUNT(*) AS c FROM tasks WHERE status = 'failed' AND COALESCE(error_class, '') != 'blocked' AND created_at >= ?",
     [new Date(now.getTime() - 24 * 3600_000).toISOString()],
   )?.c ?? 0;
   const activeTasks = Number(tasks.running ?? 0) + Number(tasks.working ?? 0);

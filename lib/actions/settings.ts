@@ -7,7 +7,7 @@ import { requireUser } from "@/lib/auth";
 import { audit } from "@/lib/audit";
 import { getProfileData } from "@/lib/profile";
 import { setSetting } from "@/lib/settings";
-import { maskEmail, runGmailTestEmail } from "@/lib/gmail";
+import { maskAddress, runResendTestEmail } from "@/lib/resend";
 import { cleanupExpiredDocuments } from "@/lib/retention";
 import { cleanupTempObjects } from "@/lib/temp-store";
 import { effectiveMinMatchScore } from "@/lib/scoring";
@@ -156,10 +156,10 @@ export async function testEmailAction(): Promise<void> {
   audit({
     action: "email.test_requested",
     entity: "email",
-    detail: recipient ? `Requested test for ${maskEmail(recipient)}` : "No notification recipient saved",
+    detail: recipient ? `Requested test for ${maskAddress(recipient)}` : "No notification recipient saved",
     userId: user.id,
   });
-  const result = await runGmailTestEmail(recipient, user.id);
+  const result = await runResendTestEmail(recipient, user.id);
   revalidatePath("/settings");
   redirect(`/settings?email_test=${encodeURIComponent(result.status)}#notifications`);
 }

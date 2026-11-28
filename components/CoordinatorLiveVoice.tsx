@@ -890,6 +890,20 @@ export function CoordinatorLiveVoice({
 
   function scheduleReconnect(): void {
     if (intentionalClose.current || !mounted.current || stateRef.current === "error") return;
+    // A browser that is still offline does not spend the bounded retry budget.
+    // Otherwise a few seconds without a link could exhaust every attempt before
+    // the network returns, turning a transient loss into a terminal error.
+    if (!navigator.onLine) {
+      emitVoiceDiagnostic("RECONNECT_DEFERRED_OFFLINE", { attempt: reconnectAttempts.current });
+      setState("connecting");
+      setNotice("Network connection lost. Waiting for the network, then reconnecting…");
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = setTimeout(() => {
+        emitVoiceDiagnostic("RECONNECT_ATTEMPT", { attempt: reconnectAttempts.current });
+        void startLive(activeAgentRef.current, { greet: false, fresh: false, preserveMessages: true });
+      }, 1_000);
+      return;
+    }
     if (reconnectAttempts.current >= 3) {
       flushTranscripts();
       stopPlayback();
@@ -979,11 +993,13 @@ export function CoordinatorLiveVoice({
       const payload = (await response.json().catch(() => ({}))) as SessionPayload & { error?: string; code?: string };
       if (!response.ok) {
         const message =
-          payload.code === "LIVE_NOT_CONFIGURED"
-            ? payload.error ?? "Live voice is not configured."
-            : response.status === 429
-              ? "Gemini Live free-tier quota is exhausted or cooling down. No paid fallback was attempted."
-              : payload.error ?? "The live voice session could not start.";
+          payload.code === "LIVE_RATE_LIMIT"
+            ? "A voice session is already starting. Please wait a moment, then try again."
+            : payload.code === "LIVE_NOT_CONFIGURED"
+              ? payload.error ?? "Live voice is not configured."
+              : response.status === 429
+                ? "The voice session request was throttled. No paid fallback was attempted."
+                : payload.error ?? "The live voice session could not start.";
         throw new Error(message);
       }
       if (!payload.wsUrl || !payload.setup) throw new Error("The live voice session was incomplete.");
@@ -1085,6 +1101,17 @@ export function CoordinatorLiveVoice({
     } catch (cause) {
       starting.current = false;
       const message = cause instanceof Error ? cause.message : "Live voice could not start.";
+      // An attempt that failed because the link itself is down did not fail on
+      // the provider's side, so it must not consume a reconnect attempt.
+      if (!options.fresh && !intentionalClose.current && !navigator.onLine) {
+        emitVoiceDiagnostic("RECONNECT_DEFERRED_OFFLINE", { attempt: reconnectAttempts.current });
+        setNotice("Network connection lost. Waiting for the network, then reconnecting…");
+        if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+        reconnectTimer.current = setTimeout(() => {
+          void startLive(activeAgentRef.current, { greet: false, fresh: false, preserveMessages: true });
+        }, 1_000);
+        return;
+      }
       // A reconnect attempt can fail before a socket exists (for example while
       // the network is still down). Keep the bounded retry budget alive rather
       // than turning one failed fetch into a permanently dead session.
@@ -1124,6 +1151,12 @@ export function CoordinatorLiveVoice({
   function handleBrowserOnline() {
     if (!mounted.current || intentionalClose.current || stateRef.current !== "connecting") return;
     emitVoiceDiagnostic("BROWSER_ONLINE");
+    // A reconnect may already be starting. Beginning a second session here
+    // would discard its fresh socket and can trip the server's 750 ms session
+    // throttle, wasting part of the bounded retry budget.
+    if (starting.current) return;
+    const current = wsRef.current;
+    if (current && (current.readyState === WebSocket.CONNECTING || current.readyState === WebSocket.OPEN)) return;
     if (reconnectTimer.current) {
       clearTimeout(reconnectTimer.current);
       reconnectTimer.current = null;

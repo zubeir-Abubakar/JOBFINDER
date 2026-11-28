@@ -33,7 +33,7 @@ export type AgentTaskView = {
 };
 
 export type AgentLastOutcome = {
-  state: "completed" | "failed" | "cancelled" | "none";
+  state: "completed" | "blocked" | "failed" | "cancelled" | "none";
   label: string;
   detail: string;
   at: string | null;
@@ -127,6 +127,9 @@ function lastOutcomeView(lastTask: { status: string; title: string; at: string |
   if (!lastTask) return { state: "none", label: "No task history", detail: "This agent has not run yet.", at: null };
   if (lastTask.status === "completed") {
     return { state: "completed", label: "Completed", detail: lastTask.title, at: lastTask.at };
+  }
+  if (lastTask.status === "blocked") {
+    return { state: "blocked", label: "Blocked — waiting for you", detail: lastTask.title, at: lastTask.at };
   }
   if (lastTask.status === "failed") {
     return { state: "failed", label: "Failed", detail: lastTask.title, at: lastTask.at };

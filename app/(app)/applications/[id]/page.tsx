@@ -9,6 +9,8 @@ import {
   statusClass,
   APPLICATION_STATUSES,
   statusRequiresVerifiedSubmission,
+  submissionConfirmationSource,
+  submissionConfirmationSourceLabel,
   submissionEvidenceLabel,
   submissionEvidenceState,
 } from "@/lib/application-status";
@@ -21,6 +23,7 @@ import { AgentAvatar } from "@/components/AgentAvatar";
 import { DocumentWorkspace } from "@/components/DocumentWorkspace";
 import { agentIdentity } from "@/lib/agent-identity";
 import { GermanRequirementCard } from "@/components/GermanRequirementCard";
+import { outreachForApplication } from "@/lib/outreach";
 
 export const dynamic = "force-dynamic";
 
@@ -44,6 +47,11 @@ export default async function ApplicationDetailPage({
     confirmation: string | null;
     approved_at: string | null;
     submitted_at: string | null;
+    submission_evidence: string | null;
+    submission_state: string | null;
+    email_handoff_sent_at: string | null;
+    email_handoff_note: string | null;
+    application_email: string | null;
     notes: string | null;
     last_update: string;
     created_at: string;
@@ -62,8 +70,8 @@ export default async function ApplicationDetailPage({
     german_requirement: string | null;
     language_evidence: string | null;
   }>(
-    `SELECT a.*, j.title, j.company, j.location, j.url, j.match_score, j.match_flag, j.salary, j.employment_type, j.description,
-            j.eligibility, j.german_requirement, j.language_evidence
+    `     SELECT a.*, j.title, j.company, j.location, j.url, j.match_score, j.match_flag, j.salary, j.employment_type, j.description,
+            j.eligibility, j.german_requirement, j.language_evidence, j.application_email
      FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?`,
     [id],
   );
@@ -78,6 +86,12 @@ export default async function ApplicationDetailPage({
   }
   const readinessLabel = readiness?.state ? readiness.state.replace(/_/g, " ") : readiness?.ready ? "ready for submission" : "not assessed";
   const evidenceState = submissionEvidenceState(app);
+  const confirmationSource = submissionConfirmationSource({ evidence: app.submission_evidence });
+  const confirmationLabel = submissionEvidenceLabel({
+    submitted_at: app.submitted_at,
+    confirmation: app.confirmation,
+    evidence: app.submission_evidence,
+  });
 
   const cv = app.cv_document_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cv_document_id]) : null;
   const cover = app.cover_letter_id ? one<{ id: string; display_name: string; ats_score: number | null; quality_status: string | null; quality_score: number | null; version: string | null; kind: string }>("SELECT id, display_name, ats_score, quality_status, quality_score, version, kind FROM documents WHERE id = ?", [app.cover_letter_id]) : null;
@@ -85,10 +99,23 @@ export default async function ApplicationDetailPage({
     "SELECT id, display_name, mime, ats_score, quality_status, quality_score, version FROM documents WHERE job_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
     [app.job_id],
   );
-  const timeline = all<{ action: string; detail: string | null; created_at: string }>(
+  const outreachDrafts = outreachForApplication(id);
+  const auditTimeline = all<{ action: string; detail: string | null; created_at: string }>(
     "SELECT action, detail, created_at FROM audit_logs WHERE entity = 'application' AND entity_id = ? ORDER BY id DESC LIMIT 20",
     [id],
   );
+  // The application timeline lives in `application_events`; audit records add
+  // operational context. Merge both so the owner-sent receipt appears on the
+  // same timeline as preparation and submission history.
+  const applicationTimeline = all<{ action: string; detail: string | null; created_at: string }>(
+    "SELECT type AS action, message AS detail, created_at FROM application_events WHERE application_id = ? ORDER BY id DESC LIMIT 20",
+    [id],
+  );
+  const timeline = [...applicationTimeline, ...auditTimeline]
+    // The dedicated receipt entry below already renders this event with its note.
+    .filter((event) => event.action !== "submission.owner_sent")
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, 20);
   const interventions = all<{ id: string; field: string | null; question: string; reason: string; kind: string }>(
     "SELECT id, field, question, reason, kind FROM application_interventions WHERE application_id = ? AND status = 'open' ORDER BY created_at",
     [id],
@@ -159,7 +186,7 @@ export default async function ApplicationDetailPage({
                   <p className="card-sub">
                     {agentIdentity("application").name} — {agentIdentity("application").title} ·{" "}
                     {evidenceState === "verified"
-                      ? `employer-confirmed${app.submitted_at ? ` ${formatDateTime(app.submitted_at)}` : ""}${app.method ? ` via ${app.method.replace(/_/g, " ")}` : ""}`
+                      ? `${confirmationSource === "owner_recorded" ? "employer-confirmed — recorded by owner" : confirmationSource === "automated_employer" ? "employer-confirmed — automated portal response" : "employer-confirmed"}${app.submitted_at ? ` ${formatDateTime(app.submitted_at)}` : ""}${app.method ? ` via ${app.method.replace(/_/g, " ")}` : ""}`
                       : evidenceState === "partial"
                         ? "a submission was attempted, but no employer confirmation is verified"
                         : "no verified submission evidence is stored for this application"}
@@ -178,7 +205,13 @@ export default async function ApplicationDetailPage({
                 <div className="card-quiet p-3">
                   <div className="label" style={{ marginBottom: 2 }}>Employer confirmation</div>
                   <div className="text-[13px]">{app.confirmation ?? "No reference stored"}</div>
-                  <p className="hint">Submission is verified by this reference and stored with the application record.</p>
+                  <p className="hint">
+                    {confirmationSource === "owner_recorded"
+                      ? "You recorded this employer confirmation from the employer's message or portal. It is not an automated portal verification, and the stored evidence keeps that distinction."
+                      : confirmationSource === "automated_employer"
+                        ? "The employer endpoint or portal returned this reference, and it is stored with the application record."
+                        : "Submission is verified by this reference and stored with the application record. The confirmation channel was not recorded."}
+                  </p>
                 </div>
               ) : (
                 <div className="stack" style={{ gap: 14 }}>
@@ -279,6 +312,40 @@ export default async function ApplicationDetailPage({
             </div>
           </section>
 
+          <section className="card" id="outreach">
+            <div className="card-head">
+              <div>
+                <h2>Hiring-manager outreach</h2>
+                <p className="card-sub">Separate from the application channel. A Gmail draft is never shown as a sent email.</p>
+              </div>
+              <span className="badge badge-neutral">{outreachDrafts.length} draft{outreachDrafts.length === 1 ? "" : "s"}</span>
+            </div>
+            <div className="card-body stack" style={{ gap: 8 }}>
+              {outreachDrafts.length === 0 ? (
+                <p className="text-[12px]" style={{ color: "var(--muted)" }}>
+                  No Gmail outreach draft is stored. No contact or draft is claimed unless persisted evidence exists.
+                </p>
+              ) : (
+                outreachDrafts.map((draft) => (
+                  <div key={draft.id} className="card-quiet p-3 stack" style={{ gap: 4 }}>
+                    <div className="between">
+                      <div className="text-[12.5px] font-medium">{draft.contactName}{draft.contactTitle ? ` · ${draft.contactTitle}` : ""}</div>
+                      <span className={`badge ${draft.status === "sent" ? "badge-good" : draft.status === "failed" ? "badge-warn" : "badge-neutral"}`}>
+                        {draft.status === "draft_created" ? "Gmail draft created — not sent" : draft.status === "sent" ? "Email sent by owner" : draft.status.replace(/_/g, " ")}
+                      </span>
+                    </div>
+                    <div className="text-[11.5px]" style={{ color: "var(--muted)" }}>{draft.recipient} · {draft.subject}</div>
+                    <div className="text-[11px]" style={{ color: "var(--muted)" }}>
+                      CV hash {draft.cvSha256.slice(0, 12)}… · cover hash {draft.coverSha256.slice(0, 12)}… · created {formatDateTime(draft.createdAt)}
+                      {draft.gmailDraftId ? ` · Gmail draft ${draft.gmailDraftId}` : ""}
+                      {draft.sentAt ? ` · sent ${formatDateTime(draft.sentAt)}` : " · no send recorded"}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </section>
+
           <section className="card">
             <div className="card-head">
               <div>
@@ -340,14 +407,29 @@ export default async function ApplicationDetailPage({
             <div className="card-head">
               <div>
                 <h2>History</h2>
-                <p className="card-sub">Audit records for this application.</p>
+                <p className="card-sub">Application and audit timeline for this application.</p>
               </div>
             </div>
             <div className="card-body">
-              {timeline.length === 0 ? (
+              {timeline.length === 0 && !app.email_handoff_sent_at ? (
                 <p className="text-[12px]" style={{ color: "var(--muted)" }}>No events recorded yet.</p>
               ) : (
                 <div className="feed">
+                  {app.email_handoff_sent_at ? (
+                    <div className="feed-item">
+                      <span className="feed-dot" style={{ color: "var(--accent)" }}>✉</span>
+                      <div>
+                        <div className="feed-text">
+                          <strong>Email application sent by you</strong>
+                          {app.application_email ? ` to ${app.application_email}` : ""}.
+                          {app.email_handoff_note ? ` ${app.email_handoff_note}` : ""}
+                        </div>
+                        <div className="feed-time">
+                          Owner attestation · {formatDateTime(app.email_handoff_sent_at)} · not employer confirmation
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
                   {timeline.map((event, i) => (
                     <div key={i} className="feed-item">
                       <span className="feed-dot">·</span>
@@ -428,7 +510,10 @@ export default async function ApplicationDetailPage({
               <div className="between"><span style={{ color: "var(--muted)" }}>Created</span><span>{formatDate(app.created_at)}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Last update</span><span>{formatDateTime(app.last_update)}</span></div>
               <div className="between"><span style={{ color: "var(--muted)" }}>Match score</span><span>{app.match_score ?? "—"}%</span></div>
-              <div className="between"><span style={{ color: "var(--muted)" }}>Submission</span><span>{submissionEvidenceLabel(app)}</span></div>
+              <div className="between"><span style={{ color: "var(--muted)" }}>Submission</span><span>{confirmationLabel}</span></div>
+              {evidenceState === "verified" ? (
+                <div className="between"><span style={{ color: "var(--muted)" }}>Verification source</span><span>{submissionConfirmationSourceLabel({ evidence: app.submission_evidence })}</span></div>
+              ) : null}
               {evidenceState === "verified" ? (
                 <div className="between"><span style={{ color: "var(--muted)" }}>Confirmation</span><span className="num">{app.confirmation}</span></div>
               ) : null}

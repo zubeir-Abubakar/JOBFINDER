@@ -17,6 +17,7 @@ import {
   type OutboxRow,
   type OutboxSender,
 } from "./notify";
+import { resendConfig, resendConfigured, senderAddress } from "./resend";
 import { statusLabel } from "./application-status";
 import { getRecruitmentPolicy } from "./recruitment-policy";
 import {
@@ -256,6 +257,8 @@ export type ExecutiveBriefDelivery = {
   recipient: string | null;
   recipientMasked: string | null;
   sender: string | null;
+  /** Delivery provider recorded on the outbox row (`resend`, or legacy `gmail`). */
+  provider: string | null;
   subject: string | null;
   messageId: string | null;
   threadId: string | null;
@@ -273,6 +276,12 @@ export type ExecutiveBriefDelivery = {
   appResponse: string | null;
   dashboardUrl: string | null;
   canResend: boolean;
+  /**
+   * The recorded block came from a configuration fault that the current
+   * resolver no longer reports. It is historical evidence, not the present
+   * cause, and must never be presented as a current failure.
+   */
+  staleConfiguration: boolean;
   generatedAt: string;
 };
 
@@ -1336,17 +1345,31 @@ function deliverySnapshot(input: {
   const lastError = row?.last_error ?? null;
   const detail = input.detail ?? row?.delivery_evidence ?? lastError ?? null;
   const dashboardUrl = input.dashboardUrl ?? null;
+  // A stored "RESEND_FROM/RESEND_API_KEY missing" reason is only meaningful if
+  // the resolver still reports it. Once the resolver is ready, that text is a
+  // historical record and is labelled as such instead of being replayed as the
+  // current cause of a block.
+  const storedConfigurationFault = /RESEND_(?:API_KEY|FROM)[^.]*?(?:missing|not a valid)|Resend is not ready|not a valid Resend key/i.test(
+    `${lastError ?? ""} ${detail ?? ""}`,
+  );
+  const staleConfiguration =
+    resendConfigured() && ["blocked", "failed"].includes(state) && storedConfigurationFault;
+  const resolvedSender = senderAddress(resendConfig().from);
+  const message = staleConfiguration
+    ? `The previous attempt for this report was not sent because ${detail ?? "a configuration requirement was missing"}. That configuration is resolved now: Resend is configured with ${resolvedSender}. Nothing is resent automatically — a deliberate resend is required, and it reuses this report.`
+    : deliveryStateMessage(state, detail ?? lastError);
   return {
     reportId: row?.report_id ?? input.reportId,
     notificationId: row?.notification_id ?? null,
     outboxId: row?.id ?? null,
     period: input.period,
     state,
-    message: deliveryStateMessage(state, lastError ?? detail),
+    message,
     detail: detail ?? "No further delivery evidence is recorded.",
     recipient: row?.recipient ?? null,
     recipientMasked: maskRecipient(row?.recipient ?? null),
     sender: row?.sender ?? null,
+    provider: row?.provider ?? null,
     subject: row?.subject ?? input.subject ?? null,
     messageId: row?.provider_message_id ?? null,
     threadId: row?.provider_thread_id ?? null,
@@ -1364,6 +1387,7 @@ function deliverySnapshot(input: {
     appResponse: row?.gmail_response ?? null,
     dashboardUrl,
     canResend: ["failed", "blocked", "bounced"].includes(state),
+    staleConfiguration,
     generatedAt: input.generatedAt,
   };
 }
@@ -1418,6 +1442,7 @@ export async function sendDailyExecutiveBrief(options: {
     body: content.text,
     emailBody: content.text,
     html: content.html,
+    now,
   });
   const existing = outboxByDedupeKey(`executive_brief:${period.key}`);
   const deliveryState = existing ? deliveryStateForRow(existing) : queued.deliveryState;
@@ -1448,7 +1473,7 @@ export async function sendDailyExecutiveBrief(options: {
     emailQueued: queued.emailQueued,
     detail:
       status === "queued"
-        ? "Queued to the durable Gmail outbox. Gmail acceptance is recorded separately from inbox delivery."
+        ? "Queued to the durable Resend outbox. Provider acceptance is recorded separately from inbox delivery."
         : status === "duplicate"
           ? "Today's executive brief already exists; a second copy was not queued."
           : queued.emailReason ?? "The in-app report was recorded, but no email was queued.",
@@ -1535,11 +1560,11 @@ export async function sendExecutiveBriefNow(options: {
     return finish(null, "blocked", "Daily report delivery is disabled in Settings.");
   }
   if (!recipient) {
-    return finish(null, "blocked", "No configured notification recipient is available. Gmail must be connected and the owner address saved.");
+    return finish(null, "blocked", "No configured notification recipient is available. Save the owner address in Settings; Resend delivery also requires RESEND_API_KEY.");
   }
   const readiness = options.readiness
     ? await options.readiness()
-    : await import("./gmail").then((gmail) => gmail.gmailSendReadiness());
+    : await import("./resend").then((resend) => resend.resendSendReadiness());
   if (!readiness.ok) {
     return finish(null, "blocked", readiness.detail);
   }
@@ -1548,8 +1573,9 @@ export async function sendExecutiveBriefNow(options: {
   if (existing) {
     const state = deliveryStateForRow(existing);
     if (!options.resend) {
+      const previous = existing.last_error ?? existing.delivery_evidence ?? "The previous attempt did not result in delivery.";
       const detail = ["failed", "blocked", "bounced"].includes(state)
-        ? `${existing.last_error ?? existing.delivery_evidence ?? "The previous attempt did not result in delivery."} A new copy requires an explicit resend.`
+        ? `Previous attempt: ${previous} Resend is configured with ${senderAddress(resendConfig().from)}; a new copy requires an explicit resend and no duplicate is created.`
         : "This report already has an outbox record; a duplicate was not submitted.";
       return finish(existing, state, detail);
     }
@@ -1578,6 +1604,7 @@ export async function sendExecutiveBriefNow(options: {
       emailBody: content.text,
       html: content.html,
       deferQueue: true,
+      now,
     });
     if (!queued.emailQueued) {
       return finish(queued.outboxId ? outboxById(queued.outboxId) : null, queued.deliveryState, queued.emailReason ?? "The report was generated but no email was queued.");
@@ -1611,7 +1638,13 @@ export function latestExecutiveBriefDelivery(): ExecutiveBriefDelivery {
     "SELECT * FROM notification_outbox WHERE kind = ? AND dedupe_key NOT LIKE 'executive_brief_test:%' ORDER BY created_at DESC LIMIT 1",
     [EXECUTIVE_BRIEF_KIND],
   );
-  const stored = getSetting<(ExecutiveBriefSendResult & { delivery?: ExecutiveBriefDelivery }) | null>("executive_brief_last", null);
+  // `sendExecutiveBriefNow` stores the delivery snapshot at the top level, so
+  // the reader must accept `state` there as well as the nested `delivery.state`
+  // written by the scheduled sender. Without this a stored blocked report is
+  // misreported as "generated".
+  const stored = getSetting<
+    (ExecutiveBriefSendResult & { delivery?: ExecutiveBriefDelivery; state?: DeliveryState }) | null
+  >("executive_brief_last", null);
   const operationalStored = stored && !(stored.reportId ?? "").startsWith("brief:test:") ? stored : null;
   const period = row?.report_id ? executiveBriefPeriod(new Date()) : operationalStored?.period ?? executiveBriefPeriod(new Date());
   const dashboardUrl = operationalStored?.delivery?.dashboardUrl ?? null;
@@ -1631,7 +1664,7 @@ export function latestExecutiveBriefDelivery(): ExecutiveBriefDelivery {
       period,
       generatedAt: operationalStored.generatedAt,
       dashboardUrl,
-      state: operationalStored.delivery?.state ?? operationalStored.deliveryState ?? "generated",
+      state: operationalStored.delivery?.state ?? operationalStored.state ?? operationalStored.deliveryState ?? "generated",
       detail: operationalStored.detail,
     });
   }

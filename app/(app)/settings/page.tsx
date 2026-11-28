@@ -30,7 +30,7 @@ import { Icon } from "@/components/icons";
 import { tempStorageStats } from "@/lib/temp-store";
 import { effectiveMinMatchScore } from "@/lib/scoring";
 import { relativeTime } from "@/lib/format";
-import type { GmailTestResult } from "@/lib/gmail";
+import type { ResendSendResult } from "@/lib/resend";
 
 export const dynamic = "force-dynamic";
 
@@ -57,7 +57,7 @@ export default async function SettingsPage({
   const emailConfig = settings.email ?? { connected: false, provider: "gmail", sender: "", account: "" };
   const emailTest =
     settings.email_test_last && typeof settings.email_test_last === "object"
-      ? (settings.email_test_last as GmailTestResult)
+      ? (settings.email_test_last as ResendSendResult)
       : null;
   const stats = storageStats();
   const cache = tempStorageStats();
@@ -438,28 +438,28 @@ export default async function SettingsPage({
             </form>
             {emailTest ? (
               <div
-                className={`alert ${emailTest.status === "accepted" ? "alert-ok" : emailTest.status === "unverified" ? "alert-warn" : "alert-error"} mt-3`}
+                className={`alert ${emailTest.status === "accepted" ? "alert-ok" : emailTest.status === "api_error" ? "alert-warn" : "alert-error"} mt-3`}
               >
                 <strong>
                   {emailTest.status === "accepted"
-                    ? "Gmail accepted the test message."
-                    : emailTest.status === "unverified"
-                      ? "Gmail response was not conclusive."
-                      : emailTest.status === "authentication_failed"
-                        ? "Gmail authentication failed."
-                        : emailTest.status === "missing_configuration"
-                          ? "Gmail is not configured."
-                          : emailTest.status === "invalid_recipient"
-                            ? "Notification recipient is invalid."
-                            : emailTest.status === "permission_denied"
-                              ? "Gmail permission is missing."
-                              : "Gmail API error."}
+                    ? "Resend accepted the test message."
+                    : emailTest.status === "authentication_failed"
+                      ? "Resend rejected the API key."
+                      : emailTest.status === "missing_configuration"
+                        ? "Resend is not configured."
+                        : emailTest.status === "invalid_recipient"
+                          ? "Notification recipient is invalid."
+                          : emailTest.status === "permission_denied"
+                            ? "Resend denied this send."
+                            : emailTest.status === "invalid_request"
+                              ? "Resend rejected the sender or message content."
+                              : "Resend could not be reached."}
                 </strong>
                 <div className="mt-1">{emailTest.detail}</div>
                 <div className="mt-1 text-[11px]" style={{ color: "var(--muted)" }}>
-                  Provider: Gmail · Recipient: {emailTest.recipientMasked || "not configured"}
-                  {emailTest.messageId ? <> · Gmail message ID: {emailTest.messageId}</> : null}
-                  {emailTest.delivery === "unverified" ? " · Delivery unverified" : null}
+                  Provider: Resend · Recipient: {emailTest.recipientMasked || "not configured"}
+                  {emailTest.messageId ? <> · Provider message ID: {emailTest.messageId}</> : null}
+                  {emailTest.status === "accepted" ? " · Inbox delivery not independently confirmed" : null}
                   {emailTest.at ? <> · {relativeTime(emailTest.at)}</> : null}
                 </div>
               </div>

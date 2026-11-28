@@ -42,6 +42,8 @@ type ExtractedControl = {
   options: Array<{ value: string; label: string }>;
   selector: string | null;
   optionLabel: string | null;
+  /** Caption of the surrounding field wrapper, without the control's placeholder. */
+  context: string;
 };
 
 type ExtractedForm = {
@@ -65,15 +67,29 @@ type FrameSnapshot = {
   applicationSignal: number;
 };
 
-type FieldGroup = {
+export type FieldGroup = {
   field: CandidateField;
   controls: ExtractedControl[];
   kind: "text" | "select" | "file" | "check" | "radio";
 };
 
+export type BrowserFormProbe = {
+  executor: "playwright";
+  pageUrl: string;
+  finalUrl: string;
+  formFound: boolean;
+  fields: number;
+  filledFields: string[];
+  submit: { selector: string; kind: "next" | "submit"; label: string } | null;
+  applicationFrame: ReturnType<typeof frameEvidence>;
+  screenshot: string | null;
+};
+
 export type BrowserFormRun = {
   plan: CandidateFormPlan;
   result: CandidateFormResult;
+  /** Present only when the caller asked to inspect and fill without submitting. */
+  probe?: BrowserFormProbe;
 };
 
 type BrowserFormInput = {
@@ -85,6 +101,13 @@ type BrowserFormInput = {
   authorised?: Record<string, string>;
   /** Additional form-provider hosts the caller has tied to this employer. */
   allowedFrameHosts?: string[];
+  /**
+   * Verification-only mode: render, detect, fill and validate every field, then
+   * stop before activating any submit or next control. Nothing is sent.
+   */
+  probeOnly?: boolean;
+  /** Optional screenshot path for probe evidence. */
+  screenshotPath?: string;
 };
 
 const BROWSER_USER_AGENT =
@@ -127,7 +150,7 @@ function groupFields(controls: ExtractedControl[]): FieldGroup[] {
   const groups: FieldGroup[] = [];
   const seen = new Map<string, FieldGroup>();
   for (const control of controls) {
-    if (!control.name || control.type === "hidden") continue;
+    if (!control.name || control.type === "hidden" || control.hidden) continue;
     if (["submit", "button", "reset", "image"].includes(control.type)) continue;
     const isChoice = control.type === "radio" || control.type === "checkbox";
     if (isChoice) {
@@ -163,19 +186,68 @@ function groupFields(controls: ExtractedControl[]): FieldGroup[] {
     groups.push({
       field: {
         name: control.name,
-        label: control.label || control.name,
+        // Upload widgets frequently share one placeholder. The wrapper caption
+        // is preferred over the placeholder so the CV and cover-letter fields
+        // are told apart by real form structure, not by shared text.
+        label: control.label || control.context || control.name,
         type: control.type === "textarea" ? "textarea" : control.type === "select" ? "select" : control.type === "file" ? "file" : "text",
         required: control.required,
         options: control.options,
         hidden: false,
         accept: control.accept,
         value: null,
+        context: control.context || undefined,
       },
       controls: [control],
       kind: control.type === "select" ? "select" : control.type === "file" ? "file" : "text",
     });
   }
   return groups;
+}
+
+function uploadSignature(group: FieldGroup): string {
+  const field = group.field;
+  // A generated DOM id ("cu-form-file-field-input-4") does not say which
+  // document belongs in the field. Only a semantic name does.
+  const semanticName = /cv|resume|curriculum|cover|motivation|lebenslauf|anschreiben/i.test(field.name)
+    ? field.name
+    : "";
+  return [semanticName, field.label, field.context ?? "", field.accept ?? ""]
+    .join("|")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * A form can render several upload controls that are indistinguishable by DOM
+ * name, label, caption and `accept` type. Filling all of them with the CV would
+ * attach the CV to the wrong question, so the run stops and names the ambiguity
+ * instead. This is what the Digt ClickUp form exposed.
+ */
+export function fileUploadBlocker(groups: FieldGroup[]): string | null {
+  const uploads = groups.filter((group) => group.kind === "file");
+  if (uploads.length <= 1) return null;
+  const signatures = new Map<string, FieldGroup[]>();
+  for (const group of uploads) {
+    const signature = uploadSignature(group);
+    signatures.set(signature, [...(signatures.get(signature) ?? []), group]);
+  }
+  const identical = [...signatures.values()].filter((list) => list.length > 1);
+  if (identical.length > 0) {
+    const fields = identical[0];
+    return `The form has ${fields.length} upload fields that cannot be told apart ("${fields[0].field.label}"): their DOM names, labels and accept types are identical. No file was attached to them and nothing was sent. The owner must say which field accepts the CV and which accepts the cover letter before a future attempt.`;
+  }
+  const byCategory = new Map<string, FieldGroup[]>();
+  for (const group of uploads) {
+    const category = categoryFor(group.field);
+    byCategory.set(category, [...(byCategory.get(category) ?? []), group]);
+  }
+  const duplicated = [...byCategory.entries()].find(([category, list]) => category !== "unknown_file" && list.length > 1);
+  if (duplicated) {
+    return `The form has ${duplicated[1].length} upload fields that all read as "${duplicated[0].replace(/_/g, " ")}" with no way to tell them apart. No file was attached to them and nothing was sent.`;
+  }
+  return null;
 }
 
 async function visibleSecurityBlocker(scope: FormScope): Promise<string | null> {
@@ -214,6 +286,40 @@ async function visibleSecurityBlocker(scope: FormScope): Promise<string | null> 
     if (!password) return null;
   }
   return security;
+}
+
+/**
+ * JavaScript ATS pages render their form after the document loads. Extraction
+ * must wait for a bounded moment instead of declaring the page empty on the
+ * first synchronous paint.
+ */
+async function waitForRenderedControls(scope: FormScope, timeoutMs = 8_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  let count = 0;
+  let stable = 0;
+  while (Date.now() < deadline) {
+    // Hydrating forms often render a skeleton first and append dynamic
+    // questions later. A form may publish an explicit readiness marker; absent
+    // one, wait until the visible control count has stopped changing instead of
+    // extracting the first non-empty skeleton.
+    const ready = await scope
+      .locator('[data-form-ready="true"], form[data-ready="true"]')
+      .count()
+      .catch(() => 0);
+    const next = await scope
+      .locator('input:visible, textarea:visible, select:visible')
+      .count()
+      .catch(() => 0);
+    if (next > 0) {
+      if (ready > 0) return next;
+      if (next === count) stable += 1;
+      else stable = 0;
+      if (stable >= 2) return next;
+    }
+    count = next;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  return count;
 }
 
 async function extractForm(scope: FormScope): Promise<ExtractedForm> {
@@ -260,6 +366,29 @@ async function extractForm(scope: FormScope): Promise<ExtractedForm> {
       return "";
     };
 
+    // The visible caption of an upload control's field wrapper. The control's
+    // own placeholder is excluded by removing form controls from a clone.
+    const contextFor = (element: Element): string => {
+      let node: Element | null = element.parentElement;
+      for (let depth = 0; depth < 3 && node; depth += 1) {
+        const tag = node.tagName.toLowerCase();
+        // Never read the whole form or page: that would mix the CV caption with
+        // the cover-letter caption and mislabel both fields.
+        if (tag === "form" || tag === "body" || tag === "html") break;
+        const controlCount = node.querySelectorAll("input, textarea, select").length;
+        if (controlCount <= 2) {
+          const clone = node.cloneNode(true) as Element;
+          Array.from(clone.querySelectorAll("input, textarea, select, button, script, style")).forEach((child) =>
+            child.remove(),
+          );
+          const text = (clone.textContent ?? "").replace(/\s+/g, " ").trim();
+          if (text.length >= 2 && text.length <= 120) return text;
+        }
+        node = node.parentElement;
+      }
+      return "";
+    };
+
     const selectorFor = (element: Element): string | null => {
       const id = element.getAttribute("id");
       if (id) return `#${CSS.escape(id)}`;
@@ -301,18 +430,30 @@ async function extractForm(scope: FormScope): Promise<ExtractedForm> {
               label: textOf(option) || option.value,
             }))
           : [];
+      // React/Greenhouse/ClickUp forms frequently omit `name` and identify a
+      // control only by id or aria-label. Dropping those controls made a
+      // perfectly visible form look empty.
+      const name =
+        (element.getAttribute("name") ?? "").trim() ||
+        (element.getAttribute("id") ?? "").trim() ||
+        (element.getAttribute("aria-label") ?? "").trim() ||
+        (element.getAttribute("placeholder") ?? "").trim();
       return {
-        name: (element.getAttribute("name") ?? "").trim(),
+        name,
         label: labelFor(element),
         groupLabel: groupLabelFor(element),
         type,
         required: element.hasAttribute("required") || element.getAttribute("aria-required") === "true",
-        hidden: type === "hidden",
+        // CSS-hidden conditional fields are not questions yet. Hidden file
+        // inputs remain usable because custom upload widgets often hide the
+        // native control behind a drop zone.
+        hidden: type === "hidden" || (type !== "file" && !isVisible(element)),
         accept: element.getAttribute("accept"),
         value: element.getAttribute("value"),
         options,
         selector: selectorFor(element),
         optionLabel: textOf(element.closest("label")),
+        context: type === "file" ? contextFor(element) : "",
       };
     });
 
@@ -424,7 +565,13 @@ async function fillField(
   if (question.action !== "answer" || question.answer === null) return null;
   try {
     if (group.kind === "file") {
-      const file = question.category === "cover_file" ? documents.cover : group.field.name.match(/cover|motivation/i) ? documents.cover : documents.cv;
+      // The field must have been identified as the CV or the cover letter from
+      // its own DOM structure. An unidentified upload is a blocker upstream,
+      // never a default CV upload.
+      if (question.category !== "cv_file" && question.category !== "cover_file") {
+        return "The upload field could not be identified as the CV or the cover letter.";
+      }
+      const file = question.category === "cover_file" ? documents.cover : documents.cv;
       if (!file) return "The required document is not available.";
       const control = group.controls[0];
       if (!control.selector) return "The upload field has no usable selector.";
@@ -459,14 +606,46 @@ async function fillField(
 }
 
 /** Every completed control is read back. A controlled component that discards a verified value stops the send. */
+/** URL controls often normalise a verified value (add https://, strip a
+ * trailing slash or www). That is not a changed answer. */
+function comparableValue(value: string, group: FieldGroup): string {
+  const raw = value.trim();
+  const urlish =
+    group.field.type === "url" ||
+    /url|website|linkedin|homepage|portfolio/i.test(`${group.field.label} ${group.field.name}`);
+  if (!urlish) return raw;
+  return raw
+    .replace(/^https?:\/\//i, "")
+    .replace(/^www\./i, "")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+/**
+ * Upload persistence is checked by filename, not by a non-zero count: a widget
+ * can keep a placeholder file while discarding the validated document.
+ */
+export function uploadPersistenceIssue(kept: string[], expected: string | null): string | null {
+  if (kept.length === 0) return "The uploaded document was cleared by the form.";
+  if (expected && !kept.includes(expected)) {
+    return `The form kept "${kept.join(", ")}" instead of the validated document "${expected}".`;
+  }
+  return null;
+}
+
 async function verifyField(scope: FormScope, group: FieldGroup, question: CandidateQuestion): Promise<string | null> {
   if (question.action !== "answer" || question.answer === null) return null;
   try {
     if (group.kind === "file") {
       const control = group.controls[0];
       if (!control.selector) return "The upload field has no usable selector.";
-      const count = await scope.locator(control.selector).first().evaluate((element) => (element as HTMLInputElement).files?.length ?? 0);
-      return count > 0 ? null : "The uploaded document was cleared by the form.";
+      const names = await scope
+        .locator(control.selector)
+        .first()
+        .evaluate((element) =>
+          Array.from((element as HTMLInputElement).files ?? []).map((file) => file.name),
+        );
+      return uploadPersistenceIssue(names, question.answer);
     }
     if (group.kind === "radio" || group.kind === "check") {
       const selected = group.controls.find(
@@ -484,7 +663,7 @@ async function verifyField(scope: FormScope, group: FieldGroup, question: Candid
     const control = group.controls[0];
     if (!control.selector) return "The field has no usable selector.";
     const value = await scope.locator(control.selector).first().inputValue();
-    if (value.trim() !== question.answer.trim()) {
+    if (comparableValue(value, group) !== comparableValue(question.answer, group)) {
       return `The form changed the verified value for "${group.field.label || group.field.name}".`;
     }
     if (group.field.type === "email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())) {
@@ -981,6 +1160,7 @@ export async function runBrowserCandidateForm(input: BrowserFormInput): Promise<
         return { plan, result: blockedBrowserResult(plan, "security_challenge", applicationFrame) };
       }
 
+      await waitForRenderedControls(applicationFrame.frame);
       const extracted = await extractForm(applicationFrame.frame);
       if (!extracted.fields.some((field) => !field.hidden)) {
         const plan = planFor({
@@ -994,15 +1174,35 @@ export async function runBrowserCandidateForm(input: BrowserFormInput): Promise<
         });
         return { plan, result: blockedBrowserResult(plan, null) };
       }
-      const groups = groupFields(extracted.fields);
+      // A password control is an access control, never a candidate question.
+      // Asking the owner to supply an employer password would be a credential
+      // request; stop with a login blocker instead.
+      if (extracted.fields.some((field) => field.type === "password")) {
+        const detail = "The employer's page requires an account password; credential entry is never automated.";
+        const plan = planFor({
+          pageUrl: page.url(),
+          action,
+          groups: [],
+          questions: [],
+          blockers: [detail],
+          status: "intervention",
+          detail,
+        });
+        return { plan, result: blockedBrowserResult(plan, "account_login", applicationFrame) };
+      }
+      let groups = groupFields(extracted.fields);
       const fieldView = groups.map((group) => group.field);
       const authorised = input.authorised ?? {};
-      const questions = fieldView.map((field) =>
+      let questions = fieldView.map((field) =>
         answerFor(categoryFor(field), field, input.profile, input.documents, authorised),
       );
-      const blockers = questions
-        .filter((question) => question.action === "intervention")
-        .map((question) => `${question.label || question.name}: ${question.reason}`);
+      const uploadIssue = fileUploadBlocker(groups);
+      const blockers = [
+        ...(uploadIssue ? [uploadIssue] : []),
+        ...questions
+          .filter((question) => question.action === "intervention")
+          .map((question) => `${question.label || question.name}: ${question.reason}`),
+      ];
       action = actionFor(applicationFrame.frame, page, extracted.action);
       lastGroups = groups;
       lastQuestions = questions;
@@ -1073,7 +1273,149 @@ export async function runBrowserCandidateForm(input: BrowserFormInput): Promise<
         }
       }
 
+      // Conditional questions can be revealed after a select, checkbox or file
+      // upload. Re-scan once and fill only fields that were not present before,
+      // so a newly required question is never submitted empty.
+      const knownKeys = () => new Set(groups.map((group) => `${group.kind}:${group.field.name}`));
+      const newlyRevealed = (candidate: ExtractedForm): FieldGroup[] => {
+        const known = knownKeys();
+        return groupFields(candidate.fields).filter(
+          (group) => !known.has(`${group.kind}:${group.field.name}`),
+        );
+      };
+      let revealed = await extractForm(applicationFrame.frame);
+      let revealedGroups = newlyRevealed(revealed);
+      for (let attempt = 0; attempt < 5 && revealedGroups.length === 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        revealed = await extractForm(applicationFrame.frame);
+        revealedGroups = newlyRevealed(revealed);
+      }
+      if (revealedGroups.length > 0) {
+        const revealedQuestions = revealedGroups.map((group) =>
+          answerFor(categoryFor(group.field), group.field, input.profile, input.documents, authorised),
+        );
+        const revealedBlockers = [
+          ...(fileUploadBlocker(revealedGroups) ? [fileUploadBlocker(revealedGroups) as string] : []),
+          ...revealedQuestions
+            .filter((question) => question.action === "intervention")
+            .map((question) => `${question.label || question.name}: ${question.reason}`),
+        ];
+        groups = [...groups, ...revealedGroups];
+        questions = [...questions, ...revealedQuestions];
+        lastGroups = groups;
+        lastQuestions = questions;
+        if (revealedBlockers.length > 0) {
+          const plan = planFor({
+            pageUrl: page.url(),
+            action,
+            groups,
+            questions,
+            blockers: revealedBlockers,
+          });
+          return {
+            plan,
+            result: blockedBrowserResult(plan, externalRequirementFor(revealedQuestions, null), applicationFrame),
+          };
+        }
+        for (const [index, group] of revealedGroups.entries()) {
+          const question = revealedQuestions[index];
+          const fillError = await fillField(applicationFrame.frame, group, question, input.documents);
+          const verifyError = fillError
+            ? null
+            : await verifyField(applicationFrame.frame, group, question);
+          const error = fillError ?? verifyError;
+          if (error) {
+            const plan = planFor({
+              pageUrl: page.url(),
+              action,
+              groups,
+              questions,
+              blockers: [error],
+              status: "failed",
+              detail: `${error} Nothing was sent.`,
+            });
+            return {
+              plan,
+              result: {
+                status: "failed",
+                detail: plan.detail,
+                httpStatus: null,
+                reference: null,
+                endpoint: plan.action,
+                finalUrl: page.url(),
+                evidence: { sent: false, executor: "playwright", blockers: plan.blockers, questions },
+              },
+            };
+          }
+        }
+      }
+
+      if (input.probeOnly) {
+        // Hard stop before any submit/next control. This is the only code path
+        // that may run with probeOnly=true, and it returns unconditionally.
+        let screenshot: string | null = null;
+        if (input.screenshotPath) {
+          try {
+            await page.screenshot({ path: input.screenshotPath, fullPage: true });
+            screenshot = input.screenshotPath;
+          } catch {
+            screenshot = null;
+          }
+        }
+        const filledFields = questions.filter((question) => question.action === "answer").map((question) => question.name);
+        const probe: BrowserFormProbe = {
+          executor: "playwright",
+          pageUrl,
+          finalUrl: applicationFrame.frame.url() || page.url(),
+          formFound: true,
+          fields: groups.length,
+          filledFields,
+          submit: extracted.submit,
+          applicationFrame: frameEvidence(applicationFrame),
+          screenshot,
+        };
+        const plan = planFor({ pageUrl: page.url(), action, groups, questions, blockers: [] });
+        return {
+          plan,
+          probe,
+          result: {
+            status: "blocked",
+            detail: `Probe only: the rendered form was detected, ${filledFields.length} field(s) were filled and verified, and no submit control was activated. Nothing was sent.`,
+            httpStatus: null,
+            reference: null,
+            endpoint: action,
+            finalUrl: probe.finalUrl,
+            evidence: { sent: false, executor: "playwright", probeOnly: true, blockers: [], questions },
+          },
+        };
+      }
+
       const submit = extracted.submit;
+      // A CAPTCHA is an access control even when its widget is visually hidden
+      // until the final click (invisible reCAPTCHA). Presence in the DOM is
+      // enough to stop before the send control is activated.
+      const captchaPresent = await applicationFrame.frame
+        .evaluate(() =>
+          Boolean(
+            document.querySelector(
+              'iframe[src*="recaptcha" i], iframe[src*="hcaptcha" i], .g-recaptcha, .h-captcha, [data-sitekey]',
+            ),
+          ),
+        )
+        .catch(() => false);
+      if (captchaPresent) {
+        const detail = "The application form contains a CAPTCHA, which is never bypassed.";
+        const plan = planFor({
+          pageUrl: page.url(),
+          action,
+          groups,
+          questions,
+          blockers: [detail],
+          status: "security",
+          detail,
+        });
+        return { plan, result: blockedBrowserResult(plan, "security_challenge", applicationFrame) };
+      }
       if (!submit) {
         const plan = planFor({
           pageUrl: page.url(),
@@ -1286,6 +1628,26 @@ export async function runBrowserCandidateForm(input: BrowserFormInput): Promise<
       }
 
       if (!response) {
+        const clientErrors = await visibleValidationErrors(applicationFrame.frame);
+        if (clientErrors.length > 0) {
+          return {
+            plan,
+            result: {
+              status: "failed",
+              detail: `The form rejected the application: ${clientErrors.join(" ")} Nothing was sent.`,
+              httpStatus,
+              reference: null,
+              endpoint: plan.action,
+              finalUrl,
+              evidence: {
+                ...evidenceBase,
+                sent: null,
+                blockers: clientErrors,
+                responseSnippet: text.slice(0, 800),
+              },
+            },
+          };
+        }
         return {
           plan,
           result: {

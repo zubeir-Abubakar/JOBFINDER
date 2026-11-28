@@ -29,6 +29,21 @@ export type EmailMimeResult = {
   rfcMessageId: string;
 };
 
+export type OutreachAttachment = {
+  filename: string;
+  mime: string;
+  content: Buffer;
+};
+
+export type OutreachMimeInput = {
+  from: string;
+  to: string;
+  subject: string;
+  text: string;
+  attachments: OutreachAttachment[];
+  messageId?: string | null;
+};
+
 function header(value: string): string {
   return value.replace(/[\r\n]+/g, " ").trim().slice(0, 998);
 }
@@ -128,6 +143,51 @@ export function buildEmailMime(input: EmailMimeInput): EmailMimeResult {
 
   const message = `${headers.join("\r\n")}\r\n\r\n${body}`;
   return { raw: Buffer.from(message, "utf8").toString("base64url"), usedLogo, rfcMessageId };
+}
+
+/**
+ * Plain-text outreach MIME with vacancy-specific PDF attachments. No logo or
+ * HTML is inserted, so the message stays small and the attachment set is
+ * exactly the validated CV and cover letter.
+ */
+export function buildOutreachMime(input: OutreachMimeInput): { raw: string; rfcMessageId: string } {
+  const from = header(input.from || "AT AI Workforce");
+  const domain = from.match(/@([^>\s]+)/)?.[1] ?? "atw.local";
+  const rfcMessageId = header(input.messageId ?? `<atw-outreach-${crypto.randomUUID()}@${domain}>`);
+  const boundary = `atw-outreach-${crypto.randomBytes(12).toString("hex")}`;
+  const headers = [
+    `From: ${from}`,
+    `To: ${header(input.to)}`,
+    `Subject: ${encodedHeader(input.subject)}`,
+    `Message-ID: ${rfcMessageId}`,
+    `Date: ${new Date().toUTCString()}`,
+    "MIME-Version: 1.0",
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+  ];
+  const parts = [
+    [
+      `--${boundary}`,
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      base64Body(input.text),
+    ].join("\r\n"),
+    ...input.attachments.map((attachment) => {
+      const filename = header(attachment.filename).replace(/["\\]/g, "_");
+      return [
+        `--${boundary}`,
+        `Content-Type: ${header(attachment.mime) || "application/octet-stream"}; name="${filename}"`,
+        "Content-Transfer-Encoding: base64",
+        `Content-Disposition: attachment; filename="${filename}"`,
+        "",
+        base64Body(attachment.content),
+      ].join("\r\n");
+    }),
+    `--${boundary}--`,
+    "",
+  ];
+  const message = `${headers.join("\r\n")}\r\n\r\n${parts.join("\r\n")}`;
+  return { raw: Buffer.from(message, "utf8").toString("base64url"), rfcMessageId };
 }
 
 /** Decode a generated raw message for tests and local previews. */

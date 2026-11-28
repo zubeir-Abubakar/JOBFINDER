@@ -5,7 +5,7 @@ import { getProfileData, profileCompleteness } from "@/lib/profile";
 import { getSetting } from "@/lib/settings";
 import { unreadNotifications } from "@/lib/notify";
 import { cleanupExpiredDocuments } from "@/lib/retention";
-import { PageHead, HeroStat, Empty, Flash } from "@/components/ui";
+import { PageHead, HeroStat, Stat, Empty, Flash } from "@/components/ui";
 import { relativeTime, param } from "@/lib/format";
 import { startAutonomousRecruitmentAction } from "@/lib/actions/recruitment";
 import { SubmitButton } from "@/components/SubmitButton";
@@ -14,6 +14,7 @@ import { statusLabel, statusClass } from "@/lib/application-status";
 import { boardColumnForRow } from "@/lib/application-board";
 import { getDashboardSnapshot } from "@/lib/dashboard-live";
 import { AgentCommandDashboard } from "@/components/AgentCommandDashboard";
+import { outreachDashboard, outreachQualityForDraft, type OutreachAttachmentState } from "@/lib/outreach";
 
 export const dynamic = "force-dynamic";
 
@@ -89,6 +90,24 @@ export default async function DashboardPage({
   // and the last actual health check. Unavailable measurements stay null.
   const workforce = getDashboardSnapshot();
 
+  // Outreach is counted from the outreach ledger, never from a template. The
+  // dashboard shows the same record the outreach inbox reads, so a draft can
+  // never be presented here as a sent email.
+  const outreach = outreachDashboard();
+  const outreachPreview = outreach.drafts.slice(0, 3);
+  const outreachQuality = new Map(
+    outreach.drafts.map((draft) => [draft.id, outreachQualityForDraft(draft.id)] as const),
+  );
+  const outreachQualityFailures = [...outreachQuality.values()].filter((assessment) => assessment?.ok === false).length;
+  const attachmentLabel = (state: OutreachAttachmentState): { className: string; label: string } =>
+    state === "attached"
+      ? { className: "badge badge-good", label: "Attached" }
+      : state === "quality_failed"
+        ? { className: "badge badge-bad", label: "Quality failed" }
+        : state === "wrong_vacancy"
+          ? { className: "badge badge-bad", label: "Wrong vacancy" }
+          : { className: "badge badge-warn", label: "Missing" };
+
   return (
     <>
       <Flash ok={param(sp.ok)} error={param(sp.error)} saved={param(sp.saved)} />
@@ -97,12 +116,17 @@ export default async function DashboardPage({
         title={`Good ${new Date().getHours() < 12 ? "morning" : new Date().getHours() < 18 ? "afternoon" : "evening"}, ${user.name.split(" ")[0]}`}
         sub="Your opportunities, confirmed submissions and the few things that need you."
         actions={
-          <form action={startAutonomousRecruitmentAction}>
-            <input type="hidden" name="return_to" value="/dashboard" />
-            <SubmitButton pendingLabel="Starting run…" className="btn btn-primary">
-              <Icon name="jobs" /> Start recruitment run
-            </SubmitButton>
-          </form>
+          <>
+            <Link href="/capabilities" className="btn" data-testid="dashboard-capabilities">
+              Capabilities
+            </Link>
+            <form action={startAutonomousRecruitmentAction}>
+              <input type="hidden" name="return_to" value="/dashboard" />
+              <SubmitButton pendingLabel="Starting run…" className="btn btn-primary">
+                <Icon name="jobs" /> Start recruitment run
+              </SubmitButton>
+            </form>
+          </>
         }
       />
 
@@ -139,6 +163,134 @@ export default async function DashboardPage({
           icon="shield"
           tone="amber"
         />
+      </section>
+
+      <section className="card mb-4" data-testid="dashboard-outreach-card" data-visual-id="dashboard-outreach">
+        <div className="card-head">
+          <div>
+            <h2>Hiring Manager Outreach</h2>
+            <p className="card-sub">
+              Prepared Gmail drafts and verified employer contacts from the outreach ledger. A prepared draft is not a sent email: a draft moves
+              to <strong>Sent</strong> only when a sent copy is observed in the connected mailbox.
+            </p>
+          </div>
+          <div className="row gap-2">
+            {outreachQualityFailures > 0 ? (
+              <Link
+                href="/outreach?quality=failed"
+                className="badge badge-bad"
+                data-testid="dashboard-outreach-quality-failed"
+                title="Only drafts whose deterministic quality check failed"
+              >
+                {outreachQualityFailures} with a failed quality check
+              </Link>
+            ) : null}
+            <Link href="/outreach" className="btn btn-sm btn-primary" data-testid="dashboard-outreach-open">
+              View prepared emails
+            </Link>
+          </div>
+        </div>
+        <div className="card-body stack" style={{ gap: 14 }}>
+          <section className="stats" aria-label="Outreach counters">
+            <Stat label="Prepared email drafts" value={outreach.counters.draftsPrepared} href="/outreach" />
+            <Stat
+              label="Verified employer contacts"
+              value={outreach.counters.verifiedContacts}
+              tone={outreach.counters.verifiedContacts ? "good" : undefined}
+              href="/outreach"
+            />
+            <Stat
+              label="Drafts awaiting review"
+              value={outreach.counters.awaitingReview}
+              tone={outreach.counters.awaitingReview ? "warn" : undefined}
+              href="/outreach"
+            />
+            <Stat
+              label="Emails actually sent by you"
+              value={outreach.counters.emailsSent}
+              tone={outreach.counters.emailsSent ? "good" : undefined}
+              href="/outreach"
+            />
+            <Stat label="Employer replies received" value={outreach.counters.repliesReceived} href="/outreach" />
+            <Stat
+              label="Drafts requiring intervention"
+              value={outreach.counters.needsIntervention}
+              tone={outreach.counters.needsIntervention ? "bad" : undefined}
+              href="/outreach"
+            />
+          </section>
+
+          {outreachPreview.length === 0 ? (
+            <p className="text-[12px]" style={{ color: "var(--muted)" }} data-testid="dashboard-outreach-empty">
+              No outreach draft is stored yet, so every counter is zero. A draft is created only when a verified employer-associated address and a
+              validated CV plus cover letter exist for a qualified vacancy. Nothing is invented to fill this card.
+            </p>
+          ) : (
+            <div className="table-wrap">
+              <table className="data responsive-cards" data-testid="dashboard-outreach-drafts">
+                <thead>
+                  <tr>
+                    <th>Employer &amp; role</th>
+                    <th>Recipient</th>
+                    <th>Attachments</th>
+                    <th>Email state</th>
+                    <th>Quality</th>
+                    <th aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {outreachPreview.map((draft) => {
+                    const cv = attachmentLabel(draft.cv.state);
+                    const cover = attachmentLabel(draft.cover.state);
+                    const quality = outreachQuality.get(draft.id) ?? null;
+                    return (
+                      <tr key={draft.id}>
+                        <td data-label="Employer & role">
+                          <Link href={`/outreach/${draft.id}`} className="cell-title">{draft.company}</Link>
+                          <div className="cell-sub">{draft.jobTitle}</div>
+                        </td>
+                        <td data-label="Recipient">
+                          <div className="cell-title">{draft.contactName}</div>
+                          <div className="cell-sub num">{draft.recipient}</div>
+                        </td>
+                        <td data-label="Attachments">
+                          <div className="flex flex-wrap gap-1">
+                            <span className={cv.className}>CV · {cv.label}</span>
+                            <span className={cover.className}>Cover · {cover.label}</span>
+                          </div>
+                        </td>
+                        <td data-label="Email state">
+                          <span className={`badge ${draft.status === "sent" ? "badge-good" : draft.status === "draft_created" ? "badge-info" : "badge-warn"}`}>
+                            {draft.status === "sent" ? "Sent by owner" : draft.status === "draft_created" ? "Draft — not sent" : draft.status === "draft_missing" ? "Draft missing" : draft.status === "failed" ? "Draft failed" : "Pending"}
+                          </span>
+                        </td>
+                        <td data-label="Quality">
+                          {quality ? (
+                            <span
+                              className={`badge ${quality.ok ? "badge-good" : "badge-bad"}`}
+                              title={quality.summary}
+                            >
+                              {quality.ok ? `Passed · ${quality.wordCount} words` : "Check failed — not ready to review"}
+                            </span>
+                          ) : (
+                            <span className="badge badge-neutral">Not assessed</span>
+                          )}
+                        </td>
+                        <td data-label="Actions" className="text-right">
+                          <Link href={`/outreach/${draft.id}`} className="btn btn-sm">Open and review</Link>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="hint">
+            Counts come from <code>outreach_drafts</code>, <code>outreach_contacts</code> and the matched mailbox messages. Drafted, sent and
+            replied are separate states, and no draft is counted as sent.
+          </p>
+        </div>
       </section>
 
       <AgentCommandDashboard initialSnapshot={workforce} />

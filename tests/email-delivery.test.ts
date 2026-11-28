@@ -103,7 +103,7 @@ test("a repeated Send Now does not submit a duplicate message", async () => {
   assert.match(delivery.detail, /duplicate|already has an outbox record/i);
 });
 
-test("accepted Gmail delivery stays distinct until Sent-folder evidence arrives", async () => {
+test("provider acceptance stays distinct until independent delivery evidence arrives", async () => {
   const delivery = await brief.sendExecutiveBriefNow({
     now: new Date("2026-12-02T10:00:00+01:00"),
     readiness: ready,
@@ -117,8 +117,9 @@ test("accepted Gmail delivery stays distinct until Sent-folder evidence arrives"
     }),
   });
   notifications.stopNotificationQueue();
-  assert.equal(delivery.state, "accepted_by_gmail");
+  assert.equal(delivery.state, "accepted_by_provider");
   assert.equal(delivery.sentObservedAt, null);
+  assert.match(delivery.message, /Resend has accepted.*not yet been independently confirmed/i);
 
   const delayed = await notifications.refreshOutboxSentObservation(delivery.outboxId as string, async (messageId) => ({
     observed: true,
@@ -185,7 +186,7 @@ test("a definitive block can be deliberately resent; an accepted message cannot"
     }),
   });
   notifications.stopNotificationQueue();
-  assert.equal(resent.state, "accepted_by_gmail");
+  assert.equal(resent.state, "accepted_by_provider");
   assert.equal(resent.resendCount, 1);
   assert.equal(resent.attempts, 1);
 
@@ -198,7 +199,7 @@ test("a definitive block can be deliberately resent; an accepted message cannot"
     },
   });
   notifications.stopNotificationQueue();
-  assert.equal(refused.state, "accepted_by_gmail");
+  assert.equal(refused.state, "accepted_by_provider");
   assert.equal(refused.resendCount, 1);
   assert.match(refused.detail, /Resend is allowed only/i);
 });
@@ -236,8 +237,9 @@ test("Coordinator wording never promotes an intermediate state to delivery", () 
   const expected: Record<DeliveryState, RegExp> = {
     generated: /has been generated/i,
     queued: /added to the email outbox.*has not yet been confirmed/i,
-    sending: /currently being submitted to Gmail/i,
-    accepted_by_gmail: /Gmail has accepted.*has not yet been independently confirmed/i,
+    sending: /currently being submitted to the email provider/i,
+    accepted_by_provider: /Resend has accepted.*has not yet been independently confirmed/i,
+    accepted_by_gmail: /Gmail API accepted this historical message.*not independently confirmed/i,
     sent_folder_observed: /found in the connected Gmail Sent folder.*not yet confirmed/i,
     delivery_confirmed: /independently confirmed/i,
     blocked: /was not sent.*blocked because/i,

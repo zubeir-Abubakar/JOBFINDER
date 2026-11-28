@@ -154,7 +154,101 @@ export function hasVerifiedSubmissionEvidence(input: {
   return Boolean(input.submitted_at) && Boolean(input.confirmation);
 }
 
+/**
+ * The five canonical operating outcomes. They are derived from persisted
+ * evidence, never from prose or from the fact that an agent task ended.
+ */
+export type CanonicalSubmissionOutcome =
+  | "submitted_verified"
+  | "prepared_not_submitted"
+  | "blocked_external"
+  | "failed_technical"
+  | "outcome_uncertain";
+
+export const CANONICAL_OUTCOME_LABELS: Record<CanonicalSubmissionOutcome, string> = {
+  submitted_verified: "Submitted — employer confirmed",
+  prepared_not_submitted: "Prepared — not submitted",
+  blocked_external: "Blocked — external requirement",
+  failed_technical: "Failed — technical",
+  outcome_uncertain: "Outcome uncertain",
+};
+
+function declaredOutcome(evidence: string | null | undefined): CanonicalSubmissionOutcome | null {
+  if (!evidence) return null;
+  try {
+    const parsed = JSON.parse(evidence) as { outcomeClass?: unknown };
+    const value = parsed.outcomeClass;
+    if (
+      value === "submitted_verified" ||
+      value === "prepared_not_submitted" ||
+      value === "blocked_external" ||
+      value === "failed_technical" ||
+      value === "outcome_uncertain"
+    ) {
+      return value;
+    }
+  } catch {
+    // An unreadable evidence blob falls through to the status-based mapping.
+  }
+  return null;
+}
+
+/**
+ * A prepared application is not a submission, a CAPTCHA block is not a
+ * technical failure and an uncertain POST is never counted as submitted.
+ */
+export function canonicalSubmissionOutcome(input: {
+  status: string;
+  submission_status: string | null;
+  submitted_at: string | null;
+  confirmation: string | null;
+  evidence?: string | null;
+}): CanonicalSubmissionOutcome {
+  if (hasVerifiedSubmissionEvidence(input) || input.submission_status === "verified" || input.status === "acknowledged") {
+    return input.submission_status === "verified" || hasVerifiedSubmissionEvidence(input)
+      ? "submitted_verified"
+      : "outcome_uncertain";
+  }
+  if (["submission_unverified", "submission_unknown"].includes(input.status) || input.submission_status === "unverified") {
+    return "outcome_uncertain";
+  }
+  if (input.status === "submission_failed" || input.submission_status === "failed") return "failed_technical";
+  const declared = declaredOutcome(input.evidence);
+  if (declared && declared !== "submitted_verified") return declared;
+  if (input.status === "human_intervention_required" || input.submission_status === "blocked") return "blocked_external";
+  return "prepared_not_submitted";
+}
+
 export type SubmissionEvidenceState = "verified" | "partial" | "none";
+
+/**
+ * How a verified submission was confirmed. `owner_recorded` is the owner
+ * transcribing the employer's portal/email confirmation; it is never presented
+ * as an automated portal verification.
+ */
+export type SubmissionConfirmationSource = "automated_employer" | "owner_recorded" | "unknown";
+
+export function submissionConfirmationSource(input: {
+  evidence?: string | null;
+}): SubmissionConfirmationSource {
+  if (!input.evidence) return "unknown";
+  try {
+    const parsed = JSON.parse(input.evidence) as { source?: unknown; outcomeClass?: unknown };
+    if (parsed.source === "manual_record") return "owner_recorded";
+    if (typeof parsed.outcomeClass === "string") return "automated_employer";
+  } catch {
+    // An unreadable evidence blob is reported as an unknown source, never as
+    // automated portal verification.
+  }
+  return "unknown";
+}
+
+export function submissionConfirmationSourceLabel(input: { evidence?: string | null }): string {
+  const source = submissionConfirmationSource(input);
+  if (source === "owner_recorded") return "Owner-recorded from the employer's confirmation (not an automated portal response)";
+  if (source === "automated_employer") return "Automated employer portal/endpoint response";
+  return "Verification source not recorded";
+}
 
 /**
  * `partial` means an attempt left a timestamp or a reference behind, but not the
@@ -173,9 +267,15 @@ export function submissionEvidenceState(input: {
 export function submissionEvidenceLabel(input: {
   submitted_at: string | null;
   confirmation: string | null;
+  evidence?: string | null;
 }): string {
   const state = submissionEvidenceState(input);
-  if (state === "verified") return "Employer-confirmed";
+  if (state === "verified") {
+    const source = submissionConfirmationSource(input);
+    if (source === "owner_recorded") return "Employer-confirmed · recorded by owner";
+    if (source === "automated_employer") return "Employer-confirmed · automated portal response";
+    return "Employer-confirmed";
+  }
   if (state === "partial") return "Attempted — not verified";
   return "No verified submission evidence";
 }

@@ -22,6 +22,14 @@ export const RECRUITMENT_TIME = "12:00";
 /** Monday–Sunday: one run every calendar day. */
 export const RECRUITMENT_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7];
 export const RECRUITMENT_SCHEDULE_KEY = "daily_recruitment";
+/**
+ * How late the 60-second ticker may still start the current occurrence.
+ *
+ * This is a tick tolerance, not a catch-up window: it covers scheduling jitter
+ * and one delayed tick. An occurrence outside it was missed while the process
+ * was not running, so it is recorded as missed and never executed later.
+ */
+export const RECRUITMENT_EXECUTION_TOLERANCE_MS = 120_000;
 export const REPORT_TIME = "16:00";
 export const REPORT_WEEKDAYS = [1, 2, 3, 4, 5];
 export const REPORT_SCHEDULE_KEY = "daily_executive_brief";
@@ -313,6 +321,12 @@ export function localDateKey(date: Date = new Date(), timeZone = RECRUITMENT_TIM
   return `${parts.year}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
 }
 
+/**
+ * Recovery window for the separate daily report schedule only.
+ *
+ * Recruitment does not use it: a recruitment occurrence is never replayed as a
+ * catch-up run. `RECRUITMENT_CATCHUP_HOURS` therefore affects the report alone.
+ */
 export function catchUpWindowHours(): number {
   const parsed = Number(process.env.RECRUITMENT_CATCHUP_HOURS ?? "6");
   return Number.isFinite(parsed) && parsed >= 0 ? Math.min(48, parsed) : 6;
@@ -551,8 +565,11 @@ export function scheduleSnapshot(now: Date = new Date(), key = RECRUITMENT_SCHED
   const enabled = row.enabled === 1;
   const runsToday = enabled && weekdays.includes(localWeekday(now, row.timezone));
   const overdueMs = enabled && Number.isFinite(next) ? now.getTime() - next : 0;
-  const due = runsToday && Number.isFinite(next) && overdueMs >= 0;
-  const windowMs = catchUpWindowHours() * 3600_000;
+  // `due` is the short tick tolerance for the 12:00 occurrence. `missed` is the
+  // same occurrence after that tolerance has elapsed; it is recorded, never run.
+  const due =
+    runsToday && Number.isFinite(next) && overdueMs >= 0 && overdueMs <= RECRUITMENT_EXECUTION_TOLERANCE_MS;
+  const windowMs = RECRUITMENT_EXECUTION_TOLERANCE_MS;
   const slots = key === RECRUITMENT_SCHEDULE_KEY ? recruitmentRunTimes(row.time) : [];
   const nextClock = localClockTime(row.next_run_at, row.timezone);
   const nextSlot = slots.find((slot) => slot.time === nextClock) ?? null;
@@ -572,9 +589,8 @@ export function scheduleSnapshot(now: Date = new Date(), key = RECRUITMENT_SCHED
     nextRunTime: nextSlot?.time ?? null,
     due,
     overdueMs: Math.max(0, overdueMs),
-    // A missed run stays recoverable inside the catch-up window. Beyond it the
-    // day is skipped and the reason is reported, rather than silently pretending
-    // a run happened.
+    // A missed occurrence is reported with its scheduled timestamp and reason,
+    // and is never replayed later. There is no compensation run.
     missed: enabled && runsToday && Number.isFinite(next) && overdueMs > windowMs,
     lastRunAt: row.last_run_at,
     lastRunId: row.last_run_id,

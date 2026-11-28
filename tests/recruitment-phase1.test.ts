@@ -361,7 +361,9 @@ const profileModule = await import("../lib/profile.ts");
 const emailTemplate = await import("../lib/email-template.ts");
 
 db.getDb();
-db.run("UPDATE profiles SET email = ?, full_name = ? WHERE id = 1", ["candidate@example.com", "Abubakar Towfiq"]);
+// A .test address keeps the "no real recipient" guard meaningful when a run
+// legitimately sends a partial-recruitment notification to the owner.
+db.run("UPDATE profiles SET email = ?, full_name = ? WHERE id = 1", ["candidate@example.test", "Abubakar Towfiq"]);
 db.run("INSERT INTO skills (name, category, level, verified, source, sort) VALUES ('Playwright', 'Automation & testing', 'advanced', 1, 'manual', 99)");
 mkdirSync(db.UPLOAD_DIR, { recursive: true });
 writeFileSync(join(db.UPLOAD_DIR, "phase1-master-cv.pdf"), "%PDF-1.4 phase one master CV");

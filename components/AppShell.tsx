@@ -19,7 +19,9 @@ const ownerNav = [
   { href: "/agents", label: "Agents", icon: "agents" },
   { href: "/profile", label: "My profile", icon: "users" },
   { group: "More" },
+  { href: "/outreach", label: "Outreach inbox", icon: "mail" },
   { href: "/recruitment", label: "Recruitment runs", icon: "agents" },
+  { href: "/capabilities", label: "Capability centre", icon: "analytics" },
   { href: "/analytics", label: "Analytics", icon: "analytics" },
   { href: "/settings", label: "Settings", icon: "settings" },
 ];

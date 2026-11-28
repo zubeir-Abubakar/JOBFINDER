@@ -632,7 +632,8 @@ test("a missed scheduled run is recorded rather than silently skipped", async ()
   assert.match(result.reason ?? "", /missed/i);
   const missed = runs.runById(result.runId ?? "");
   assert.ok(missed);
-  assert.equal(missed!.status, "failed");
+  assert.equal(missed!.status, "missed");
+  assert.equal(missed!.trigger, "missed");
   assert.match(missed!.error ?? "", /missed/i);
   schedule.setScheduleEnabled(true);
 });

@@ -22,7 +22,7 @@ test("command dashboard shows real agents, provider health and token analytics",
   await expect(page.getByText("Attribution unresolved", { exact: true })).toBeVisible();
   await expect(page.getByText(/Reporting period:/)).toBeVisible();
   const firstCard = page.locator(".cmd-agent-card").first();
-  await expect(firstCard).toContainText("Task execs");
+  await expect(firstCard).toContainText("Total execs");
   await expect(firstCard).toContainText("AI calls");
   await expect(firstCard).toContainText("Task-linked");
   await expect(firstCard).toContainText("Background");

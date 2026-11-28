@@ -8,6 +8,8 @@ import {
 import {
   hasVerifiedSubmissionEvidence,
   statusRequiresVerifiedSubmission,
+  submissionConfirmationSource,
+  submissionConfirmationSourceLabel,
   submissionEvidenceLabel,
   validateApplicationStatusTransition,
 } from "../lib/application-status";
@@ -15,6 +17,14 @@ import {
 const noEvidence = { submitted_at: null, confirmation: null };
 const partialEvidence = { submitted_at: "2026-11-20T09:00:00.000Z", confirmation: null };
 const verified = { submitted_at: "2026-11-20T09:00:00.000Z", confirmation: "EMP-48213" };
+const automatedEvidence = {
+  ...verified,
+  evidence: JSON.stringify({ outcomeClass: "submitted_verified", httpStatus: 200, reference: "EMP-48213" }),
+};
+const ownerRecordedEvidence = {
+  ...verified,
+  evidence: JSON.stringify({ source: "manual_record", method: "employer_portal", recordedBy: "u_owner" }),
+};
 
 const transition = (
   currentStatus: string,
@@ -99,6 +109,22 @@ test("submission_unverified is never described as employer-confirmed", () => {
   assert.equal(submissionEvidenceLabel(partialEvidence), "Attempted — not verified");
   assert.doesNotMatch(submissionEvidenceLabel(partialEvidence), /employer-confirmed/i);
   assert.equal(submissionEvidenceLabel(verified), "Employer-confirmed");
+});
+
+test("automated and owner-recorded confirmations stay distinct without implying portal automation", () => {
+  assert.equal(submissionConfirmationSource(automatedEvidence), "automated_employer");
+  assert.equal(submissionConfirmationSource(ownerRecordedEvidence), "owner_recorded");
+  assert.equal(submissionConfirmationSource({ evidence: null }), "unknown");
+  assert.equal(submissionConfirmationSource({ evidence: "not-json" }), "unknown");
+
+  assert.equal(submissionEvidenceLabel(automatedEvidence), "Employer-confirmed · automated portal response");
+  assert.equal(submissionEvidenceLabel(ownerRecordedEvidence), "Employer-confirmed · recorded by owner");
+  assert.match(submissionConfirmationSourceLabel(ownerRecordedEvidence), /owner-recorded/i);
+  assert.match(submissionConfirmationSourceLabel(ownerRecordedEvidence), /not an automated portal response/i);
+  assert.match(submissionConfirmationSourceLabel(automatedEvidence), /automated employer portal/i);
+  // A historical row without a channel is not silently upgraded to automated.
+  assert.equal(submissionEvidenceLabel(verified), "Employer-confirmed");
+  assert.match(submissionConfirmationSourceLabel({ evidence: null }), /not recorded/i);
 });
 
 test("board counting uses the same rows, so headers, cards and totals reconcile", () => {

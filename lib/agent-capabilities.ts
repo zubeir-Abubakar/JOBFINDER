@@ -13,6 +13,7 @@ import { agentDefinition, type AgentKey } from "./agent-definitions";
 export type CapabilityId =
   | "read_operational_data"
   | "read_job_sources"
+  | "research_external"
   | "read_profile"
   | "read_documents"
   | "create_documents"
@@ -60,6 +61,34 @@ const READ_PROFILE: AgentCapability = {
   prohibited: false,
 };
 
+/**
+ * Shared read-only Agent Reach research. The exact channel set is enforced in
+ * `lib/agent-reach.ts`; this record only states the grant and its limit.
+ */
+function researchCapability(restriction: string): AgentCapability {
+  return {
+    id: "research_external",
+    label: "Read approved public sources through the shared research service",
+    available: true,
+    granted: true,
+    restriction,
+    prohibited: false,
+  };
+}
+
+const COORDINATOR_RESEARCH = researchCapability(
+  "Read-only. May delegate a research request to any specialist; may not use a login-walled, paid or write channel.",
+);
+const RESEARCH_AGENT = researchCapability(
+  "Read-only: public web search/read, public GitHub, public YouTube metadata and public V2EX. No login, cookie import or write action.",
+);
+const TECHNICAL_RESEARCH = researchCapability(
+  "Read-only: public web pages and public GitHub. No login or write action.",
+);
+const PAGE_RESEARCH = researchCapability(
+  "Read-only public page reading only. No login, cookie import or employer contact.",
+);
+
 const READ_DOCS: AgentCapability = {
   id: "read_documents",
   label: "Read generated documents and quality reports",
@@ -81,6 +110,7 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
   coordinator: [
     READ_OPS,
     READ_PROFILE,
+    COORDINATOR_RESEARCH,
     READ_DOCS,
     {
       id: "control_workflow",
@@ -112,6 +142,7 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
   ],
   research: [
     READ_OPS,
+    RESEARCH_AGENT,
     {
       id: "read_job_sources",
       label: "Read configured public job sources",
@@ -124,11 +155,12 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
     NEVER_DB,
     NEVER_SECRETS,
   ],
-  analysis: [READ_OPS, READ_PROFILE, NEVER_SHELL, NEVER_DB, NEVER_SECRETS],
+  analysis: [READ_OPS, READ_PROFILE, TECHNICAL_RESEARCH, NEVER_SHELL, NEVER_DB, NEVER_SECRETS],
   cv: [
     READ_OPS,
     READ_PROFILE,
     READ_DOCS,
+    PAGE_RESEARCH,
     {
       id: "create_documents",
       label: "Create tailored CV files",
@@ -145,6 +177,7 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
     READ_OPS,
     READ_PROFILE,
     READ_DOCS,
+    PAGE_RESEARCH,
     {
       id: "create_documents",
       label: "Audit generated documents",
@@ -161,6 +194,7 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
     READ_OPS,
     READ_PROFILE,
     READ_DOCS,
+    PAGE_RESEARCH,
     {
       id: "create_documents",
       label: "Create cover-letter files",
@@ -177,6 +211,7 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
     READ_OPS,
     READ_DOCS,
     READ_PROFILE,
+    PAGE_RESEARCH,
     {
       id: "prepare_application",
       label: "Prepare an application package",
@@ -200,6 +235,7 @@ export const AGENT_CAPABILITIES: Record<AgentKey, AgentCapability[]> = {
   email: [
     READ_OPS,
     READ_PROFILE,
+    PAGE_RESEARCH,
     {
       id: "read_gmail",
       label: "Read the connected Gmail mailbox",

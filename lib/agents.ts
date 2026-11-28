@@ -126,7 +126,7 @@ const ACTIVE_TASK_STATES = new Set([
   "retry_scheduled",
 ]);
 
-function assertTaskOwner(taskId: string, agentKey: string, operation: "complete" | "fail") {
+function assertTaskOwner(taskId: string, agentKey: string, operation: "complete" | "fail" | "block") {
   const task = one<{ agent_key: string; status: string; workflow_id: string | null }>(
     "SELECT agent_key, status, workflow_id FROM tasks WHERE id = ?",
     [taskId],
@@ -344,6 +344,60 @@ export function completeTask(
              last_run_at = ?,
              run_count = run_count + 1,
              success_count = success_count + 1
+       WHERE key = ?`,
+      [nowIso(), agentKey],
+    );
+  }
+}
+
+/**
+ * Terminal "blocked" state for work the agent finished but could not complete
+ * because of an external requirement (CAPTCHA, MFA, login, unsupported portal)
+ * or an unresolved prerequisite.
+ *
+ * It is deliberately not `failed`: no technical fault occurred, so the task is
+ * excluded from failure counts and never raises an agent-failure alert. The
+ * reason, class and recovery state stay persisted so the owner sees exactly
+ * what stopped it. The agent did its permitted work, so it is recorded as
+ * having run, then left waiting for the owner rather than marked as a failure.
+ */
+export function blockTask(
+  taskId: string,
+  agentKey: string,
+  reason: string,
+  options: { errorClass?: TaskErrorClass; recoveryState?: string; requiresInput?: boolean } = {},
+): void {
+  assertTaskOwner(taskId, agentKey, "block");
+  const blockedTask = one<{ workflow_id: string | null }>("SELECT workflow_id FROM tasks WHERE id = ?", [taskId]);
+  run(
+    `UPDATE tasks SET status = 'blocked', error = ?, error_class = ?, recovery_state = ?,
+       state_reason = ?, requires_input = ?, heartbeat_at = NULL, finished_at = ?
+     WHERE id = ? AND agent_key = ? AND status IN ('running','working','thinking','waiting_provider','retry_scheduled')`,
+    [
+      reason.slice(0, 2000),
+      options.errorClass ?? "blocked",
+      options.recoveryState ?? "blocked_external",
+      reason.slice(0, 1200),
+      v(options.requiresInput ?? true),
+      nowIso(),
+      taskId,
+      agentKey,
+    ],
+  );
+  if (blockedTask?.workflow_id) {
+    emitWorkflowEvent({
+      workflowId: blockedTask.workflow_id,
+      type: "agent.blocked",
+      agentKey,
+      message: `${agentIdentity(agentKey).shortName} finished its permitted work and is waiting for the owner: ${reason.slice(0, 300)}`,
+      meta: { taskId, errorClass: options.errorClass ?? "blocked" },
+    });
+  }
+  if (agentKeyExists(agentKey)) {
+    run(
+      `UPDATE agents
+         SET status = CASE WHEN status = 'paused' THEN 'paused' ELSE 'waiting' END,
+             current_task = NULL, last_run_at = ?, run_count = run_count + 1
        WHERE key = ?`,
       [nowIso(), agentKey],
     );

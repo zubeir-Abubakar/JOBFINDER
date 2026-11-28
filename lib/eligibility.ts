@@ -53,7 +53,7 @@ export type EligibilityJob = {
 };
 
 const SWISS =
-  /(switzerland|schweiz|suisse|svizzera|swiss|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.?\s*gallen|lugano|fribourg|vaud|ticino|neuch|bienne|biel|thun|olten|aarau|schaffhausen|sion|chur|emmen|bonaduz|altdorf|nidau|sarnen|bellach|puidoux|burgdorf|d[üu]bendorf|manno|reinach|d[äa]llikon|kreuzlingen|moosseedorf|zollikofen|wohlen)/i;
+  /(switzerland|schweiz|suisse|svizzera|swiss|zurich|zürich|geneva|genève|geneve|lausanne|bern|basel|zug|luzern|lucerne|winterthur|st\.?\s*gallen|lugano|fribourg|vaud|ticino|neuch|bienne|biel|thun|olten|aarau|schaffhausen|sion|chur|emmen|bonaduz|altdorf|nidau|sarnen|bellach|puidoux|burgdorf|d[üu]bendorf|manno|reinach|d[äa]llikon|kreuzlingen|moosseedorf|zollikofen|wohlen|\bch\b)/i;
 // "Remote" on its own is not residency eligibility: a posting must explicitly
 // accept Europe/EEA/global applicants, which is the distinction the brief calls out.
 const EUROPE_OPEN = /\b(eu\/efta|european union|europe|eea|emea|dach|worldwide|anywhere|global(?:ly)?|international)\b/i;
@@ -127,6 +127,10 @@ export function assessEligibility(job: EligibilityJob, profile: ProfileData, now
   // employer's marketing copy (e.g. "live in 38 markets including Switzerland").
   // The description is only used when the posting states no usable location.
   const locationStated = Boolean(job.location && !/^\s*(not specified|unknown|n\/a)\s*$/i.test(job.location));
+  // A source's location label can be wrong: "Zurich" listings from one board
+  // state "fully onsite, based at our office in Lisbon" in the body. Explicit
+  // foreign on-site evidence therefore wins over the label, which is why the
+  // Swiss-label shortcut is deliberately not applied here.
   const explicitForeignOnsite =
     FOREIGN_ONSITE.test(description) &&
     (FOREIGN_ONSITE_CITY.test(description) || (locationStated && !SWISS.test(locationText)));

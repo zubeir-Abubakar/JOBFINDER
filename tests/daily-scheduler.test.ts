@@ -16,6 +16,7 @@ const schedule = await import("../lib/recruitment-schedule.ts");
 const ticker = await import("../lib/recruitment-ticker.ts");
 const runtime = await import("../lib/runtime-state.ts");
 const scoring = await import("../lib/scoring.ts");
+const runs = await import("../lib/recruitment-run.ts");
 
 db.getDb();
 
@@ -154,19 +155,111 @@ test("repeated scheduler initialisation registers one timer and one worker", () 
   process.env.RECRUITMENT_SCHEDULER = "false";
 });
 
-test("a missed occurrence is recorded once and never replayed by catch-up", async () => {
-  setScheduleRow({ nextRunAt: new Date(Date.now() - 48 * 3600_000).toISOString() });
+test("a late start records the occurrence as missed at its scheduled timestamp and never executes it", async () => {
+  const occurrence = "2026-11-24T11:00:00.000Z"; // 12:00 Europe/Zurich, Tuesday
+  setScheduleRow({ nextRunAt: occurrence });
   const before = runCount();
-  const first = await ticker.tickRecruitmentSchedule(new Date());
+  // 12:40 local: the process was not running at 12:00. This is a missed slot,
+  // not a late start to be compensated.
+  const first = await ticker.tickRecruitmentSchedule(new Date("2026-11-24T11:40:00.000Z"));
   assert.equal(first.started, false);
   assert.match(first.reason ?? "", /missed/i);
-  assert.equal(runCount(), before + 1, "exactly one missed occurrence is recorded");
+  assert.equal(runCount(), before + 1, "exactly one missed occurrence record is added");
 
-  const second = await ticker.tickRecruitmentSchedule(new Date());
-  assert.equal(second.started, false);
-  const third = await ticker.tickRecruitmentSchedule(new Date());
-  assert.equal(third.started, false);
-  assert.equal(runCount(), before + 1, "further ticks do not add catch-up runs");
+  const missed = runs.runById(first.runId ?? "");
+  assert.ok(missed, "the missed occurrence is persisted as a run record");
+  assert.equal(missed!.status, "missed");
+  assert.equal(missed!.trigger, "missed");
+  assert.equal(missed!.scheduled_for, occurrence, "the scheduled timestamp is preserved");
+  assert.equal(missed!.started_at, null, "the missed occurrence was never started");
+  assert.match(missed!.error ?? "", /12:00/);
+  assert.match(missed!.error ?? "", /not executed late/i);
+
+  const executed = db.all<{ id: string }>(
+    "SELECT id FROM recruitment_runs WHERE scheduled_for = ? AND status != 'missed'",
+    [occurrence],
+  );
+  assert.equal(executed.length, 0, "no recruitment execution was created for the missed slot");
+
+  const row = schedule.getSchedule(new Date("2026-11-24T11:40:00.000Z"));
+  assert.equal(row.last_status, "missed");
+  assert.equal(row.last_scheduled_for, occurrence);
+  assert.equal(row.next_run_at, "2026-11-25T11:00:00.000Z", "the schedule moves to the next day's single occurrence");
+});
+
+test("duplicate ticks after a missed occurrence add nothing and never start a run", async () => {
+  const occurrence = "2026-11-24T11:00:00.000Z";
+  setScheduleRow({ nextRunAt: occurrence });
+  const before = runCount();
+  await ticker.tickRecruitmentSchedule(new Date("2026-11-24T11:40:00.000Z"));
+  assert.equal(runCount(), before + 1);
+  for (const late of ["2026-11-24T11:41:00.000Z", "2026-11-24T12:30:00.000Z", "2026-11-25T09:00:00.000Z"]) {
+    const again = await ticker.tickRecruitmentSchedule(new Date(late));
+    assert.equal(again.started, false);
+    assert.doesNotMatch(again.reason ?? "", /already in progress/i);
+  }
+  assert.equal(runCount(), before + 1, "further ticks do not add catch-up or duplicate runs");
+  const scheduledRuns = db.all<{ id: string }>("SELECT id FROM recruitment_runs WHERE trigger = 'schedule' AND scheduled_for = ?", [occurrence]);
+  assert.equal(scheduledRuns.length, 0);
+});
+
+test("the 60-second ticker starts the occurrence only inside its short tolerance", () => {
+  const occurrence = "2026-11-24T11:00:00.000Z";
+  setScheduleRow({ nextRunAt: occurrence });
+  const early = schedule.scheduleSnapshot(new Date("2026-11-24T10:59:30.000Z"));
+  assert.equal(early.due, false);
+  assert.equal(early.missed, false);
+  const onTime = schedule.scheduleSnapshot(new Date("2026-11-24T11:00:45.000Z"));
+  assert.equal(onTime.due, true);
+  assert.equal(onTime.missed, false);
+  const tooLate = schedule.scheduleSnapshot(new Date("2026-11-24T11:03:00.000Z"));
+  assert.equal(tooLate.due, false);
+  assert.equal(tooLate.missed, true);
+});
+
+test("a stopped scheduler worker misses the slot and reports itself stopped until the process returns", async () => {
+  ticker.stopRecruitmentScheduler();
+  assert.equal(ticker.recruitmentSchedulerStatus().running, false);
+  const workerBefore = runtime.runtimeWorkerSnapshot().find((worker) => worker.name === "recruitment_scheduler");
+  assert.ok(workerBefore, "the stopped worker is still observable for health");
+  assert.equal(workerBefore!.effectiveStatus, "stopped");
+
+  const occurrence = "2026-11-25T11:00:00.000Z";
+  setScheduleRow({ nextRunAt: occurrence });
+  const before = runCount();
+  const result = await ticker.tickRecruitmentSchedule(new Date("2026-11-25T12:10:00.000Z"));
+  assert.equal(result.started, false, "a missed occurrence never starts discovery");
+  assert.equal(runCount(), before + 1);
+  assert.equal(runs.runById(result.runId ?? "")?.status, "missed");
+  const workerAfter = runtime.runtimeWorkerSnapshot().find((worker) => worker.name === "recruitment_scheduler");
+  assert.equal(workerAfter?.effectiveStatus, "running", "the returning process heartbeats the worker again");
+});
+
+test("missed detection uses the Zurich wall clock across both DST transitions", () => {
+  // Spring forward: 12:00 Zurich is 10:00Z on Sunday 29 March 2026.
+  const spring = "2026-03-29T10:00:00.000Z";
+  assert.equal(schedule.localClockTime(spring), "12:00");
+  setScheduleRow({ nextRunAt: spring });
+  assert.equal(schedule.scheduleSnapshot(new Date("2026-03-29T09:59:30.000Z")).due, false);
+  const springOnTime = schedule.scheduleSnapshot(new Date("2026-03-29T10:00:30.000Z"));
+  assert.equal(springOnTime.due, true);
+  assert.equal(springOnTime.missed, false);
+  const springLate = schedule.scheduleSnapshot(new Date("2026-03-29T10:05:00.000Z"));
+  assert.equal(springLate.due, false);
+  assert.equal(springLate.missed, true);
+  assert.equal(springLate.nextRunAt, spring);
+
+  // Autumn back: 12:00 Zurich is 11:00Z on Sunday 25 October 2026.
+  const autumn = "2026-10-25T11:00:00.000Z";
+  assert.equal(schedule.localClockTime(autumn), "12:00");
+  setScheduleRow({ nextRunAt: autumn });
+  const autumnOnTime = schedule.scheduleSnapshot(new Date("2026-10-25T11:00:30.000Z"));
+  assert.equal(autumnOnTime.due, true);
+  assert.equal(autumnOnTime.missed, false);
+  const autumnLate = schedule.scheduleSnapshot(new Date("2026-10-25T11:05:00.000Z"));
+  assert.equal(autumnLate.due, false);
+  assert.equal(autumnLate.missed, true);
+  assert.equal(autumnLate.nextRunAt, autumn);
 });
 
 test("an in-progress recruitment run prevents overlapping execution", async () => {

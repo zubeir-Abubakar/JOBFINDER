@@ -3,6 +3,8 @@ import { chmodSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { hashPassword, randomId } from "./security.ts";
 import { AGENT_IDENTITIES } from "./agent-identity.ts";
+import { applyMigrations } from "./migrations.ts";
+import { businessDayKey } from "./business-day.ts";
 
 /** Data location is configurable so a verification run can use an isolated database. */
 export const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(process.cwd(), "data");
@@ -691,6 +693,14 @@ export function getDb(): DatabaseSync {
   const db = new DatabaseSync(dbFile);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA foreign_keys = ON;");
+  // Every daily boundary is a Europe/Zurich calendar day. Exposing the
+  // conversion to SQL keeps filters and grouping DST-correct instead of
+  // assuming a fixed UTC offset (a Zurich day can be 23 or 25 hours).
+  db.function("business_day", { deterministic: true }, (value: unknown) => {
+    if (value === null || value === undefined) return null;
+    const parsed = new Date(String(value));
+    return Number.isNaN(parsed.getTime()) ? null : businessDayKey(parsed);
+  });
   ensureSchema(db);
   migrate(db);
   seed(db);
@@ -866,7 +876,7 @@ function ensureColumn(db: DatabaseSync, table: string, column: string, ddl: stri
 }
 
 /** Additive migrations only — existing records are never dropped or rewritten. */
-export const SCHEMA_VERSION = 26;
+export const SCHEMA_VERSION = 29;
 
 /**
  * Idempotent schema enforcement. Safe to run on every open and on a cached
@@ -1080,6 +1090,9 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "notification_outbox", "sent_verification", "sent_verification TEXT");
   ensureColumn(db, "notification_outbox", "delivery_evidence", "delivery_evidence TEXT");
   ensureColumn(db, "notification_outbox", "bounce_info", "bounce_info TEXT");
+  // A machine-readable reason separates a dead refresh grant from a transient
+  // Google-side failure without parsing the human-readable last_error text.
+  ensureColumn(db, "notification_outbox", "failure_code", "failure_code TEXT");
   ensureColumn(db, "notification_outbox", "resend_count", "resend_count INTEGER NOT NULL DEFAULT 0");
   db.exec("CREATE INDEX IF NOT EXISTS idx_notification_outbox_report ON notification_outbox(report_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(status, next_retry_at)");
@@ -1098,6 +1111,9 @@ function ensureSchema(db: DatabaseSync): void {
   ensureColumn(db, "tasks", "idempotency_key", "idempotency_key TEXT");
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_run ON tasks(run_id)");
   db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_heartbeat ON tasks(status, heartbeat_at)");
+  // Versioned, additive migrations ("schema_migrations"). Each runs once, in a
+  // transaction, after a consistent backup of the database file.
+  applyMigrations(db, { dataDir: DATA_DIR });
   db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 }
 

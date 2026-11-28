@@ -6,12 +6,25 @@ test.setTimeout(150_000);
 
 const syntheticTitle = "Senior QA Automation Engineer";
 
+// A retry reuses the isolated database. This spec ends with a verified manual
+// record, so leaving it behind made later whole-database counts depend on test
+// order. Cleanup keeps the leakage impossible without relaxing any assertion.
+test.afterEach(() => {
+  const job = one<{ id: string }>("SELECT id FROM jobs WHERE title = ?", syntheticTitle);
+  if (!job) return;
+  execute("DELETE FROM application_events WHERE application_id IN (SELECT id FROM applications WHERE job_id = ?)", job.id);
+  execute("DELETE FROM submission_attempts WHERE job_id = ?", job.id);
+  execute("DELETE FROM applications WHERE job_id = ?", job.id);
+  execute("UPDATE jobs SET status = 'documents' WHERE id = ?", job.id);
+});
+
 /**
  * SubmitButton disables until an editable field changes. If the first change
  * event lands before hydration, keep dispatching a real change until the form
  * observes it, rather than retrying an inaccessible click.
  */
 async function chooseStatus(form: import("@playwright/test").Locator, option: string): Promise<void> {
+  await form.page().waitForLoadState("networkidle");
   const select = form.locator("select[name=status]");
   const save = form.getByRole("button", { name: "Save status" });
   await select.selectOption(option);
@@ -189,8 +202,23 @@ test("application creation, status update and in-app notification are persisted 
   await page.goto(`/applications/${application.id}`, { waitUntil: "domcontentloaded" });
   const confirmation = `E2E-${Date.now()}`;
   const submissionForm = page.locator("form").filter({ has: page.getByRole("button", { name: /Record confirmed submission/i }) });
-  await submissionForm.locator("#confirmation").fill(confirmation);
-  await submissionForm.getByRole("button", { name: /Record confirmed submission/i }).click();
+  const confirmationInput = submissionForm.locator("#confirmation");
+  const recordSubmission = submissionForm.getByRole("button", { name: /Record confirmed submission/i });
+  await confirmationInput.fill(confirmation);
+  // SubmitButton enables itself from a React change event. If fill landed
+  // before hydration, dispatch the event until the form observes the change.
+  await expect
+    .poll(
+      async () => {
+        if (await recordSubmission.isEnabled()) return true;
+        await confirmationInput.dispatchEvent("input");
+        await confirmationInput.dispatchEvent("change");
+        return recordSubmission.isEnabled();
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  await recordSubmission.click();
   const verifiedRow = await waitForDb(
     () => {
       const row = one<{ status: string; submitted_at: string | null; confirmation: string | null }>(
@@ -205,6 +233,7 @@ test("application creation, status update and in-app notification are persisted 
   expect(verifiedRow.confirmation).toBe(confirmation);
 
   await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle");
   const verifiedStatusForm = page.locator("form").filter({ has: page.getByRole("button", { name: "Save status" }) });
   await chooseStatus(verifiedStatusForm, "interview_invited");
   await verifiedStatusForm.getByRole("button", { name: "Save status" }).click();

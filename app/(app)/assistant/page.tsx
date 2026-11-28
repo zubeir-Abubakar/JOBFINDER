@@ -7,7 +7,7 @@ import { SubmitButton } from "@/components/SubmitButton";
 import { AssistantChat } from "@/components/AssistantChat";
 import { AgentAvatar, AgentStatusBadge } from "@/components/AgentAvatar";
 import { AGENT_IDENTITY_KEYS, agentIdentity } from "@/lib/agent-identity";
-import { activeAgentSession } from "@/lib/agent-sessions";
+import { activeAgentSession, activateAgentSession, agentKeyForName, recentConversationSummary } from "@/lib/agent-sessions";
 import { effectiveVoiceProfileForAgent } from "@/lib/agent-voice-settings";
 import { getOperationalSnapshot } from "@/lib/operations";
 
@@ -20,6 +20,20 @@ export default async function AssistantPage({
 }) {
   const user = await requireUser();
   const sp = await searchParams;
+  // Agent cards link here with ?agent=<key>. Resolution is deterministic and
+  // must never crash the page: an unknown or unavailable agent produces a
+  // readable flash message and the current conversation stays usable.
+  const requested = param(sp.agent);
+  let entryError: string | null = null;
+  if (requested) {
+    const target = agentKeyForName(requested);
+    if (!target) {
+      entryError = `No registered agent matches “${requested}”. Choose one of the eight agents in the switcher.`;
+    } else {
+      const activation = activateAgentSession(user.id, target, recentConversationSummary(user.id, 8));
+      if (!activation.ok) entryError = activation.reason;
+    }
+  }
   const messages = chatHistory(user.id);
   const active = activeAgentSession(user.id);
   const activeIdentity = agentIdentity(active.agentKey);
@@ -30,7 +44,7 @@ export default async function AssistantPage({
 
   return (
     <>
-      <Flash ok={param(sp.ok)} error={param(sp.error)} />
+      <Flash ok={param(sp.ok)} error={entryError ?? param(sp.error)} />
       <PageHead
         title="AI assistance"
         sub={`Converse with ${agentIdentity("coordinator").name} or a named specialist, inspect live operational state, or run a grounded recruitment action. Nothing is submitted or sent without approval.`}

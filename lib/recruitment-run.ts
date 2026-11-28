@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { randomId } from "./security";
 import {
   analyseSingleJob,
+  blockTask,
   completeTask,
   createWorkflow,
   failTask,
@@ -21,6 +22,19 @@ import {
 import { discoverJobSources, sourceHealth, type DiscoveryResult, type SourceMetrics } from "./recruitment-discovery";
 import { evaluateReadiness, type ReadinessItem } from "./application-readiness";
 import { submitApplication, existingVerifiedSubmission, recoverStaleSubmissionClaims, submissionOutcomeClass, type SubmissionInput, type SubmissionOutcome } from "./submission";
+import {
+  claimQueueWork,
+  finishQueueEntry,
+  pipelineReconciliation,
+  queueSnapshot,
+  preflightDestination,
+  recordSubmissionLifecycle,
+  releaseQueueLeases,
+  requeueBlockedApplications,
+  syncQualifiedQueue,
+  validPackageFor,
+  type QueueState,
+} from "./recruitment-queue";
 import { QUALIFYING_MATCH_SCORE, effectiveMinMatchScore, qualifiesForAutoApply, autoApplyBlockers, type JobAnalysis } from "./scoring";
 import { getSetting } from "./settings";
 import { getProfileData } from "./profile";
@@ -33,10 +47,12 @@ import {
 import { notify } from "./notify";
 import { enqueueDocumentRecovery } from "./recruitment-recovery";
 import { audit } from "./audit";
-import { catchUpWindowHours, localClockTime, localDateKey, nextRecruitmentOccurrence, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIMEZONE, RECRUITMENT_WEEKDAYS, formatInZone } from "./recruitment-schedule";
+import { RECRUITMENT_EXECUTION_TOLERANCE_MS, localClockTime, localDateKey, nextRecruitmentOccurrence, recordScheduleRun, scheduleSnapshot, RECRUITMENT_TIMEZONE, RECRUITMENT_WEEKDAYS, formatInZone } from "./recruitment-schedule";
 import { qualificationStatusFor } from "./job-identity";
 import { acquireRuntimeLock, refreshRuntimeLock, releaseRuntimeLock, runtimeLockActive } from "./runtime-state";
 import { recordApplicationEvent } from "./application-events";
+import { outreachSummary, prepareOutreachForApplication, reconcileOutreachFromGmail, type OutreachResult } from "./outreach";
+import { accountStatus as gmailAccountStatus } from "./gmail";
 import { generateText, providerConfigured, scrubProviderError } from "./providers";
 import { AiSpendingPolicyError, zeroSpendSummary } from "./ai-spending-policy";
 import { buildExecutionManifest } from "./execution-manifest";
@@ -79,10 +95,15 @@ export const RUN_STATES = [
   "completed_with_warnings",
   "failed",
   "interrupted",
+  // A missed occurrence is recorded explicitly and never executed later.
+  "missed",
 ] as const;
 
 export type RunState = (typeof RUN_STATES)[number];
-export type RunTrigger = "schedule" | "manual" | "catch_up";
+export type RunTrigger = "schedule" | "manual" | "catch_up" | "missed";
+
+/** States that end a run. A missed occurrence is terminal: it is not executed. */
+const TERMINAL_RUN_STATES = "'completed','completed_with_warnings','failed','interrupted','missed'";
 
 export type RunRow = {
   id: string;
@@ -133,7 +154,7 @@ export function qualifyingThreshold(): number {
 
 export function activeRun(): RunRow | null {
   return one<RunRow>(
-    "SELECT * FROM recruitment_runs WHERE status NOT IN ('completed','completed_with_warnings','failed','interrupted') ORDER BY created_at DESC LIMIT 1",
+    `SELECT * FROM recruitment_runs WHERE status NOT IN (${TERMINAL_RUN_STATES}) ORDER BY created_at DESC LIMIT 1`,
   );
 }
 
@@ -164,20 +185,50 @@ export function runStateHistory(run: RunRow): Array<{ state: string; at: string;
 export function recoverInterruptedRecruitmentRuns(now: Date = new Date()): {
   resumed: string[];
   interrupted: string[];
+  missed: string[];
 } {
   const rows = all<RunRow>(
-    "SELECT * FROM recruitment_runs WHERE status NOT IN ('completed','completed_with_warnings','failed','interrupted') ORDER BY created_at",
+    `SELECT * FROM recruitment_runs WHERE status NOT IN (${TERMINAL_RUN_STATES}) ORDER BY created_at`,
   );
   const resumed: string[] = [];
   const interrupted: string[] = [];
+  const missed: string[] = [];
   for (const runRow of rows) {
     const lockKey = `recruitment:run:${runRow.id}`;
     if (runtimeLockActive(lockKey, now)) continue;
     const scheduled = Date.parse(runRow.scheduled_for ?? runRow.created_at);
-    const withinCatchup =
-      Number.isFinite(scheduled) && now.getTime() - scheduled <= catchUpWindowHours() * 3600_000;
-    if (runRow.status === "scheduled" && withinCatchup) {
+    // Only a run created moments ago by the current tick may be resumed. A run
+    // left `scheduled` for longer than the tick tolerance was missed; replaying
+    // it now would be exactly the catch-up execution this policy forbids.
+    const withinTickTolerance =
+      Number.isFinite(scheduled) &&
+      now.getTime() - scheduled >= 0 &&
+      now.getTime() - scheduled <= RECRUITMENT_EXECUTION_TOLERANCE_MS;
+    if (runRow.status === "scheduled" && withinTickTolerance) {
       resumed.push(runRow.id);
+      continue;
+    }
+    // A scheduled occurrence that was created but never started, and is now
+    // outside the tick tolerance, is a missed occurrence. It is recorded as
+    // missed with its scheduled timestamp; it is never executed late.
+    if (runRow.status === "scheduled" && runRow.trigger !== "manual") {
+      const message = `The scheduled occurrence at ${formatInZone(runRow.scheduled_for)} (${RECRUITMENT_TIMEZONE}) was missed: the run record existed but no worker started it within the tick tolerance. It is recorded as missed and was not executed late. No catch-up run was created.`;
+      const history = [...runStateHistory(runRow), { state: "missed", at: now.toISOString(), message }];
+      run(
+        "UPDATE recruitment_runs SET status = 'missed', state_history = ?, error = ?, finished_at = ? WHERE id = ? AND status = 'scheduled'",
+        [JSON.stringify(history).slice(0, 20000), message, now.toISOString(), runRow.id],
+      );
+      closeOpenAssignments(runRow.id, "failed", message, runRow.workflow_id);
+      if (runRow.workflow_id) finishWorkflow(runRow.workflow_id, "failed", message);
+      recordScheduleRun({ runId: runRow.id, status: "missed", error: message, now, scheduledFor: runRow.scheduled_for });
+      notify({
+        kind: "recruitment_missed",
+        dedupeKey: `run_missed:${runRow.id}`,
+        subject: "A scheduled recruitment run was missed",
+        body: message,
+      });
+      audit({ action: "recruitment.run_missed", entity: "recruitment_run", entityId: runRow.id, detail: message });
+      missed.push(runRow.id);
       continue;
     }
     const message = `Run was ${runRow.status} without an active worker lease after a restart. It was marked interrupted; completed work was preserved and no submission was retried blindly.`;
@@ -203,7 +254,7 @@ export function recoverInterruptedRecruitmentRuns(now: Date = new Date()): {
     audit({ action: "recruitment.run_interrupted", entity: "recruitment_run", entityId: runRow.id, detail: message });
     interrupted.push(runRow.id);
   }
-  return { resumed, interrupted };
+  return { resumed, interrupted, missed };
 }
 
 function pushState(runId: string, state: RunState, message?: string): void {
@@ -624,6 +675,96 @@ export function enforceStoredGermanExclusion(now: Date = new Date()): number {
   return changed;
 }
 
+/**
+ * Repair stored location rejections after a rule correction.
+ *
+ * A persisted `ineligible` result is historical evidence, not a live verdict, so
+ * a corrected location rule would otherwise never apply to vacancies already
+ * stored. Only rows whose stored blockers are exclusively location-based are
+ * re-assessed; German, authorisation, deadline and provenance blockers are left
+ * untouched. An upgraded row is eligible again and, at or above the threshold,
+ * re-enters the qualified pool. It is never written below the threshold.
+ */
+export function requalifyLocationRejections(now: Date = new Date()): { checked: number; upgraded: number } {
+  const rows = all<{
+    id: string;
+    title: string;
+    company: string;
+    location: string | null;
+    description: string | null;
+    remote: number;
+    application_url: string | null;
+    url: string | null;
+    employment_type: string | null;
+    match_score: number | null;
+    eligibility: string | null;
+    eligibility_notes: string | null;
+    german_requirement: string | null;
+    language_evidence: string | null;
+  }>(
+    `SELECT id, title, company, location, description, remote, application_url, url, employment_type,
+            match_score, eligibility, eligibility_notes, german_requirement, language_evidence
+     FROM jobs
+     WHERE eligibility IN ('ineligible','needs_review')
+       AND coalesce(eligibility_notes,'') LIKE '%outside Switzerland%'`,
+  );
+  const threshold = qualifyingThreshold();
+  const profile = getProfileData();
+  let checked = 0;
+  let upgraded = 0;
+  for (const row of rows) {
+    let blockers: string[] = [];
+    try {
+      const parsed = JSON.parse(row.eligibility_notes ?? "{}") as { blockers?: unknown };
+      blockers = Array.isArray(parsed.blockers) ? parsed.blockers.filter((item): item is string => typeof item === "string") : [];
+    } catch {
+      continue;
+    }
+    if (blockers.length === 0) continue;
+    // Only a pure location verdict is repairable here.
+    if (!blockers.every((blocker) => /outside Switzerland|excludes Switzerland|on-site role outside/i.test(blocker))) continue;
+    checked += 1;
+    const assessment = assessEligibility(
+      {
+        title: row.title,
+        company: row.company,
+        location: row.location,
+        description: row.description,
+        remote: row.remote,
+        application_url: row.application_url,
+        url: row.url,
+        employment_type: row.employment_type,
+        german_requirement: row.german_requirement,
+        language_evidence: row.language_evidence,
+      },
+      profile,
+      now,
+    );
+    if (assessment.status === "ineligible") continue;
+    const qualified =
+      assessment.status === "eligible" && Number(row.match_score ?? 0) >= threshold ? 1 : 0;
+    run(
+      `UPDATE jobs SET eligibility = ?, eligibility_notes = ?, eligibility_checked_at = ?, qualified = ?,
+         qualification_status = ?, status = CASE
+           WHEN status IN ('applied','submitted','documents') THEN status
+           WHEN ? = 1 THEN 'shortlisted'
+           ELSE status END
+       WHERE id = ?`,
+      [
+        assessment.status,
+        JSON.stringify(assessment).slice(0, 12000),
+        now.toISOString(),
+        qualified,
+        assessment.status === "eligible" ? (qualified ? "qualified" : "eligible_below_threshold") : "needs_review",
+        qualified,
+        row.id,
+      ],
+    );
+    upgraded += 1;
+  }
+  return { checked, upgraded };
+}
+
 function parseAnalysis(value: string | null): JobAnalysis | null {
   if (!value) return null;
   try {
@@ -788,8 +929,8 @@ export function assessSubmissionReadiness(applicationId: string): Readiness {
     // (unchanged helper body follows)
     if (!id) return null;
     const row = one<{ text_content: string | null; quality_status: string | null; quality_score: number | null; relative_path: string }>(
-      "SELECT text_content, quality_status, quality_score, relative_path FROM documents WHERE id = ? AND deleted_at IS NULL",
-      [id],
+      "SELECT text_content, quality_status, quality_score, relative_path FROM documents WHERE id = ? AND job_id = ? AND deleted_at IS NULL",
+      [id, app.job_id],
     );
     if (!row) return null;
     return {
@@ -912,6 +1053,10 @@ export type RunDeps = {
   analyse?: (jobId: string) => JobAnalysis | null;
   /** Test fixtures may inject a local-page verifier; production uses the real fetch gate. */
   verifyVacancy?: (jobId: string) => Promise<VacancyVerification>;
+  /** Test fixtures may supply a deterministic destination preflight. */
+  preflight?: (jobId: string) => Promise<{ state: QueueState; reason: string }>;
+  /** Outreach is independent of submission and may be injected in isolated tests. */
+  outreach?: (input: { applicationId: string; jobId: string }) => Promise<OutreachResult>;
   now?: Date;
 };
 
@@ -940,6 +1085,46 @@ function updateCounts(runId: string, counts: Partial<Record<
   if (keys.length === 0) return;
   const assignments = keys.map((key) => `${key} = ?`).join(", ");
   run(`UPDATE recruitment_runs SET ${assignments} WHERE id = ?`, [...keys.map((key) => counts[key] ?? 0), runId]);
+}
+
+type DiscoveryAttempt = {
+  sources: Array<{ requests?: number; responses?: number }>;
+  allSourcesFailed?: boolean;
+};
+
+/**
+ * One bounded retry for a discovery attempt that produced no usable source.
+ *
+ * A transient host/worker stall previously ended the daily run as "all job
+ * sources failed" on the first attempt, even though the sources themselves were
+ * reachable minutes later. The retry is deliberately single: it cannot turn a
+ * genuine outage into an endless loop, and it never lowers a threshold or
+ * invents a vacancy because the discovery function itself is reused unchanged.
+ */
+export async function discoverWithRetry<T extends DiscoveryAttempt>(
+  discover: () => Promise<T>,
+  options: { retries?: number; delayMs?: number; onRetry?: (attempt: number, reason: string) => void } = {},
+): Promise<T> {
+  const retries = Math.max(0, Math.min(2, options.retries ?? 1));
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const result = await discover();
+      const checked = result.sources.filter((source) => (source.requests ?? 0) > 0);
+      const succeeded = checked.filter((source) => (source.responses ?? 0) > 0);
+      const unusable = result.allSourcesFailed ?? (checked.length > 0 && succeeded.length === 0);
+      if (!unusable) return result;
+      lastError = new Error(`All ${checked.length} configured job source(s) returned no usable response.`);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error("Discovery failed.");
+    }
+    if (attempt < retries) {
+      options.onRetry?.(attempt + 1, lastError.message);
+      const delay = Math.max(0, options.delayMs ?? 0);
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError ?? new Error("Discovery failed.");
 }
 
 export async function executeRun(
@@ -1013,7 +1198,15 @@ export async function executeRun(
   // The language rule is re-applied before any scoring, package or submission,
   // including on vacancies stored by earlier runs.
   enforceStoredGermanExclusion(now);
+  // Re-apply the corrected location rule to vacancies rejected by an older rule.
+  // This only upgrades pure location verdicts and never lowers the threshold.
+  const requalified = requalifyLocationRejections(now);
   const warnings: string[] = [];
+  if (requalified.upgraded > 0) {
+    warnings.push(
+      `Re-assessed ${requalified.checked} stored location rejection(s); ${requalified.upgraded} now meet the location rule and were returned to the pool.`,
+    );
+  }
   const failures: string[] = [];
   let allSourcesFailed = false;
   const userId = ownerUserId(options.userId);
@@ -1076,23 +1269,36 @@ export async function executeRun(
     logAgent({ runId, agentKey: "research", assignment: "Discover QA vacancies across all configured sources", status: "running" });
     let discovery: DiscoveryResult;
     try {
-      discovery = reuseDiscovery
-        ? {
-            discovered: persistedDiscoveryJobIds.length,
-            inserted: persistedDiscoveryJobIds.length,
-            duplicates: runRow.jobs_duplicates,
-            updated: runRow.jobs_updated,
-            filtered: runRow.jobs_filtered,
-            jobIds: persistedDiscoveryJobIds,
-            sources: [],
-            warnings: ["Discovery was not repeated: the completed checkpoint and persisted vacancies were reused."],
-            scope: discoveryScope,
-            since: runRow.discovery_since,
-            discoveryState: "ok",
-          }
-        : deps.discover
-          ? await deps.discover({ runId, pages, scope: discoveryScope })
-          : await discoverJobSources({ runId, pages, scope: discoveryScope });
+      if (reuseDiscovery) {
+        discovery = {
+          discovered: persistedDiscoveryJobIds.length,
+          inserted: persistedDiscoveryJobIds.length,
+          duplicates: runRow.jobs_duplicates,
+          updated: runRow.jobs_updated,
+          filtered: runRow.jobs_filtered,
+          jobIds: persistedDiscoveryJobIds,
+          sources: [],
+          warnings: ["Discovery was not repeated: the completed checkpoint and persisted vacancies were reused."],
+          scope: discoveryScope,
+          since: runRow.discovery_since,
+          discoveryState: "ok",
+        };
+      } else {
+        discovery = await discoverWithRetry(
+          () =>
+            deps.discover
+              ? deps.discover({ runId, pages, scope: discoveryScope })
+              : discoverJobSources({ runId, pages, scope: discoveryScope }),
+          {
+            retries: 1,
+            delayMs: Math.max(0, Number(process.env.RECRUITMENT_DISCOVERY_RETRY_MS ?? 1500) || 0),
+            onRetry: (attempt, reason) =>
+              warnings.push(
+                `Discovery attempt ${attempt} produced no usable source (${reason}); retrying once before failing the run.`,
+              ),
+          },
+        );
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Discovery failed.";
       allSourcesFailed = true;
@@ -1112,6 +1318,9 @@ export async function executeRun(
         warnings: [`Discovery unavailable: ${message}`],
         scope: discoveryScope,
         since: null,
+        // Without this the later `discovery.allSourcesFailed ?? …` recomputation
+        // would overwrite the caught failure with a successful-looking zero.
+        allSourcesFailed: true,
       };
     }
     for (const warning of discovery.warnings) warnings.push(warning);
@@ -1119,18 +1328,25 @@ export async function executeRun(
     const sourceSummary = discovery.sources
       .map((source) => `${source.label}: ${source.fetched} fetched / ${source.inserted} new / ${source.updated ?? 0} updated${source.error ? ` (${source.error})` : ""}`)
       .join("; ");
+    // Bounded external evidence is reported as a separate fact. It never changes
+    // the source counters, eligibility, score, threshold or submission outcome.
+    const researchEvidence = discovery.research;
+    const researchSummary =
+      researchEvidence && researchEvidence.attempted > 0
+        ? ` Agent Reach read-only evidence: ${researchEvidence.succeeded}/${researchEvidence.attempted} of the newest ${researchEvidence.cap} new vacancy(ies); evidence cannot change eligibility, score or submission.`
+        : "";
     logAgent({
       runId,
       agentKey: "research",
       assignment: "Discover QA vacancies across all configured sources",
       status: "completed",
-      output: `${discovery.inserted} new, ${discovery.updated} updated, ${discovery.duplicates} duplicates, ${discovery.filtered} rejected. ${sourceSummary}`,
+      output: `${discovery.inserted} new, ${discovery.updated} updated, ${discovery.duplicates} duplicates, ${discovery.filtered} rejected. ${sourceSummary}${researchSummary}`,
       finishedAt: nowIso(),
     });
     safeComplete(
       researchTask.taskId,
       "research",
-      `${discovery.inserted} new vacancies; ${discovery.updated} updated; ${discovery.duplicates} duplicate listing(s) blocked; ${discovery.filtered} posting(s) rejected. ${sourceSummary}`,
+      `${discovery.inserted} new vacancies; ${discovery.updated} updated; ${discovery.duplicates} duplicate listing(s) blocked; ${discovery.filtered} posting(s) rejected. ${sourceSummary}${researchSummary}`,
     );
     const checkedSources = discovery.sources.filter((source) => (source.requests ?? 0) > 0);
     const succeededSources = checkedSources.filter((source) => (source.responses ?? 0) > 0);
@@ -1142,7 +1358,14 @@ export async function executeRun(
       stage: "discovery",
       status: allSourcesFailed ? "failed" : "completed",
       outputRefs: { jobIds: [...new Set(discovery.jobIds)] },
-      evidence: { inserted: discovery.inserted, updated: discovery.updated, duplicates: discovery.duplicates, filtered: discovery.filtered },
+      evidence: {
+        inserted: discovery.inserted,
+        updated: discovery.updated,
+        duplicates: discovery.duplicates,
+        filtered: discovery.filtered,
+        researchEvidence: researchEvidence?.succeeded ?? 0,
+        researchAttempted: researchEvidence?.attempted ?? 0,
+      },
       reason: allSourcesFailed ? "All configured sources failed." : null,
       errorClass: allSourcesFailed ? "provider_unavailable" : null,
       now,
@@ -1282,7 +1505,35 @@ export async function executeRun(
         });
       }
     }
+    // Part A: the backlog is persistent. Requeue any blocked application whose
+    // blocking evidence has actually changed, reconcile the queue against the
+    // live jobs table, then merge standing work with this run's discoveries.
+    // A vacancy qualified yesterday is no longer forgotten because today's
+    // discovery did not return it.
+    if (!discoveryOnly) {
+      requeueBlockedApplications({ runId, now });
+    }
+    syncQualifiedQueue({ runId, now });
+    // `qualifiedJobs` keeps its run-scoped meaning for reporting; processing
+    // uses `workItems`, which also carries the persisted backlog.
+    const workItems = [...qualifiedJobs];
+    if (!discoveryOnly) {
+      const standingWork = claimQueueWork({ runId, limit: Math.max(1, selectionLimit), now });
+      const canonicalByJob = new Map(
+        all<{ id: string; canonical_key: string | null }>("SELECT id, canonical_key FROM jobs WHERE qualified = 1").map(
+          (row) => [row.id, row.canonical_key ?? row.id] as const,
+        ),
+      );
+      const seenCanonical = new Set(workItems.map((item) => canonicalByJob.get(item.id) ?? item.id));
+      for (const entry of standingWork) {
+        const canonical = entry.canonicalKey ?? entry.jobId;
+        if (seenCanonical.has(canonical)) continue;
+        seenCanonical.add(canonical);
+        workItems.push({ id: entry.jobId, score: entry.score });
+      }
+    }
     qualifiedJobs.sort((a, b) => b.score - a.score);
+    workItems.sort((a, b) => b.score - a.score);
     const strongMatches = all<{ title: string; company: string; match_score: number }>(
       "SELECT title, company, match_score FROM jobs WHERE run_id = ? AND match_flag = 'strong' ORDER BY match_score DESC LIMIT 5",
       [runId],
@@ -1506,10 +1757,10 @@ export async function executeRun(
     }
 
     /* 3. Documents */
-    const selected = qualifiedJobs.slice(0, selectionLimit);
-    if (qualifiedJobs.length > selected.length && selectionLimit > 0) {
+    const selected = workItems.slice(0, selectionLimit);
+    if (workItems.length > selected.length && selectionLimit > 0) {
       warnings.push(
-        `${qualifiedJobs.length - selected.length} qualifying vacancy(ies) remain for a later run because the daily submission limit is ${policy.maxSubmissionsPerDay}.`,
+        `${workItems.length - selected.length} qualifying vacancy(ies) remain for a later run because the daily submission limit is ${policy.maxSubmissionsPerDay}.`,
       );
     }
     let prepared = 0;
@@ -1519,6 +1770,30 @@ export async function executeRun(
       for (const item of selected) {
         const job = jobLite(item.id);
         if (!job) continue;
+        // Part C: a verified employer destination is required before any
+        // tailored document is generated. An unresolved or aggregator URL is
+        // recorded as waiting and consumes no generation work.
+        const existingPackage = validPackageFor(item.id);
+        if (!existingPackage) {
+          const destination = await (deps.preflight?.(item.id) ?? preflightDestination(item.id));
+          if (
+            destination.state !== "ready_for_preparation" &&
+            destination.state !== "package_ready" &&
+            destination.state !== "ready_for_submission"
+          ) {
+            warnings.push(`Destination preflight held ${job.title} at ${job.company}: ${destination.reason}`);
+            logAgent({
+              runId,
+              agentKey: "ats",
+              assignment: `Employer destination preflight for ${job.title}`,
+              status: "blocked",
+              output: destination.reason,
+              decision: "No document was generated until a verified employer destination exists.",
+              finishedAt: nowIso(),
+            });
+            continue;
+          }
+        }
         const validationDecision = options.resume
           ? decideStageRecovery({ runId, jobId: item.id, stage: "vacancy_validation", now, leaseActive: false })
           : null;
@@ -1602,6 +1877,27 @@ export async function executeRun(
             finishedAt: nowIso(),
           });
         }
+        if (!pkg && existingPackage) {
+          // A package from an earlier run is reused verbatim. Regenerating it
+          // would create a second CV/cover pair and a second application row.
+          pkg = {
+            ok: true,
+            message: "The persisted, quality-validated package was reused; no document was regenerated.",
+            applicationId: existingPackage.id,
+            cvDocumentId: existingPackage.cvDocumentId,
+            coverDocumentId: existingPackage.coverDocumentId,
+            warnings: [],
+          };
+          logAgent({
+            runId,
+            agentKey: "cv",
+            assignment: `Reuse the persisted package for ${job.title}`,
+            status: "completed",
+            output: "Both validated documents already existed; nothing was regenerated.",
+            decision: "Duplicate package generation was prevented.",
+            finishedAt: nowIso(),
+          });
+        }
         let lastError: string | null = null;
         for (let attempt = 1; attempt <= 2 && !(pkg && pkg.ok); attempt += 1) {
           const started = nowIso();
@@ -1641,7 +1937,7 @@ export async function executeRun(
           });
           continue;
         }
-        prepared += 1;
+        if (!existingPackage) prepared += 1;
         packagesByJob.set(item.id, pkg);
         run("UPDATE jobs SET document_state = 'prepared' WHERE id = ?", [item.id]);
         if (pkg.applicationId) {
@@ -1845,9 +2141,15 @@ export async function executeRun(
         );
         if (submitTask.taskId) submissionTasks.push(submitTask.taskId);
         if (submitTask.warning) warnings.push(submitTask.warning);
-        const finishSubmissionTask = (status: "completed" | "failed", output: string, errorClass?: "validation" | "submission_ambiguous" | "blocked") => {
+        const finishSubmissionTask = (
+          status: "completed" | "failed" | "blocked",
+          output: string,
+          errorClass?: "validation" | "submission_ambiguous" | "blocked",
+          recoveryState?: string,
+        ) => {
           if (!submitTask.taskId) return;
           if (status === "completed") completeTask(submitTask.taskId, "application", output);
+          else if (status === "blocked") blockTask(submitTask.taskId, "application", output, { errorClass: errorClass ?? "blocked", recoveryState });
           else failTask(submitTask.taskId, "application", output, errorClass ?? "validation");
         };
         // Submission is irreversible. A restart must inspect the persisted
@@ -1989,6 +2291,16 @@ export async function executeRun(
           continue;
         }
         recordSubmissionCheckpoints(runId, item.jobId, now);
+        recordSubmissionLifecycle({
+          applicationId: item.applicationId,
+          jobId: item.jobId,
+          status: outcome.status,
+          outcomeClass: submissionOutcomeClass(outcome),
+          detail: outcome.detail,
+          externalRequirement:
+            typeof outcome.evidence?.externalRequirement === "string" ? outcome.evidence.externalRequirement : null,
+          now,
+        });
         if (outcome.status === "verified") {
           submitted += 1;
           finishSubmissionTask("completed", outcome.detail);
@@ -2011,15 +2323,75 @@ export async function executeRun(
           finishSubmissionTask("failed", `Technical submission failure: ${outcome.detail}`, "validation");
           logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "failed", error: outcome.detail, decision: "Technical submission failure; nothing was recorded as submitted and no approval gate was created.", finishedAt: nowIso() });
         } else {
+          // An external requirement (CAPTCHA, MFA, login, unsupported portal) is
+          // not a technical failure. The task is recorded as `blocked`, with the
+          // canonical outcome class kept in submission_evidence, so failure
+          // counts and agent-failure alerts stay truthful.
           intervention += 1;
-          finishSubmissionTask("failed", `Submission needs intervention: ${outcome.detail}`, "blocked");
-          logAgent({ runId, agentKey: "application", assignment: `Submit ${item.job.title}`, status: "skipped", error: outcome.detail, decision: "Queued for human intervention; nothing was recorded as submitted.", finishedAt: nowIso() });
+          const outcomeClass = submissionOutcomeClass(outcome);
+          const detail =
+            outcomeClass === "blocked_external"
+              ? `Submission blocked by an external requirement: ${outcome.detail}`
+              : `Prepared but not submitted: ${outcome.detail}`;
+          finishSubmissionTask("blocked", detail, "blocked", outcomeClass);
+          logAgent({
+            runId,
+            agentKey: "application",
+            assignment: `Submit ${item.job.title}`,
+            status: "blocked",
+            output: detail,
+            error: outcome.detail,
+            decision:
+              outcomeClass === "blocked_external"
+                ? "Noor completed its permitted work; the employer's external requirement is recorded as blocked, not as a technical failure."
+                : "Noor prepared the package; no employer submission was made.",
+            finishedAt: nowIso(),
+          });
           notify({
             kind: "application_intervention",
             dedupeKey: `intervention:${runId}:${item.jobId}`,
             subject: `Application needs your attention: ${item.job.title}`,
             body: `${item.job.company} was not submitted. ${outcome.detail}`,
           });
+        }
+      }
+    }
+
+    /* 5b. Outreach — independent of whether submission succeeded. */
+    const outreachAvailable = Boolean(deps.outreach) || gmailAccountStatus().connected;
+    for (const item of outreachAvailable ? ready : []) {
+      try {
+        const result = deps.outreach
+          ? await deps.outreach({ applicationId: item.applicationId, jobId: item.jobId })
+          : await prepareOutreachForApplication({ applicationId: item.applicationId });
+        if (result.status === "draft_created") {
+          logAgent({
+            runId,
+            agentKey: "email",
+            assignment: `Outreach draft for ${item.job.title}`,
+            status: "completed",
+            output: result.detail,
+            decision: "A real Gmail draft was created; no outreach email was sent.",
+            finishedAt: nowIso(),
+          });
+        } else if (result.status === "failed" || result.status === "blocked") {
+          warnings.push(`Outreach for ${item.job.title}: ${result.detail}`);
+        }
+      } catch (error) {
+        warnings.push(`Outreach for ${item.job.title}: ${error instanceof Error ? error.message : "unknown error"}`);
+      }
+    }
+    // Reconcile owner-sent drafts against Gmail's Sent label on the existing
+    // daily run. This adds no schedule and never treats a draft as sent.
+    if (gmailAccountStatus().connected) {
+      const awaitingSend = all<{ id: string }>(
+        "SELECT id FROM outreach_drafts WHERE status = 'draft_created' AND gmail_draft_id IS NOT NULL ORDER BY created_at LIMIT 10",
+      );
+      for (const draft of awaitingSend) {
+        try {
+          await reconcileOutreachFromGmail(draft.id);
+        } catch {
+          // A reconciliation failure leaves draft_created intact.
         }
       }
     }
@@ -2096,6 +2468,12 @@ export async function executeRun(
       ],
     );
     closeOpenAssignments(runId, runStatus === "failed" ? "failed" : "completed", "Stage reached its terminal result; no background work remains for this assignment.", workflowId);
+    // The run is finished; nothing should keep a queue lease after this point.
+    releaseQueueLeases(runId);
+    // Reconcile the queue with what this run actually produced (prepared
+    // packages, simulated submissions, human holds) so the next run starts from
+    // truthful persisted states rather than pre-run ones.
+    syncQualifiedQueue({ runId, now });
     pushState(
       runId,
       runStatus,
@@ -2172,8 +2550,6 @@ export async function executeRun(
       finishedAt: nowIso(),
     });
 
-    const finalReport = buildRunReport(runId, { warnings, failures });
-    run("UPDATE recruitment_runs SET report = ? WHERE id = ?", [finalReport, runId]);
     if (trackingTask.taskId) {
       completeTask(
         trackingTask.taskId,
@@ -2183,6 +2559,11 @@ export async function executeRun(
         { outputRefs: { submitted, unverified, intervention, failures: failures.length, warnings: warnings.length } },
       );
     }
+    // Build the manifest only after the final assignment is terminal. Otherwise
+    // a completed run can show Rayna as still running and Noor would report work
+    // that no longer exists.
+    const finalReport = buildRunReport(runId, { warnings, failures });
+    run("UPDATE recruitment_runs SET report = ? WHERE id = ?", [finalReport, runId]);
     finishWorkflow(workflowId, runStatus === "failed" ? "failed" : "completed", finalReport.split("\n")[1] ?? "Daily recruitment run completed.");
     // A discovery-only run does not consume the daily schedule slot.
     if (!discoveryOnly && runRow.trigger !== "manual") {
@@ -2242,6 +2623,8 @@ export async function executeRun(
       ],
     );
     closeOpenAssignments(runId, "failed", "Run terminated before this assignment completed.", workflowId);
+    // A crash must not leave a vacancy locked to this run forever.
+    releaseQueueLeases(runId);
     pushState(runId, "failed", message);
     if (workflowId) finishWorkflow(workflowId, "failed", message);
     if (runRow.trigger !== "manual") {
@@ -2515,6 +2898,25 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   );
   const failedSources = checks.filter((check) => check.ok !== 1);
   const staleSources = checks.filter((check) => check.ok === 1 && check.fresh === 0);
+  // Run-scoped counts say what this execution did; the standing counts say what
+  // the pipeline already holds. Conflating them made a run that stored nothing
+  // new look like "no vacancy passes 85%" while prepared packages existed.
+  const standing = {
+    atOrAbove: Number(one<{ n: number }>("SELECT COUNT(*) AS n FROM jobs WHERE match_score >= ?", [qualifyingThreshold()])?.n ?? 0),
+    eligible: Number(one<{ n: number }>("SELECT COUNT(*) AS n FROM jobs WHERE qualified = 1")?.n ?? 0),
+    // A package exists once both tailored documents are attached, whatever the
+    // application's workflow status is.
+    packages: Number(
+      one<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM applications WHERE cv_document_id IS NOT NULL AND cover_letter_id IS NOT NULL",
+      )?.n ?? 0,
+    ),
+    verified: Number(one<{ n: number }>("SELECT COUNT(*) AS n FROM submission_attempts WHERE status = 'verified'")?.n ?? 0),
+    blockedExternal: Number(
+      one<{ n: number }>("SELECT COUNT(*) AS n FROM submission_attempts WHERE status = 'blocked'")?.n ?? 0,
+    ),
+    technicalFailed: Number(one<{ n: number }>("SELECT COUNT(*) AS n FROM submission_attempts WHERE status = 'failed'")?.n ?? 0),
+  };
 
   const reasonFor = (job: {
     eligibility: string | null;
@@ -2562,7 +2964,8 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
         (failedSources.length > 0
           ? ` ${failedSources.length} source endpoint(s) failed: ${failedSources.map((check) => `${check.source_key} (${check.error ?? "unknown error"})`).join("; ")}.`
           : " No configured source failed.") +
-        " The 85% threshold was not lowered, publication age alone never rejects a listing, and no vacancy was invented."
+        ` Match scoring therefore had no new vacancy to assess in this run; that is not evidence that no vacancy passes the ${qualifyingThreshold()}% threshold. The standing pipeline holds ${standing.atOrAbove} vacancy(ies) at or above ${qualifyingThreshold()}% and ${standing.eligible} eligible, with ${standing.packages} package(s) prepared.` +
+        ` The ${qualifyingThreshold()}% threshold was not lowered, publication age alone never rejects a listing, and no vacancy was invented.`
       );
     }
     const ineligible = rejected.filter((job) => job.eligibility && job.eligibility !== "eligible").length;
@@ -2580,7 +2983,7 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   const screenedTotal = sourceMetrics.reduce((sum, metric) => sum + metric.postings, 0);
   const relevantTotal = sourceMetrics.reduce((sum, metric) => sum + metric.relevant, 0);
   lines.push(
-    `${screenedTotal.toLocaleString("en-GB")} postings screened, ${relevantTotal} relevant, ${runRow.jobs_discovered} new vacancies stored, ${runRow.jobs_updated ?? 0} known vacancies updated, ${runRow.jobs_duplicates ?? 0} duplicate listing(s), ${runRow.jobs_filtered ?? 0} rejected during discovery, ${runRow.jobs_eligible} eligible, ${runRow.jobs_qualified} qualified at ${qualifyingThreshold()}% or higher, ${runRow.packages_prepared} package(s) prepared, ${runRow.applications_submitted} submitted and verified, ${runRow.applications_unverified} unverified, ${runRow.applications_simulated} simulated, ${runRow.applications_intervention} needing your attention. Run status: ${runRow.status.replace(/_/g, " ")}.`,
+    `${screenedTotal.toLocaleString("en-GB")} postings screened, ${relevantTotal} relevant, ${runRow.jobs_discovered} new vacancies stored, ${runRow.jobs_updated ?? 0} known vacancies updated, ${runRow.jobs_duplicates ?? 0} duplicate listing(s), ${runRow.jobs_filtered ?? 0} rejected during discovery, ${runRow.jobs_eligible} eligible in this run, ${runRow.jobs_qualified} newly qualified at ${qualifyingThreshold()}% or higher, ${runRow.packages_prepared} package(s) prepared, ${runRow.applications_submitted} submitted and verified, ${runRow.applications_unverified} unverified, ${runRow.applications_simulated} simulated, ${runRow.applications_intervention} needing your attention. Run status: ${runRow.status.replace(/_/g, " ")}.`,
   );
   const scope = runRow.discovery_scope === "incremental" ? "incremental" : "full";
   lines.push(
@@ -2600,6 +3003,16 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   if ((runRow.mode ?? "full") === "discovery") {
     lines.push("Mode: discovery only — vacancies were discovered and assessed; no documents were prepared and nothing was submitted.");
   }
+  const outreach = outreachSummary();
+  lines.push("");
+  lines.push("## 1a. Dual-channel status");
+  lines.push(
+    `Application channel: ${runRow.applications_submitted} verified employer submission(s), ${runRow.applications_unverified} unverified, ${runRow.applications_intervention} requiring intervention. ` +
+      `Outreach channel (standing ledger): ${outreach.contactsVerified} verified contact(s), ${outreach.contactsUnavailable} unavailable after a bounded search, ${outreach.draftsCreated} Gmail draft(s) created, ${outreach.draftsAwaitingReview} awaiting owner review, ${outreach.emailsSent} actually sent by the owner, ${outreach.repliesReceived} matched employer repl${outreach.repliesReceived === 1 ? "y" : "ies"}.`,
+  );
+  lines.push(
+    "A Gmail draft is not a submitted application and is not a sent email. An unavailable contact is recorded with its reason; no address, hiring manager or confirmation was invented.",
+  );
   lines.push("");
   lines.push("## 2. Jobs discovered");
   if (jobs.length === 0) lines.push(zeroResultExplanation());
@@ -2629,6 +3042,42 @@ export function buildRunReport(runId: string, extra?: { failures?: string[]; war
   } else {
     lines.push("");
     lines.push("No source retrieval record is available for this run.");
+  }
+    lines.push("");
+  lines.push("## Pipeline breakdown (this run and standing)");
+  const scoredEligible = jobs.filter((job) => job.eligibility === "eligible").length;
+  const scoredIneligible = jobs.filter((job) => job.eligibility && job.eligibility !== "eligible").length;
+  const scoredBelow = jobs.filter((job) => job.eligibility === "eligible" && job.qualified !== 1).length;
+  lines.push(
+    `- Sources: ${runRow.sources_checked ?? 0} queried · ${runRow.sources_succeeded ?? 0} returned data · ${runRow.sources_partial ?? 0} partial · ${runRow.sources_failed ?? 0} failed.`,
+  );
+  lines.push(
+    `- Discovery in this run: ${screenedTotal.toLocaleString("en-GB")} posting(s) screened · ${relevantTotal} relevant · ${runRow.jobs_discovered} newly stored · ${runRow.jobs_updated ?? 0} updated · ${runRow.jobs_duplicates ?? 0} duplicate(s) · ${runRow.jobs_filtered ?? 0} rejected before storage.`,
+  );
+  lines.push(
+    `- Assessment in this run: ${jobs.length} vacancy(ies) scored · ${scoredEligible} eligible · ${scoredIneligible} ineligible · ${scoredBelow} eligible but below ${qualifyingThreshold()}% · ${qualified.length} qualified with no mandatory blocker.`,
+  );
+  lines.push(
+    `- Standing pipeline: ${standing.atOrAbove} vacancy(ies) at or above ${qualifyingThreshold()}% · ${standing.eligible} eligible and qualified · ${standing.packages} package(s) prepared · ${standing.verified} submission(s) verified · ${standing.blockedExternal} submission(s) blocked before sending · ${standing.technicalFailed} technical submission failure(s).`,
+  );
+  // Reconciliation: every category below has an explicit SQL definition in
+  // pipelineReconciliation(). A match-score count is never an eligibility count.
+  const reconciled = pipelineReconciliation(qualifyingThreshold());
+  const c = reconciled.counts;
+  lines.push(
+    `- Reconciled pool: ${c.discovered} discovered · ${c.score_at_or_above_threshold} scoring ${qualifyingThreshold()}%+ · ${c.eligibility_eligible} eligibility-eligible · ${c.qualified_pool} in the qualified pool · ${c.verified_destination} with a verified employer destination.`,
+  );
+  lines.push(
+    `- Persistent queue: ${c.awaiting_destination} awaiting destination · ${c.ready_for_preparation} ready/preparing · ${(c.packages_quality_validated ?? 0)} package(s) quality-validated · ${c.ready_for_submission} ready for submission · ${c.blocked_technical} technical block(s) · ${c.blocked_security} security block(s) · ${c.awaiting_human} awaiting human · ${c.submitted_verified} verified submission(s) · ${c.employer_confirmed} employer-confirmed.`,
+  );
+  const queuePreview = queueSnapshot(6);
+  for (const entry of queuePreview) {
+    lines.push(`  - ${entry.title} — ${entry.company} (${entry.score ?? "?"}%): ${entry.state}${entry.reason ? ` — ${entry.reason}` : ""}`);
+  }
+  if (jobs.length === 0 && relevantTotal > 0) {
+    lines.push(
+      `- Scoring was not skipped because of an error: this run stored no new vacancy, so the ${runRow.jobs_duplicates ?? 0} known listing(s) were not re-assessed. "No new vacancy" is not the same as "no vacancy qualifies".`,
+    );
   }
   lines.push("");
   lines.push("## 3. Jobs rejected and reasons");

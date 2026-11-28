@@ -12,6 +12,7 @@ import { buildRunReport, runById, runStateHistory, qualifyingThreshold } from "@
 import { buildExecutionManifest } from "@/lib/execution-manifest";
 import { formatInZone } from "@/lib/recruitment-schedule";
 import { agentIdentity } from "@/lib/agent-identity";
+import { discoveryResearchReport } from "@/lib/recruitment-discovery";
 
 export const dynamic = "force-dynamic";
 
@@ -31,6 +32,7 @@ export default async function RecruitmentRunPage({
   const report = runRow.report ?? buildRunReport(id);
   const states = runStateHistory(runRow);
   const manifest = buildExecutionManifest(id);
+  const research = discoveryResearchReport(id);
 
   const jobs = all<{
     id: string; title: string; company: string; location: string | null; match_score: number | null; eligibility: string | null;
@@ -71,7 +73,7 @@ export default async function RecruitmentRunPage({
         sub={`${runRow.trigger} · ${formatInZone(runRow.started_at)} → ${formatInZone(runRow.finished_at)} · threshold ${qualifyingThreshold()}% · execution ${runRow.id}`}
         actions={
           <>
-            <span className={`badge ${runRow.status === "completed" ? "badge-good" : runRow.status === "failed" ? "badge-bad" : "badge-warn"}`}>{runRow.status.replace(/_/g, " ")}</span>
+            <span className={`badge ${runRow.status === "completed" ? "badge-good" : runRow.status === "failed" || runRow.status === "missed" ? "badge-bad" : "badge-warn"}`}>{runRow.status.replace(/_/g, " ")}</span>
             {runRow.status === "failed" ? (
               <form action={retryRecruitmentRunAction}>
                 <input type="hidden" name="run_id" value={runRow.id} />
@@ -126,13 +128,39 @@ export default async function RecruitmentRunPage({
             <Stat label="Postings screened" value={manifest.counts.postingsScreened} />
             <Stat label="Relevant" value={manifest.counts.relevant} />
             <Stat label="New vacancies" value={manifest.counts.newJobs} />
-            <Stat label="Eligible" value={manifest.counts.eligible} />
-            <Stat label="Qualified" value={manifest.counts.qualified} tone="good" />
+            <Stat label="Eligible (this run)" value={manifest.counts.eligible} />
+            <Stat label="Qualified (this run)" value={manifest.counts.qualified} tone="good" />
             <Stat label="Prepared" value={manifest.counts.documentsPrepared} />
             <Stat label="Ready" value={manifest.counts.applicationsReady} />
             <Stat label="Submitted (verified)" value={manifest.counts.submittedVerified} tone="good" />
             <Stat label="Unverified" value={manifest.counts.submittedUnverified} tone={manifest.counts.submittedUnverified ? "warn" : undefined} />
             <Stat label="Intervention" value={manifest.counts.interventions} tone={manifest.counts.interventions ? "warn" : undefined} />
+          </section>
+
+          <section className="card mb-4">
+            <div className="card-head">
+              <div>
+                <h2>Read-only external evidence</h2>
+                <p className="card-sub">Agent Reach page reads for the newest stored vacancies, bounded per run. Evidence is an audit input only.</p>
+              </div>
+              <span className={`badge ${research ? (research.ok ? "badge-good" : "badge-warn") : "badge-neutral"}`}>
+                {research ? `${research.succeeded}/${research.attempted} usable` : "no evidence recorded"}
+              </span>
+            </div>
+            <div className="card-body stack text-[12.5px]" style={{ gap: 8 }}>
+              {research ? (
+                <>
+                  <div className="between"><span style={{ color: "var(--muted)" }}>Vacancies read / attempted</span><span>{research.succeeded} / {research.attempted}</span></div>
+                  <div className="between"><span style={{ color: "var(--muted)" }}>Hard cap per run</span><span>{research.cap}</span></div>
+                  <div className="between"><span style={{ color: "var(--muted)" }}>Counters describe</span><span>{research.fromRun ? "this run" : "the latest recorded research pass"}</span></div>
+                  <div className="between"><span style={{ color: "var(--muted)" }}>Last read</span><span>{research.lastCheckedAt ? formatDateTime(research.lastCheckedAt) : "not recorded"}</span></div>
+                  {research.error ? <div className="alert alert-warn" style={{ padding: "7px 9px", fontSize: 11 }}>{research.error}</div> : null}
+                  <p className="hint">These reads cannot insert a vacancy, change a match score, satisfy the {qualifyingThreshold()}% threshold, alter eligibility or reach submission. Deduplication, German-language exclusion and readiness gates run before and independently of them.</p>
+                </>
+              ) : (
+                <p className="text-[12px]" style={{ color: "var(--muted)" }}>This run recorded no bounded research pass. Discovery and every gate ran without external evidence.</p>
+              )}
+            </div>
           </section>
 
           <section className="card mb-4">

@@ -12,7 +12,6 @@ import type {
   TopologyTask,
   TopologyRecovery,
 } from "@/lib/agent-topology";
-import { switchAgentAction } from "@/lib/actions/chat";
 import type { IdentityAgentKey } from "@/lib/agent-identity";
 
 const EVENT_TYPES = [
@@ -557,10 +556,9 @@ function AgentDrawer({
         </section>
         <div className="topology-drawer-actions">
           <Link href={`/agents/list?agent=${agent.key}#activity`} className="btn">Full task history</Link>
-          <form action={switchAgentAction}>
-            <input type="hidden" name="agent" value={agent.key} />
-            <button type="submit" className="btn btn-primary">Open conversation</button>
-          </form>
+          <Link href={`/assistant?agent=${agent.key}`} className="btn btn-primary" data-testid="open-conversation">
+            Open conversation
+          </Link>
         </div>
       </aside>
     </div>,

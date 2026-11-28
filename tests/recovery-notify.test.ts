@@ -90,7 +90,7 @@ test("notification events are deduplicated and Gmail acceptance is recorded sepa
     "SELECT status, delivery, provider_message_id FROM notification_outbox WHERE dedupe_key = 'test:discovery:one'",
   );
   assert.equal(row?.status, "sent");
-  assert.equal(row?.delivery, "accepted_by_gmail");
+  assert.equal(row?.delivery, "accepted_by_provider");
   assert.equal(row?.provider_message_id, "gmail-test-id");
 });
 

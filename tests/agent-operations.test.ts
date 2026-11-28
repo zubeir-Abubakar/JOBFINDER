@@ -245,13 +245,13 @@ test("the live operational snapshot answers without inventing provider or token 
   assert.match(quota, /Provider routes cooling down/);
   assert.match(quota, /Next provider retry/);
   const email = operations.answerFromOperations("Was Gmail authenticated and did the daily report email send?", snapshot) ?? "";
-  assert.match(email, /Gmail:/);
+  assert.match(email, /Email provider:/);
   assert.match(email, /Executive Brief/);
-  assert.match(email, /state generated|state queued|state accepted_by_gmail|state sent_folder_observed|state delivery_confirmed/);
+  assert.match(email, /state generated|state queued|state accepted_by_provider|state accepted_by_gmail|state sent_folder_observed|state delivery_confirmed/);
   assert.match(email, /not delivery-confirmed/);
   const brief = operations.operationsBrief(snapshot);
   assert.match(brief, new RegExp(`schema v${db.SCHEMA_VERSION}`));
-  assert.match(brief, /Gmail accepted \(not delivery-confirmed\)/);
+  assert.match(brief, /provider accepted \(not delivery-confirmed\)/);
   assert.match(brief, /Sent-folder observed/);
   assert.match(brief, /delivery confirmed/);
 });

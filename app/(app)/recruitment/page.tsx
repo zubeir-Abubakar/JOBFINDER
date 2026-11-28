@@ -10,9 +10,11 @@ import { qualifyingThreshold, recentRuns } from "@/lib/recruitment-run";
 import { buildExecutionManifest } from "@/lib/execution-manifest";
 import { dailySubmissionUsage, getRecruitmentPolicy } from "@/lib/recruitment-policy";
 import { recruitmentSchedulerStatus } from "@/lib/recruitment-ticker";
-import { sourceHealth, type SourceMetrics } from "@/lib/recruitment-discovery";
+import { discoveryResearchReport, sourceHealth, type SourceMetrics } from "@/lib/recruitment-discovery";
 import { agentIdentity } from "@/lib/agent-identity";
 import { handoffQueue } from "@/lib/handoff";
+import { outreachDashboard, type OutreachAttachmentState, type OutreachDraftRecord } from "@/lib/outreach";
+import { reconcileOutreachAction } from "@/lib/actions/outreach";
 import {
   pauseStandingAuthorisationAction,
   resumeStandingAuthorisationAction,
@@ -24,6 +26,22 @@ import {
 import { executiveBriefScheduleSnapshot } from "@/lib/executive-brief";
 
 export const dynamic = "force-dynamic";
+
+function attachmentBadge(state: OutreachAttachmentState): { className: string; label: string } {
+  if (state === "attached") return { className: "badge badge-good", label: "Attached · validated" };
+  if (state === "quality_failed") return { className: "badge badge-bad", label: "Quality gate failed" };
+  if (state === "wrong_vacancy") return { className: "badge badge-bad", label: "Wrong vacancy" };
+  return { className: "badge badge-warn", label: "Missing" };
+}
+
+function outreachStateBadge(status: OutreachDraftRecord["status"]): { className: string; label: string } {
+  if (status === "sent") return { className: "badge badge-good", label: "Sent by owner" };
+  if (status === "draft_created") return { className: "badge badge-info", label: "Draft — not sent" };
+  if (status === "draft_missing") return { className: "badge badge-warn", label: "Draft missing" };
+  if (status === "failed") return { className: "badge badge-bad", label: "Draft failed" };
+  if (status === "blocked") return { className: "badge badge-warn", label: "Blocked" };
+  return { className: "badge badge-neutral", label: "Pending" };
+}
 
 /**
  * Autonomous Recruitment operations centre.
@@ -46,6 +64,8 @@ export default async function RecruitmentPage({
   const reportSchedule = executiveBriefScheduleSnapshot();
   const policy = getRecruitmentPolicy();
   const usage = dailySubmissionUsage();
+  const outreachView = outreachDashboard();
+  const outreach = outreachView.counters;
   const scheduler = recruitmentSchedulerStatus();
   const checkedAt = schedule.lastCheckedAt ? Date.parse(schedule.lastCheckedAt) : NaN;
   const recentlyChecked = Number.isFinite(checkedAt) && Date.now() - checkedAt < 150_000;
@@ -88,6 +108,7 @@ export default async function RecruitmentPage({
     ? Number(one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE run_id = ? AND qualified = 0", [latest.id])?.c ?? 0)
     : 0;
   const lastSourceChecks = sourceHealth();
+  const research = discoveryResearchReport(latest?.id ?? null);
   const lastSuccessfulDiscovery = lastSourceChecks
     .map((check) => check.last_success_at)
     .filter((value): value is string => Boolean(value))
@@ -117,6 +138,61 @@ export default async function RecruitmentPage({
        (SELECT COUNT(*) FROM applications WHERE status IN ('interview','interview_invited','interview_completed')) AS interviews`,
   ) ?? { discovered: 0, qualified: 0, prepared: 0, submitted: 0, intervention: 0, interviews: 0 };
 
+  // Standing pool: what is already stored and still valid, independent of how
+  // many vacancies this morning's run happened to store for the first time.
+  const pool = one<{ atOrAbove: number; eligible: number }>(
+    `SELECT
+       (SELECT COUNT(*) FROM jobs WHERE match_score >= ?) AS atOrAbove,
+       (SELECT COUNT(*) FROM jobs WHERE qualified = 1) AS eligible`,
+    [qualifyingThreshold()],
+  ) ?? { atOrAbove: 0, eligible: 0 };
+  // A listing URL is not an application destination. Surface the vacancies that
+  // cannot auto-submit until an employer/ATS URL is resolved, so the block is
+  // visible before a package is prepared rather than only in a run report.
+  const unresolvedPredicate = `(application_email IS NULL AND (application_url IS NULL OR url_confidence IN ('unresolved','aggregator','missing')))`;
+  const unresolvedUrls = all<{
+    id: string;
+    title: string;
+    company: string;
+    match_score: number | null;
+    status: string;
+    qualified: number;
+    url_confidence: string | null;
+    url_provenance: string | null;
+  }>(
+    `SELECT id, title, company, match_score, status, qualified, url_confidence, url_provenance
+     FROM jobs
+     WHERE ${unresolvedPredicate}
+       AND (qualified = 1 OR status IN ('documents','shortlisted','applied'))
+     ORDER BY (qualified = 1) DESC, match_score DESC NULLS LAST
+     LIMIT 8`,
+  );
+  const unresolvedTotal = Number(
+    one<{ n: number }>(`SELECT COUNT(*) AS n FROM jobs WHERE ${unresolvedPredicate}`)?.n ?? 0,
+  );
+  const unresolvedBlocking = Number(
+    one<{ n: number }>(
+      `SELECT COUNT(*) AS n FROM jobs WHERE ${unresolvedPredicate} AND qualified = 1`,
+    )?.n ?? 0,
+  );
+  const unresolvedReason = (job: { url_provenance: string | null }): string | null => {
+    try {
+      const parsed = JSON.parse(job.url_provenance ?? "{}") as { reason?: unknown };
+      return typeof parsed.reason === "string" && parsed.reason.trim() ? parsed.reason : null;
+    } catch {
+      return null;
+    }
+  };
+  // Persistent qualified queue: these counts survive across runs, so a
+  // vacancy qualified earlier is never invisible merely because today's
+  // discovery did not return it. Each row is a vacancy, not an application.
+  const queueStates = new Map(
+    all<{ state: string; n: number }>("SELECT state, COUNT(*) AS n FROM recruitment_queue GROUP BY state").map((row) => [
+      row.state,
+      Number(row.n),
+    ]),
+  );
+  const queueCount = (states: string[]): number => states.reduce((sum, state) => sum + (queueStates.get(state) ?? 0), 0);
   const pipeline = all<{ status: string; n: number }>("SELECT status, COUNT(*) AS n FROM applications GROUP BY status");
   const pipelineMap = new Map(pipeline.map((row) => [row.status, Number(row.n)]));
   const attention = all<{
@@ -157,11 +233,188 @@ export default async function RecruitmentPage({
         <Stat label="Latest postings screened" value={latestManifest?.counts.postingsScreened ?? 0} />
         <Stat label="Latest relevant" value={latestManifest?.counts.relevant ?? 0} />
         <Stat label="New today" value={today.discovered} href="/jobs" />
-        <Stat label={`At or above ${qualifyingThreshold()}%`} value={today.qualified} tone="good" href="/jobs?min=85" />
+        <Stat label={`${qualifyingThreshold()}%+ discovered today`} value={today.qualified} tone="good" href="/jobs?min=85" />
+        <Stat label={`${qualifyingThreshold()}%+ in stored pool`} value={pool.atOrAbove} href="/jobs?min=85" />
+        <Stat label="Eligibility-qualified pool" value={pool.eligible} tone={pool.eligible ? "good" : undefined} href="/jobs?status=shortlisted" />
         <Stat label="Prepared" value={today.prepared} href="/applications" />
         <Stat label="Submitted (verified)" value={today.submitted} tone="good" href="/applications?status=submitted" />
         <Stat label="Needs your attention" value={today.intervention} tone={today.intervention ? "warn" : undefined} href="/recruitment#attention" />
         <Stat label="Interviews" value={today.interviews} tone={today.interviews ? "good" : undefined} href="/applications?group=interviews" />
+      </section>
+
+      <section className="card mb-4" id="outreach" data-testid="outreach-card">
+        <div className="card-head">
+          <div>
+            <h2>Hiring-manager outreach</h2>
+            <p className="card-sub">
+              Live counts from the outreach ledger and the connected mailbox. A prepared draft is not a sent email, and outreach is tracked
+              independently of application submission.
+            </p>
+          </div>
+          <div className="row gap-2">
+            <span className={`badge ${outreach.needsIntervention ? "badge-warn" : "badge-neutral"}`}>
+              {outreach.needsIntervention ? `${outreach.needsIntervention} needing intervention` : "No outreach intervention"}
+            </span>
+            <Link href="/outreach" className="btn btn-sm" data-testid="recruitment-outreach-inbox">
+              Open outreach inbox
+            </Link>
+          </div>
+        </div>
+        <div className="card-body">
+          <section className="stats mb-3" aria-label="Outreach counters">
+            <Stat label="Prepared drafts" value={outreach.draftsPrepared} href="#outreach-drafts" />
+            <Stat label="Verified contacts" value={outreach.verifiedContacts} tone={outreach.verifiedContacts ? "good" : undefined} />
+            <Stat label="Awaiting your review" value={outreach.awaitingReview} tone={outreach.awaitingReview ? "warn" : undefined} href="#outreach-drafts" />
+            <Stat label="Emails sent by you" value={outreach.emailsSent} tone={outreach.emailsSent ? "good" : undefined} />
+            <Stat label="Employer replies" value={outreach.repliesReceived} />
+            <Stat label="Needs intervention" value={outreach.needsIntervention} tone={outreach.needsIntervention ? "warn" : undefined} href="#outreach-drafts" />
+          </section>
+
+          <div id="outreach-drafts" className="table-wrap">
+            {outreachView.drafts.length === 0 ? (
+              <p className="text-[12px]" style={{ color: "var(--muted)" }} data-testid="outreach-empty">
+                No drafts or verified contacts are stored yet. Zero is shown rather than a sample count. A draft is created only when a verified
+                employer-associated address and a validated CV plus cover letter exist for a qualified vacancy.
+              </p>
+            ) : (
+              <table className="data responsive-cards" data-testid="outreach-drafts">
+                <thead>
+                  <tr>
+                    <th>Employer &amp; role</th>
+                    <th>Recipient</th>
+                    <th>Subject</th>
+                    <th>Created</th>
+                    <th>CV</th>
+                    <th>Cover</th>
+                    <th>Email state</th>
+                    <th>Application</th>
+                    <th aria-label="Actions" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {outreachView.drafts.map((draft) => {
+                    const state = outreachStateBadge(draft.status);
+                    const cvBadge = attachmentBadge(draft.cv.state);
+                    const coverBadge = attachmentBadge(draft.cover.state);
+                    return (
+                      <tr key={draft.id}>
+                        <td data-label="Employer & role">
+                          <Link href={`/outreach/${draft.id}`} className="cell-title">{draft.company}</Link>
+                          <div className="cell-sub">{draft.jobTitle}</div>
+                        </td>
+                        <td data-label="Recipient">
+                          <div className="cell-title">{draft.contactName}</div>
+                          <div className="cell-sub">{draft.contactTitle ?? "Title not published"}</div>
+                          <div className="cell-sub num">{draft.recipient}</div>
+                        </td>
+                        <td data-label="Subject" className="cell-sub" style={{ maxWidth: 260 }}>{draft.subject}</td>
+                        <td data-label="Created" className="cell-sub">{formatDateTime(draft.createdAt)}</td>
+                        <td data-label="CV"><span className={cvBadge.className}>{cvBadge.label}</span></td>
+                        <td data-label="Cover"><span className={coverBadge.className}>{coverBadge.label}</span></td>
+                        <td data-label="Email state"><span className={state.className}>{state.label}</span></td>
+                        <td data-label="Application"><span className={`badge ${statusClass(draft.applicationStatus)}`}>{statusLabel(draft.applicationStatus)}</span></td>
+                        <td data-label="Actions" className="text-right">
+                          <div className="flex flex-wrap items-center justify-end gap-1.5">
+                            <Link href={`/outreach/${draft.id}`} className="btn btn-sm">View draft</Link>
+                            {draft.gmailDraftId ? (
+                              <a
+                                href={`https://mail.google.com/mail/u/0/#drafts/${encodeURIComponent(draft.gmailDraftId)}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="btn btn-sm"
+                              >
+                                Gmail draft
+                              </a>
+                            ) : null}
+                            <form action={reconcileOutreachAction}>
+                              <input type="hidden" name="id" value={draft.id} />
+                              <input type="hidden" name="return_to" value="/recruitment" />
+                              <SubmitButton className="btn btn-sm" pendingLabel="Checking…">Reconcile</SubmitButton>
+                            </form>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+          <p className="hint" style={{ marginTop: 10 }}>
+            Drafts are created automatically when a verified employer-associated address and validated vacancy documents exist. Sending always
+            requires the owner. Draft creation is never counted as an application or as a sent email.
+          </p>
+        </div>
+      </section>
+
+      <section className="card mb-4" id="persistent-queue">
+        <div className="card-head">
+          <div>
+            <h2>Persistent qualified queue</h2>
+            <p className="card-sub">
+              Qualified vacancies are stored in a durable queue and kept across runs. A vacancy is not forgotten when a later discovery omits it;
+              blocked applications are requeued only when the blocking evidence changes.
+            </p>
+          </div>
+          <span className="badge badge-neutral">{queueCount(["ready_for_preparation", "preparing", "package_ready", "ready_for_submission"])} actionable</span>
+        </div>
+        <div className="card-body">
+          <div className="stat-row" style={{ display: "flex", flexWrap: "wrap", gap: 18 }}>
+            <span><strong>{queueCount(["ready_for_preparation", "preparing"])}</strong> ready for preparation</span>
+            <span><strong>{queueCount(["package_ready"])}</strong> package ready</span>
+            <span><strong>{queueCount(["ready_for_submission"])}</strong> ready for submission</span>
+            <span><strong>{queueCount(["submitting"])}</strong> browser execution in progress</span>
+            <span><strong>{queueCount(["submitted_unverified"])}</strong> submission unverified</span>
+            <span><strong>{queueCount(["waiting_destination"])}</strong> awaiting destination</span>
+            <span><strong>{queueCount(["blocked_technical"])}</strong> technical retry</span>
+            <span><strong>{queueCount(["blocked_security"])}</strong> employer security block</span>
+            <span><strong>{queueCount(["awaiting_human"])}</strong> awaiting human</span>
+            <span><strong>{queueCount(["sent_by_owner"])}</strong> owner email handoff</span>
+            <span><strong>{queueCount(["submitted_reference", "confirmed"])}</strong> submission verified</span>
+          </div>
+          <p className="hint" style={{ marginTop: 10 }}>
+            Counts are vacancies in <code>recruitment_queue</code> by lifecycle state. They are not match-score counts and not application counts.
+          </p>
+        </div>
+      </section>
+
+      <section className="card mb-4" id="unresolved-urls">
+        <div className="card-head">
+          <div>
+            <h2>Unresolved employer application URLs</h2>
+            <p className="card-sub">A job-board listing is never loaded as an application form. These vacancies cannot be submitted automatically until an employer or ATS destination is resolved.</p>
+          </div>
+          <span className={`badge ${unresolvedBlocking ? "badge-warn" : "badge-good"}`}>
+            {unresolvedBlocking ? `${unresolvedBlocking} blocking a qualified vacancy` : "None blocking a qualified vacancy"}
+          </span>
+        </div>
+        <div className="card-body stack" style={{ gap: 10 }}>
+          {unresolvedUrls.length === 0 ? (
+            <p className="hint">Every stored qualified vacancy has an employer or ATS application URL.</p>
+          ) : (
+            unresolvedUrls.map((job) => (
+              <div className="between" key={job.id} style={{ alignItems: "flex-start", gap: 12 }}>
+                <div>
+                  <Link href={`/jobs/${job.id}`} className="cell-title">{job.title}</Link>
+                  <div className="cell-sub">
+                    {job.company} · {job.match_score ?? "—"}% · {job.status.replace(/_/g, " ")}
+                    {job.qualified ? " · qualified" : ""}
+                  </div>
+                  <div className="cell-sub">{unresolvedReason(job) ?? "No employer destination is recorded for this vacancy."}</div>
+                </div>
+                <span className={`badge ${job.qualified ? "badge-warn" : "badge-neutral"}`}>
+                  {job.url_confidence ?? "missing"}
+                </span>
+              </div>
+            ))
+          )}
+          {unresolvedTotal > unresolvedUrls.length ? (
+            <p className="hint">
+              {unresolvedTotal - unresolvedUrls.length} further unresolved listing(s) are stored but not eligible yet. <Link href="/jobs">Open vacancies</Link>.
+            </p>
+          ) : null}
+          <p className="hint">Resolution is attempted once before submission and recorded with its evidence. When no employer URL is published (jobs.ch quick-apply), the vacancy becomes a human handoff instead of a failed attempt.</p>
+        </div>
       </section>
 
       <section className="card mb-4" id="standing-authorisation">
@@ -238,11 +491,11 @@ export default async function RecruitmentPage({
             <div className="between"><span style={{ color: "var(--muted)" }}>Next execution</span><span>{formatInZone(schedule.nextRunAt)}{schedule.nextRunMode ? ` · ${schedule.nextRunMode}` : ""}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Last execution</span><span>{formatInZone(schedule.lastRunAt)}{schedule.lastStatus ? ` · ${schedule.lastStatus.replace(/_/g, " ")}` : ""}</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Scheduler process</span><span>{schedulerLive ? "Ticker running" : "Ticker not detected"}{schedule.lastCheckedAt ? ` · checked ${formatInZone(schedule.lastCheckedAt)}` : ""}</span></div>
-            {schedule.missed ? <p className="hint">The scheduled execution is outside the catch-up window; the missed run is recorded rather than executed late.</p> : null}
+            {schedule.missed ? <p className="hint">The scheduled occurrence was missed because the application was not running at its slot. It is recorded with its scheduled timestamp and reason, and it was not executed late; the next execution is the next scheduled occurrence.</p> : null}
             <div className="between"><span style={{ color: "var(--muted)" }}>Minimum match</span><span>{qualifyingThreshold()}% (cannot be lowered automatically)</span></div>
             <div className="between"><span style={{ color: "var(--muted)" }}>Applications per day</span><span>{policy.maxSubmissionsPerDay} · {usage.remaining} remaining today</span></div>
             <p className="hint">
-              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at {schedule.slotTimes[0]} {schedule.timezone} for the single daily run to execute; a switched-off machine cannot run it. The state survives restarts, and a missed run is recorded rather than silently skipped. There is no second scheduled run on the same day. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
+              This scheduler runs inside the application. Your Mac and this application (or its worker) must be running at {schedule.slotTimes[0]} {schedule.timezone} for the single daily run to execute; a switched-off machine cannot run it. The state survives restarts. A missed occurrence is recorded with its scheduled timestamp and reason and is never replayed as a catch-up run; no extra execution compensates for it. There is no second scheduled run on the same day. <Link href="/settings#scheduling" style={{ textDecoration: "underline" }}>Edit the two schedules</Link>.
             </p>
           </div>
         </section>
@@ -271,6 +524,18 @@ export default async function RecruitmentPage({
                 <div className="between"><span style={{ color: "var(--muted)" }}>Started / finished</span><span>{formatDateTime(latest.started_at)} → {formatDateTime(latest.finished_at)}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Last successful discovery</span><span>{formatInZone(lastSuccessfulDiscovery)}</span></div>
                 <div className="between"><span style={{ color: "var(--muted)" }}>Last failed source</span><span>{lastFailedSource ? `${lastFailedSource.source_key} · ${lastFailedSource.error ?? "unknown error"}` : latest ? "None in latest run" : "None recorded"}</span></div>
+                <div className="between">
+                  <span style={{ color: "var(--muted)" }}>Read-only external evidence</span>
+                  <span>
+                    {research
+                      ? `${research.succeeded}/${research.attempted} read · cap ${research.cap}${research.fromRun ? " · this run" : " · latest recorded"}`
+                      : "None recorded"}
+                  </span>
+                </div>
+                {research?.error ? <p className="hint">Evidence read issue: {research.error}</p> : null}
+                {research ? (
+                  <p className="hint">Agent Reach page reads are bounded, read-only evidence. They cannot add a vacancy, change a score, satisfy the {qualifyingThreshold()}% threshold or reach submission.</p>
+                ) : null}
                 {rejected.length > 0 ? (
                   <div className="card-quiet p-2">
                     <div className="text-[11px] font-medium mb-1">Latest run rejections</div>

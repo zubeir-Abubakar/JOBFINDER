@@ -11,6 +11,8 @@ import { hashPassword, passwordIssues, randomId } from "@/lib/security";
 import { setSetting } from "@/lib/settings";
 import { INTEGRATION_KEYS, recordIntegrationCheck, testIntegrationConnection, type IntegrationKey } from "@/lib/integrations";
 import { refreshLatestExecutiveBriefDelivery, sendExecutiveBriefNow } from "@/lib/executive-brief";
+import { notificationRecipient } from "@/lib/notify";
+import { runResendTestEmail } from "@/lib/resend";
 
 export async function createUserAction(formData: FormData): Promise<void> {
   const admin = await requireAdmin();
@@ -168,6 +170,26 @@ export async function sendExecutiveBriefNowAction(formData: FormData): Promise<v
   const result = await sendExecutiveBriefNow({ userId: admin.id, source: "admin", resend });
   revalidatePath("/admin/email");
   redirect(briefRedirect(result.state, result.message));
+}
+
+export async function sendResendTestEmailAction(): Promise<void> {
+  const admin = await requireAdmin();
+  const recipient = notificationRecipient();
+  if (!recipient) {
+    audit({
+      action: "admin.email_test_blocked",
+      entity: "email",
+      detail: "No notification recipient is configured.",
+      userId: admin.id,
+    });
+    redirect(`/admin/email?brief=blocked&detail=${encodeURIComponent("No notification recipient is configured. Save the owner address in Settings first.")}`);
+  }
+  const result = await runResendTestEmail(recipient, admin.id);
+  revalidatePath("/admin/email");
+  const state = result.status === "accepted" ? "queued" : result.status === "api_error" || result.status === "rate_limited" ? "failed" : "blocked";
+  redirect(
+    `/admin/email?brief=${encodeURIComponent(state)}&detail=${encodeURIComponent(`Test email ${result.status}: ${result.detail}`.slice(0, 900))}`,
+  );
 }
 
 export async function refreshExecutiveBriefDeliveryAction(): Promise<void> {

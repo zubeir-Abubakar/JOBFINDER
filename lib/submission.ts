@@ -103,6 +103,8 @@ export type SubmissionJob = {
   /** Provenance recorded by discovery: direct, ats, aggregator, unresolved. */
   url_confidence?: string | null;
   employer_url?: string | null;
+  /** Verified employer email channel; there is no web form for this vacancy. */
+  application_email?: string | null;
   description: string | null;
   /** ATS identity when the vacancy came from a supported connector. */
   source?: string | null;
@@ -174,6 +176,8 @@ export function browserFormsEnabled(): boolean {
 }
 
 import { canonicalUrl, isAggregatorUrl } from "./job-identity";
+import { employerUrlProvenance, resolveJobsChEmployerUrl, type LinkResolution } from "./employer-links";
+import { persistEmployerUrlProvenance } from "./jobs-ch-resolution";
 
 export function endpointFor(job: SubmissionJob): string | null {
   const template = submissionEndpointConfigured();
@@ -213,6 +217,7 @@ export function applicationProvenance(job: SubmissionJob): Record<string, unknow
   return {
     listingUrl: job.url,
     applicationUrl: job.application_url,
+    applicationEmail: job.application_email ?? null,
     employerUrl: job.employer_url ?? null,
     urlConfidence: job.url_confidence ?? (canonicalUrl(job.application_url) ? "unclassified" : "missing"),
   };
@@ -244,6 +249,13 @@ export function germanRequirementForSubmission(job: SubmissionJob): GermanRequir
 }
 
 export function blockerForChannel(job: SubmissionJob): string | null {
+  // A login URL is an access control even when the description does not say so.
+  // umantis ("CheckLogin") and similar ATS paths must never be treated as a
+  // normal candidate form, because filling them requires an employer account.
+  const destination = `${job.application_url ?? job.url ?? ""}`;
+  if (/checklogin|\/(login|signin|sign-in|logon)(\/|\?|$|\/)/i.test(destination)) {
+    return "The employer requires an account login before applying.";
+  }
   const text = `${job.description ?? ""}`;
   if (/captcha|i am not a robot|recaptcha|hcaptcha/i.test(text)) return "The employer's form uses a CAPTCHA, which is never bypassed.";
   if (/multi[- ]factor|two[- ]factor|2fa|verification code/i.test(text)) return "The employer's process requires multi-factor authentication.";
@@ -266,6 +278,14 @@ export function manualExternalRequirement(reason: string): string | null {
 export function channelFor(job: SubmissionJob): { channel: SubmissionChannel; reason: string } {
   const blocker = blockerForChannel(job);
   if (blocker) return { channel: "manual", reason: blocker };
+  // An employer email application is a verified destination but not an
+  // automatic channel: this deployment never sends email applications.
+  if (job.application_email) {
+    return {
+      channel: "manual",
+      reason: `The employer accepts applications by email at ${job.application_email}; sending requires the owner.`,
+    };
+  }
   const provenanceBlocker = applicationProvenanceBlocker(job);
   if (provenanceBlocker) return { channel: "manual", reason: provenanceBlocker };
   if (!job.application_url && !job.url) {
@@ -361,13 +381,36 @@ export function recoverStaleSubmissionClaims(now: Date = new Date()): number {
       reason: "The submission worker did not finish before its lease expired; delivery is unknown.",
     }).slice(0, 12000);
     run(
-      "UPDATE submission_attempts SET status = 'unverified', error = ? WHERE id = ? AND status = 'submitting'",
-      ["The submission worker did not finish before its lease expired; delivery is unknown.", claim.id],
+      `UPDATE submission_attempts SET status = 'unverified', error = ?, reconciliation_state = 'ambiguous',
+         reconciled_at = ? WHERE id = ? AND status = 'submitting'`,
+      [
+        "The submission worker did not finish before its lease expired; delivery is unknown.",
+        now.toISOString(),
+        claim.id,
+      ],
     );
     run(
-      "UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', submission_evidence = ?, last_update = ? WHERE id = ? AND status = 'submitting'",
+      "UPDATE applications SET status = 'submission_unverified', submission_status = 'unverified', submission_state = 'submitted_unverified', submission_evidence = ?, last_update = ? WHERE id = ? AND status = 'submitting'",
       [evidence, now.toISOString(), claim.application_id],
     );
+    // The queue must show an uncertain outcome, not a technical retry that a
+    // later worker could mistake for safe work.
+    const queue = one<{ state: string }>("SELECT state FROM recruitment_queue WHERE job_id = ?", [claim.job_id]);
+    run(
+      "UPDATE recruitment_queue SET state = 'submitted_unverified', reason = ?, lease_owner = NULL, lease_expires_at = NULL, last_checked_at = ?, updated_at = ? WHERE job_id = ?",
+      [
+        "A submission worker stopped mid-send; delivery is unverified and reconciliation is required.",
+        now.toISOString(),
+        now.toISOString(),
+        claim.job_id,
+      ],
+    );
+    if (queue && queue.state !== "submitted_unverified") {
+      run(
+        "INSERT INTO recruitment_queue_events (job_id, from_state, to_state, reason, actor, created_at) VALUES (?, ?, 'submitted_unverified', ?, 'submission.recovery', ?)",
+        [claim.job_id, queue.state, "A stale submission claim was recovered as unverified.", now.toISOString()],
+      );
+    }
     recordApplicationEvent({
       applicationId: claim.application_id,
       type: "submission.recovery",
@@ -427,12 +470,26 @@ function claimSubmission(input: SubmissionInput, at: string): ClaimResult {
       };
     }
 
-    const prior = one<{ status: string; http_status: number | null; reference: string | null; error: string | null }>(
-      "SELECT status, http_status, reference, error FROM submission_attempts WHERE job_id = ? AND status != 'submitting' ORDER BY attempted_at DESC LIMIT 1",
+    const prior = one<{
+      status: string;
+      http_status: number | null;
+      reference: string | null;
+      error: string | null;
+      reconciliation_state: string | null;
+    }>(
+      "SELECT status, http_status, reference, error, reconciliation_state FROM submission_attempts WHERE job_id = ? AND status != 'submitting' ORDER BY attempted_at DESC LIMIT 1",
       [input.job.id],
     );
     const reconciliation = reconciliationDecision(
-      prior ? { status: prior.status, httpStatus: prior.http_status, reference: prior.reference, error: prior.error } : null,
+      prior
+        ? {
+            status: prior.status,
+            httpStatus: prior.http_status,
+            reference: prior.reference,
+            error: prior.error,
+            reconciliationState: prior.reconciliation_state,
+          }
+        : null,
     );
     if (reconciliation.action === "blocked") {
       db.exec("ROLLBACK");
@@ -457,16 +514,28 @@ function claimSubmission(input: SubmissionInput, at: string): ClaimResult {
 
     const attemptId = `sub_${randomId()}`;
     const channel = channelFor(input.job).channel;
+    const destination =
+      channel === "candidate_form" || channel === "http_form"
+        ? input.job.application_url ?? endpointFor(input.job) ?? input.job.url ?? null
+        : endpointFor(input.job);
+    // The idempotency key belongs to this irreversible attempt, not to the
+    // vacancy. It is written in the same transaction that claims the send.
+    const idempotencyKey = `submission:${input.job.id}:${attemptId}`;
     db.prepare(
-      `INSERT INTO submission_attempts (id, application_id, job_id, run_id, channel, endpoint, status, http_status, reference, evidence, error, attempted_at)
-       VALUES (?, ?, ?, ?, ?, NULL, 'submitting', NULL, NULL, ?, NULL, ?)`,
+      `INSERT INTO submission_attempts
+         (id, application_id, job_id, run_id, channel, endpoint, destination, idempotency_key, status,
+          http_status, reference, evidence, error, reconciliation_state, attempted_at, started_at)
+       VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'submitting', NULL, NULL, ?, NULL, 'in_flight', ?, ?)`,
     ).run(
       attemptId,
       input.applicationId,
       input.job.id,
       input.runId ?? null,
       channel,
-      JSON.stringify({ phase: "claimed", at, channel }).slice(0, 12000),
+      destination,
+      idempotencyKey,
+      JSON.stringify({ phase: "claimed", at, channel, destination, idempotencyKey }).slice(0, 12000),
+      at,
       at,
     );
     const updated = db
@@ -481,6 +550,20 @@ function claimSubmission(input: SubmissionInput, at: string): ClaimResult {
         detail: "The application stopped being ready while the claim was being taken; nothing was sent.",
         evidence: { applicationId: input.applicationId },
       };
+    }
+    // The dashboard distinguishes an active browser execution from a package
+    // that is merely ready. The queue lease is held for the send window and is
+    // cleared by recordSubmissionLifecycle or stale-claim recovery.
+    const queue = one<{ state: string }>("SELECT state FROM recruitment_queue WHERE job_id = ?", [input.job.id]);
+    if (queue && queue.state !== "submitting") {
+      const leaseExpires = new Date(Date.parse(at) + 10 * 60_000).toISOString();
+      db.prepare(
+        `UPDATE recruitment_queue SET state = 'submitting', reason = ?, lease_owner = ?, lease_expires_at = ?,
+           last_checked_at = ?, updated_at = ? WHERE job_id = ?`,
+      ).run("Browser execution is in progress.", input.runId ?? "submission", leaseExpires, at, at, input.job.id);
+      db.prepare(
+        "INSERT INTO recruitment_queue_events (job_id, from_state, to_state, reason, actor, created_at) VALUES (?, ?, 'submitting', ?, ?, ?)",
+      ).run(input.job.id, queue.state, "The atomic submission claim was recorded before the irreversible send.", input.runId ?? "submission", at);
     }
     db.exec("COMMIT");
     transactionOpen = false;
@@ -561,26 +644,32 @@ function recordAttempt(input: {
   /** When present, finalise the atomic `submitting` row instead of adding a second row. */
   attemptId?: string | null;
 }): void {
+  const reconciliationState =
+    input.outcome.status === "verified" ? "confirmed" : input.outcome.status === "unverified" ? "ambiguous" : "unresolved";
   if (input.attemptId) {
     run(
-      `UPDATE submission_attempts SET channel = ?, endpoint = ?, status = ?, http_status = ?, reference = ?, evidence = ?, error = ?
+      `UPDATE submission_attempts SET channel = ?, endpoint = ?, destination = COALESCE(?, destination), status = ?, http_status = ?,
+         reference = ?, evidence = ?, error = ?, reconciliation_state = ?, reconciled_at = ?
        WHERE id = ?`,
       [
         input.channel,
+        input.endpoint,
         input.endpoint,
         input.outcome.status,
         input.outcome.httpStatus,
         input.outcome.reference,
         input.outcome.evidence ? JSON.stringify(input.outcome.evidence).slice(0, 12000) : null,
         input.error,
+        reconciliationState,
+        input.at,
         input.attemptId,
       ],
     );
     return;
   }
   run(
-    `INSERT INTO submission_attempts (id, application_id, job_id, run_id, channel, endpoint, status, http_status, reference, evidence, error, attempted_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO submission_attempts (id, application_id, job_id, run_id, channel, endpoint, destination, status, http_status, reference, evidence, error, reconciliation_state, attempted_at, started_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       `sub_${randomId()}`,
       input.applicationId,
@@ -588,11 +677,14 @@ function recordAttempt(input: {
       input.runId,
       input.channel,
       input.endpoint,
+      input.endpoint,
       input.outcome.status,
       input.outcome.httpStatus,
       input.outcome.reference,
       input.outcome.evidence ? JSON.stringify(input.outcome.evidence).slice(0, 12000) : null,
       input.error,
+      reconciliationState,
+      input.at,
       input.at,
     ],
   );
@@ -635,6 +727,75 @@ function recordCandidateInterventions(input: {
       meta: { questions: items },
     });
   }
+}
+
+/**
+ * The five states the owner must be able to tell apart in a failure notice.
+ * A notice must never say "submission failed" without saying whether the send
+ * control was ever activated.
+ */
+export function notificationOutcome(outcome: SubmissionOutcome): {
+  code:
+    | "employer_confirmed"
+    | "submitted_unverified"
+    | "blocked_security"
+    | "blocked_missing_information"
+    | "failed_before_submission"
+    | "failed_after_submit";
+  label: string;
+  beforeSubmit: boolean;
+  nextAction: string;
+} {
+  const evidence = outcome.evidence ?? {};
+  const blockers = Array.isArray(evidence.blockers) ? evidence.blockers.map((item) => String(item)) : [];
+  const blockerText = blockers.join(" ");
+  if (outcome.status === "verified") {
+    return {
+      code: "employer_confirmed",
+      label: "Employer confirmed the application",
+      beforeSubmit: false,
+      nextAction: "No action is required. The employer confirmation is stored on the application record.",
+    };
+  }
+  if (outcome.status === "unverified") {
+    return {
+      code: "submitted_unverified",
+      label: "The submit action was reached, but the outcome is unverified",
+      beforeSubmit: false,
+      nextAction:
+        "Check the employer portal or the confirmation email yourself, then reconcile the application record. The attempt is not retried blindly.",
+    };
+  }
+  if (outcome.status === "blocked") {
+    if (String(evidence.externalRequirement ?? "") === "security_challenge") {
+      return {
+        code: "blocked_security",
+        label: "Stopped at an employer security control",
+        beforeSubmit: true,
+        nextAction:
+          "Complete the application yourself in a normal browser. CAPTCHA, MFA, login and bot challenges are never bypassed by this application.",
+      };
+    }
+    return {
+      code: "blocked_missing_information",
+      label: "Stopped because a required answer is missing",
+      beforeSubmit: true,
+      nextAction:
+        "Supply the missing verified answer on the application record, or complete this application yourself. The application is not retried automatically.",
+    };
+  }
+  const beforeSubmit =
+    evidence.sent === false || (outcome.httpStatus === null && /nothing was sent/i.test(outcome.detail));
+  return {
+    code: beforeSubmit ? "failed_before_submission" : "failed_after_submit",
+    label: beforeSubmit
+      ? "Failed before the submit action was reached"
+      : "Failed after the send attempt; the employer outcome is unknown",
+    beforeSubmit,
+    nextAction: beforeSubmit
+      ? "Review the exact blocker on the application record and decide whether a separate, authorised attempt is appropriate."
+      : "Contact the employer or check for a confirmation before deciding anything. Do not assume the application was received.",
+  };
 }
 
 function applyOutcome(input: {
@@ -735,12 +896,35 @@ function applyOutcome(input: {
     message: outcome.detail,
     meta: { endpoint: outcome.endpoint, httpStatus: outcome.httpStatus, outcomeClass: evidence.outcomeClass },
   });
-  if (safeFailure) {
+  // Both a technical failure and a legitimate stop produce an owner notice. The
+  // notice states whether the employer was contacted, whether anything was
+  // submitted, why it stopped and that no reference exists. The dedupe key is
+  // the unchanged event, not the attempt timestamp, so re-checking the same
+  // failure never sends a second notification.
+  if (safeFailure || outcome.status === "blocked") {
+    const classification = notificationOutcome(outcome);
+    const contactLine =
+      classification.beforeSubmit
+        ? `${input.job.company} was not contacted and nothing was submitted.`
+        : `The send action was reached, so contact with ${input.job.company} cannot be ruled out; nothing was confirmed.`;
+    const subject =
+      classification.code === "blocked_security"
+        ? `Not submitted — employer security control: ${input.job.title}`
+        : classification.code === "blocked_missing_information"
+          ? `Not submitted — missing information: ${input.job.title}`
+          : `Not submitted — ${input.job.title} at ${input.job.company}`;
     notify({
       kind: "application_failed",
-      dedupeKey: `submission_failed:${input.applicationId}:${at}`,
-      subject: `Submission failed: ${input.job.title}`,
-      body: `${input.job.company} was not contacted successfully. ${outcome.detail}`,
+      dedupeKey: `submission_outcome:${input.applicationId}:${classification.code}`,
+      subject,
+      body: [
+        contactLine,
+        classification.label + ".",
+        `Reason: ${outcome.detail}`,
+        outcome.reference ? `Employer reference: ${outcome.reference}.` : "No employer reference exists.",
+        `Required action: ${classification.nextAction}`,
+        `Application record: /applications/${input.applicationId}`,
+      ].join(" "),
     });
   }
 }
@@ -749,6 +933,46 @@ function applyOutcome(input: {
  * Submits one application. Every path is recorded, including the blocked ones,
  * so the daily report can distinguish prepared, submitted and verified.
  */
+/**
+ * A job-board listing is a discovery source, not an application destination.
+ *
+ * Discovery already resolves jobs.ch listings, but older rows and resolution
+ * failures can still carry an aggregator URL. Before any channel decision this
+ * makes one bounded attempt to resolve the employer/ATS destination and persists
+ * the evidence. When it cannot be resolved the URL is cleared and marked
+ * `unresolved`, so the provenance gate turns the vacancy into a human handoff
+ * instead of posting to a listing page that has no form.
+ */
+export async function ensureEmployerDestination(
+  job: SubmissionJob,
+  resolve: (url: string) => Promise<LinkResolution> = (url) => resolveJobsChEmployerUrl(url),
+): Promise<void> {
+  const current = job.application_url;
+  if (current && !isAggregatorUrl(current)) return;
+  const listing = job.url && isAggregatorUrl(job.url) ? job.url : current && isAggregatorUrl(current) ? current : null;
+  if (!listing) {
+    if (current && isAggregatorUrl(current)) {
+      job.application_url = null;
+      job.url_confidence = "unresolved";
+    }
+    return;
+  }
+  try {
+    const resolution = await resolve(listing);
+    persistEmployerUrlProvenance(job.id, employerUrlProvenance(resolution));
+    if ((resolution.confidence === "direct" || resolution.confidence === "ats") && resolution.employerUrl) {
+      job.application_url = resolution.employerUrl;
+      job.employer_url = resolution.employerUrl;
+      job.url_confidence = resolution.confidence;
+      return;
+    }
+  } catch {
+    // Fall through: an unresolved destination is recorded, never guessed.
+  }
+  job.application_url = null;
+  job.url_confidence = "unresolved";
+}
+
 export async function submitApplication(input: SubmissionInput): Promise<SubmissionOutcome> {
   const at = (input.now ?? new Date()).toISOString();
   // Defence in depth: the run checks this too, but a direct call must never be
@@ -901,12 +1125,26 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
 
   // Retry safety: a timeout or missing reference means delivery is unknown. It is
   // never sent again blindly, even if the next run regenerates the package.
-  const prior = one<{ status: string; http_status: number | null; reference: string | null; error: string | null }>(
-    "SELECT status, http_status, reference, error FROM submission_attempts WHERE job_id = ? ORDER BY attempted_at DESC LIMIT 1",
+  const prior = one<{
+    status: string;
+    http_status: number | null;
+    reference: string | null;
+    error: string | null;
+    reconciliation_state: string | null;
+  }>(
+    "SELECT status, http_status, reference, error, reconciliation_state FROM submission_attempts WHERE job_id = ? ORDER BY attempted_at DESC LIMIT 1",
     [input.job.id],
   );
   const reconciliation = reconciliationDecision(
-    prior ? { status: prior.status, httpStatus: prior.http_status, reference: prior.reference, error: prior.error } : null,
+    prior
+      ? {
+          status: prior.status,
+          httpStatus: prior.http_status,
+          reference: prior.reference,
+          error: prior.error,
+          reconciliationState: prior.reconciliation_state,
+        }
+      : null,
   );
   if (reconciliation.action === "blocked") {
     const ambiguousPrior = reconciliation.evidence.reconciliation === "ambiguous";
@@ -988,16 +1226,21 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
       endpoint: null,
       evidence: { ...(claim.evidence ?? {}), provenance: applicationProvenance(input.job) },
     };
-    recordAttempt({
-      applicationId: input.applicationId,
-      jobId: input.job.id,
-      runId: input.runId ?? null,
-      channel: outcome.channel,
-      endpoint: null,
-      outcome,
-      error: claim.detail,
-      at,
-    });
+    // If the database is unavailable, the claim itself could not be persisted.
+    // Nothing was sent, so attempting another write here would only turn a
+    // safe local block into an exception; the caller can retry after recovery.
+    if (claim.kind !== "storage_error") {
+      recordAttempt({
+        applicationId: input.applicationId,
+        jobId: input.job.id,
+        runId: input.runId ?? null,
+        channel: outcome.channel,
+        endpoint: null,
+        outcome,
+        error: claim.detail,
+        at,
+      });
+    }
     return outcome;
   }
   const claimAttemptId = claim.attemptId;
@@ -1066,6 +1309,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
     return outcome;
   }
 
+  await ensureEmployerDestination(input.job);
   const channelChoice = channelFor(input.job);
   const { channel, reason } = channelChoice;
   if (channel === "candidate_form") {
@@ -1091,7 +1335,9 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
         ? "No"
         : null,
     };
-    const pageUrl = input.job.application_url ?? input.job.url ?? "";
+    // Defence in depth: never load a listing page as if it were the form.
+    const pageUrl =
+      input.job.application_url && !isAggregatorUrl(input.job.application_url) ? input.job.application_url : "";
     const formInput = {
       pageUrl,
       jobTitle: input.job.title,
@@ -1135,6 +1381,7 @@ export async function submitApplication(input: SubmissionInput): Promise<Submiss
             : "blocked";
     const externalRequirement =
       (typeof result.evidence.externalRequirement === "string" ? result.evidence.externalRequirement : null) ??
+      plan.externalRequirement ??
       (plan.status === "security" ? "security_challenge" : null) ??
       (plan.questions.some((question) => question.action === "intervention" && question.category === "legal")
         ? "legal_declaration"

@@ -113,6 +113,24 @@ test("an abandoned run and its task are marked interrupted, while a safe schedul
   const safe = runs.recoverInterruptedRecruitmentRuns(now);
   assert.equal(safe.resumed.includes("run_scheduled_safe"), true);
   assert.equal(db.one<{ status: string }>("SELECT status FROM recruitment_runs WHERE id = 'run_scheduled_safe'")?.status, "scheduled");
+
+  // A scheduled occurrence that was never started and is outside the tick
+  // tolerance is a missed occurrence: no catch-up execution, explicit record.
+  db.run(
+    `INSERT INTO recruitment_runs (id, run_key, scheduled_for, trigger, status, state_history, created_at)
+     VALUES ('run_scheduled_missed', 'phase4#scheduled-missed', ?, 'schedule', 'scheduled', ?, ?)`,
+    [new Date(now.getTime() - 3 * 3600_000).toISOString(), JSON.stringify([{ state: "scheduled", at: now.toISOString() }]), new Date(now.getTime() - 3 * 3600_000).toISOString()],
+  );
+  const missed = runs.recoverInterruptedRecruitmentRuns(now);
+  assert.equal(missed.missed.includes("run_scheduled_missed"), true);
+  const missedRow = db.one<{ status: string; error: string | null; started_at: string | null; scheduled_for: string }>(
+    "SELECT status, error, started_at, scheduled_for FROM recruitment_runs WHERE id = 'run_scheduled_missed'",
+  );
+  assert.equal(missedRow?.status, "missed");
+  assert.equal(missedRow?.started_at, null);
+  assert.equal(missedRow?.scheduled_for, new Date(now.getTime() - 3 * 3600_000).toISOString());
+  assert.match(missedRow?.error ?? "", /missed/i);
+  assert.match(missedRow?.error ?? "", /not executed late/i);
 });
 
 test("two notification workers cannot send the same outbox row", async () => {
@@ -150,10 +168,10 @@ test("two notification workers cannot send the same outbox row", async () => {
   assert.equal(row?.attempts, 1);
   assert.equal(row?.provider_message_id, "phase4-mock-id");
   const outbox = notifications.notificationQueueSnapshot();
-  assert.equal(outbox.deliveryCounts.accepted_by_gmail, 1);
+  assert.equal(outbox.deliveryCounts.accepted_by_provider, 1);
   assert.equal(outbox.deliveryCounts.sent_folder_observed, 0);
   assert.equal(outbox.deliveryCounts.delivery_confirmed, 0);
-  assert.equal(outbox.lastAccepted?.delivery, "accepted_by_gmail", "the last accepted query cannot return a merely Sent-folder row");
+  assert.equal(outbox.lastAccepted?.delivery, "accepted_by_provider", "the last accepted query cannot return a merely Sent-folder row");
 });
 
 test("notification retries are bounded and end in a failed dead-letter row", async () => {

@@ -65,8 +65,14 @@ export function priorAttemptDisposition(attempt: {
   httpStatus: number | null;
   reference: string | null;
   error: string | null;
+  reconciliationState?: string | null;
 } | null): AttemptDisposition {
   if (!attempt) return "none";
+  // Only an explicit reconciliation can authorise a second send. A recorded
+  // `not_delivered` outcome is employer/local evidence that the application did
+  // not arrive; an owner's unverified claim is never such evidence.
+  if (attempt.reconciliationState === "not_delivered") return "none";
+  if (attempt.reconciliationState === "confirmed" && attempt.reference) return "confirmed";
   // A channel block or an unread local file never left the machine; it is safe
   // to assemble and queue the package again on a later run.
   if (attempt.status === "blocked" && attempt.httpStatus === null && !attempt.error) return "none";
@@ -89,6 +95,7 @@ export function reconciliationDecision(attempt: {
   httpStatus: number | null;
   reference: string | null;
   error: string | null;
+  reconciliationState?: string | null;
 } | null): Reconciliation {
   const disposition = priorAttemptDisposition(attempt);
   if (disposition === "none") {

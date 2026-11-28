@@ -2038,7 +2038,8 @@ table.data tbody tr:last-child td { border-bottom: 1px solid var(--line); }
   .doc-stage { max-height: 64dvh; }
   /* Generic responsive table: rows become cards so no column is clipped and
      every action stays reachable at 390px. */
-  .responsive-cards { border-spacing: 0; }
+  .responsive-cards { display: block; width: 100%; max-width: 100%; border-spacing: 0; }
+  .responsive-cards tbody { display: block; width: 100%; }
   .responsive-cards thead { display: none; }
   .responsive-cards tbody tr {
     display: block;
@@ -2050,12 +2051,20 @@ table.data tbody tr:last-child td { border-bottom: 1px solid var(--line); }
   }
   .responsive-cards tbody td {
     display: flex;
+    flex-wrap: wrap;
     align-items: flex-start;
     justify-content: space-between;
     gap: 12px;
     width: 100%;
     padding: 5px 0 !important;
     border: 0 !important;
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+  .responsive-cards tbody td:not(:first-child) > * { min-width: 0; }
+  .responsive-cards tbody td:not(:first-child) .cell-title,
+  .responsive-cards tbody td:not(:first-child) .cell-sub {
+    flex: 1 1 100%;
     text-align: right;
   }
   .responsive-cards tbody td::before {

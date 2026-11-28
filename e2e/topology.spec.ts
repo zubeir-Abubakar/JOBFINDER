@@ -57,6 +57,20 @@ test.beforeAll(() => {
     at(0),
   );
 
+  // The scheduler's recovery pass treats a non-terminal run without a live
+  // worker lease as abandoned on its next 60-second tick. A real run holds this
+  // lease while executing; the fixture must hold one too, otherwise a tick that
+  // lands mid-test closes the seeded tasks and resets the agents.
+  execute(
+    `INSERT INTO runtime_locks (key, owner, acquired_at, heartbeat_at, expires_at, meta)
+     VALUES (?, 'e2e-topology-fixture', ?, ?, ?, ?)`,
+    `recruitment:run:${RUN}`,
+    at(0),
+    at(0),
+    at(2 * 60 * 60_000),
+    JSON.stringify({ synthetic: true, fixture: "topology" }),
+  );
+
   // Timestamps are relative to this test process. A fixed morning timestamp
   // becomes a genuinely stale task when the suite runs later in the day, which
   // would correctly trigger lease-aware recovery and end the fixture workflow.
@@ -127,6 +141,7 @@ test.beforeAll(() => {
 });
 
 test.afterAll(() => {
+  execute("DELETE FROM runtime_locks WHERE key = ?", `recruitment:run:${RUN}`);
   execute("DELETE FROM workflow_events WHERE workflow_id = ?", WORKFLOW);
   execute("DELETE FROM tasks WHERE workflow_id = ?", WORKFLOW);
   execute("DELETE FROM recruitment_run_agents WHERE run_id = ?", RUN);
@@ -307,7 +322,10 @@ test("filters by real states and opens the persisted agent detail drawer", async
     "href",
     "/agents/list?agent=research#activity",
   );
-  await expect(drawer.getByRole("button", { name: "Open conversation" })).toBeVisible();
+  await expect(drawer.getByRole("link", { name: "Open conversation" })).toHaveAttribute(
+    "href",
+    "/assistant?agent=research",
+  );
 
   await page.getByRole("button", { name: "Close agent details" }).click();
   await expect(drawer).toHaveCount(0);
@@ -320,18 +338,23 @@ test("filters by real states and opens the persisted agent detail drawer", async
 });
 
 test("a newly persisted event appears without a page reload and refresh keeps event ids unique", async ({ page, diagnostics }) => {
+  const message = "Saffa persisted a new configured-source result.";
+  // Retries reuse the database, so remove this test's own event before taking
+  // the baseline. Otherwise a retry sees six events and fails before it starts.
+  execute("DELETE FROM workflow_events WHERE workflow_id = ? AND message = ?", WORKFLOW, message);
   await gotoReady(page, "/agents");
-  await expect(page.locator(".topology-event")).toHaveCount(5);
+  const baseline = await page.locator(".topology-event").count();
+  expect(baseline).toBeGreaterThan(0);
 
-  insertEvent("agent.progress", "research", "Saffa persisted a new configured-source result.", at(1_000));
+  insertEvent("agent.progress", "research", message, at(1_000));
   await page.evaluate(() => document.dispatchEvent(new Event("visibilitychange")));
 
-  await expect(page.getByText("Saffa persisted a new configured-source result.", { exact: true })).toBeVisible();
-  await expect(page.locator(".topology-event")).toHaveCount(6);
+  await expect(page.getByText(message, { exact: true })).toBeVisible();
+  await expect(page.locator(".topology-event")).toHaveCount(baseline + 1);
 
   await page.reload({ waitUntil: "domcontentloaded" });
-  await expect(page.locator(".topology-event")).toHaveCount(6);
-  await expect(page.getByText("Saffa persisted a new configured-source result.", { exact: true })).toHaveCount(1);
+  await expect(page.locator(".topology-event")).toHaveCount(baseline + 1);
+  await expect(page.getByText(message, { exact: true })).toHaveCount(1);
   const eventIds = await page.locator(".topology-event").evaluateAll((events) =>
     events.map((event) => event.getAttribute("data-event-id")),
   );

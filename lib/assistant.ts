@@ -5,7 +5,7 @@ import { cleanupExpiredDocuments } from "./retention";
 import { statusLabel } from "./application-status";
 import { agentIdentity, agentIdentityForName, agentKeysMentioned, agentRoster } from "./agent-identity";
 import { generateText } from "./providers";
-import { runGmailTestEmail } from "./gmail";
+import { runResendTestEmail } from "./resend";
 import { answerFromOperations, getOperationalSnapshot, operationsBrief } from "./operations";
 import { latestWorkflowSnapshotForUser } from "./workflow-view";
 import { latestPausedWorkflow, workflowActor } from "./workflow";
@@ -118,7 +118,7 @@ function todaySnapshot() {
   ) ?? { awaiting: 0, submitted_today: 0, interviews: 0 };
   const tasks = one<{ completed_today: number; failed_today: number }>(
     `SELECT SUM(CASE WHEN status = 'completed' AND date(finished_at) = date('now') THEN 1 ELSE 0 END) AS completed_today,
-            SUM(CASE WHEN status = 'failed' AND date(finished_at) = date('now') THEN 1 ELSE 0 END) AS failed_today
+            SUM(CASE WHEN status = 'failed' AND COALESCE(error_class, '') != 'blocked' AND date(finished_at) = date('now') THEN 1 ELSE 0 END) AS failed_today
      FROM tasks`,
   ) ?? { completed_today: 0, failed_today: 0 };
   const messages = one<{ c: number }>("SELECT COUNT(*) AS c FROM email_messages")?.c ?? 0;
@@ -272,11 +272,11 @@ export async function handleAssistantMessage(
     if (!to) {
       return { reply: "No notification email is stored. Add the recipient in Settings first; the test cannot be aimed at an employer or an arbitrary address.", taskIds, agentKeys: ["email"] };
     }
-    const result = await runGmailTestEmail(to, userId);
+    const result = await runResendTestEmail(to, userId);
     const accepted = result.status === "accepted" && Boolean(result.messageId);
     return {
       reply: accepted
-        ? `Gmail accepted one test email for ${result.recipientMasked}. Message ID ${result.messageId}. Gmail API acceptance is confirmed; inbox delivery is still unverified. No employer was contacted.`
+        ? `Resend accepted one test email for ${result.recipientMasked}. Message ID ${result.messageId}. Provider acceptance is confirmed; inbox delivery is still unverified. No employer was contacted.`
         : `The test email was not accepted: ${result.status}. ${result.detail} No message was sent to an employer.`,
       taskIds,
       agentKeys: ["email"],
@@ -370,7 +370,7 @@ export async function handleAssistantMessage(
     const paused = agentSnapshot().filter((a) => a.status === "paused");
     const awaiting = one<{ c: number }>("SELECT COUNT(*) AS c FROM applications WHERE status = 'awaiting_approval'")?.c ?? 0;
     const failed = one<{ agent_key: string; title: string; error: string | null }>(
-      "SELECT agent_key, title, error FROM tasks WHERE status = 'failed' ORDER BY created_at DESC LIMIT 1",
+      "SELECT agent_key, title, error FROM tasks WHERE status = 'failed' AND COALESCE(error_class, '') != 'blocked' ORDER BY created_at DESC LIMIT 1",
     );
     const pausedWorkflow = latestPausedWorkflow(workflowActor(userId));
     const newJobs = one<{ c: number }>("SELECT COUNT(*) AS c FROM jobs WHERE match_score IS NULL")?.c ?? 0;
@@ -398,7 +398,7 @@ export async function handleAssistantMessage(
 
   if (/\bwhy\b.*\b(fail|failed|failure|error)\b/.test(text) || /\b(task|workflow)\b.*\bfail/.test(text)) {
     const failed = one<{ agent_key: string; title: string; error: string | null; created_at: string }>(
-      "SELECT agent_key, title, error, created_at FROM tasks WHERE status = 'failed' ORDER BY created_at DESC LIMIT 1",
+      "SELECT agent_key, title, error, created_at FROM tasks WHERE status = 'failed' AND COALESCE(error_class, '') != 'blocked' ORDER BY created_at DESC LIMIT 1",
     );
     if (!failed) return { reply: "There are no failed tasks recorded. The latest workflow does not have a failure to explain.", taskIds };
     return {
