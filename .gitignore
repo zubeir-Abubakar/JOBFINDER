@@ -71,6 +71,10 @@ artifacts/*.png
 artifacts/**/*.wav
 artifacts/*.wav
 artifacts/investigations/
+# Reset manifests record the owner's name, hostname, home paths and CV filenames;
+# the acceptance note quotes the owner's name and email. Local evidence only.
+artifacts/reset/
+artifacts/autonomous-submission/real-world-acceptance.md
 uploads/
 *.db
 *.db-journal

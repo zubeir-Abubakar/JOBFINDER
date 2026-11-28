@@ -1,8 +1,0 @@
-{
-  "status": "completed",
-  "completedAt": "2026-11-22T10:13:21.438Z",
-  "completion": "artifacts/reset/completion.json",
-  "manifest": "artifacts/reset/manifest.json",
-  "postStartupVerified": "PASS",
-  "postStartupVerifiedAt": "2026-11-22T10:15:14.281Z"
-}

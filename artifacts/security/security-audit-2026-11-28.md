@@ -212,14 +212,16 @@ the presence of the files.
 | # | Item | Severity | Why it is open |
 |---|------|----------|----------------|
 | B1 | Exposed key still valid | **Critical** | Only the owner can confirm the project and rotate/restrict it. If it is Digt's, rotation is theirs; revocation is unverifiable from here. |
-| B2 | Remote `main` still contains the key and the DB backups | **Critical** | Local history is purged; publishing the rewrite is a force-push (section D), which was explicitly not authorised. |
+| B2 | Remote `main` still contains the key and the DB backups | **Critical** | Verified again this phase: `git ls-remote origin` returns `2b8471422c71a6eb9dc51b230fb580a4ff6bfd4f` for `refs/heads/main` and `HEAD` — the pre-rewrite commit itself. The rewritten local `main` is clean, but nothing has been pushed; publishing is the force-push in section D, still not authorised. |
 | B3 | GitHub protections not enabled | Medium | Secret scanning, push protection, Dependabot and branch protection are repository settings, not files. |
-| B4 | Screenshots and investigation notes contain owner PII | **Resolved** | 78 PNGs of the owner dashboard/profile/CVs, two live-call recordings and a note containing the owner's address were tracked. No credential found. All 81 files are now untracked, kept on disk, and ignored (`.gitignore`). The files remain in published history until D1 rewrites it. |
+| B4 | Artifacts contain owner PII | **Resolved in the index** | 78 PNGs, two live-call recordings and a Gmail investigation note were untracked earlier (81 files). This phase also untracked `artifacts/reset/` (owner name, hostname, home paths, CV filenames) and `artifacts/autonomous-submission/real-world-acceptance.md` (name and email in an employer confirmation). All files stay on disk. The old copies — including the screenshots — remain in the **published** history until D1. |
 | B5 | Rate limiting is single-host | Low | Durable across processes that share the SQLite file, but not a distributed limiter for horizontally scaled replicas. The deployment is a single host; a shared store would be required to scale out. |
 | B6 | Pre-purge backup bundle holds the old history | Medium (local) | `backups/pre-purge-20261128T132506Z.bundle` contains the exposed key by design, so the purge is reversible. It is gitignored and must be deleted once the rewrite is accepted. |
 | B7 | Desktop-chromium Playwright project not re-run | Low | Auth, admin, schedules, mobile, visual, voice and integration projects pass (17 passed, 3 skipped by design, 0 failed, 0 flaky with retries disabled). The `desktop-chromium` project was not part of this run; `npm run test:e2e` covers everything but `integration`. |
 | B8 | Other remote branches | Info | `checkpoint/*`, `feature/oracle-mobile-migration` and tag `phase2-baseline-2026-11-19` were checked: no `.tmp`/backups path at their tips and no key-shaped value in their histories. No action needed. |
-| B9 | A `git fetch` restores the old objects until D1 | Medium (local) | A background fetch during this audit reset `origin/main` to the published `2b847142` and brought the old blobs back into `.git`. The scanner correctly flagged it. `origin/main` was re-pointed and the objects re-pruned, but **do not fetch between the purge and the force-push**; if you do, re-point `refs/remotes/origin/main` and re-run `git gc --prune=now`. |
+| B9 | A `git fetch` restores the old objects until D1 | Medium (local) | **Currently active.** `refs/remotes/origin/main` and `refs/remotes/origin/HEAD` point at `2b847142`, so that commit's objects are present again and `node scripts/secret-scan.mjs --history` now fails on the three original findings (`.tmp/phase5/digt_kontakt.html`, two historical test fixtures) even though `refs/heads/main` is clean. This is correct behaviour, not a scanner fault: the old history really does exist in this clone. Scoped to the rewritten branch, the same scan passes over 19 commits. Clear it with `git update-ref refs/remotes/origin/main refs/heads/main && git gc --prune=now` **only after** the remote rewrite is published, otherwise the next fetch restores it again. |
+| B10 | Two tracked reports contain a home-directory path | Info | `artifacts/phase6-acceptance.md` and `artifacts/provider-restoration/final-report.md` show `/Users/<name>/Desktop/jobs` in example commands. The GitHub account handle already identifies the owner, so this adds little; untrack or redact if the repository becomes public. |
+| B11 | One root secret protects three purposes | Medium (design) | Sessions are stored as hashes, but Gmail tokens, MFA secrets and OAuth state all derive from `APP_SECRET_KEY` (domain-separated by scrypt salt). Rotating it to recover from a leak would also invalidate every MFA enrolment. A separate `GMAIL_TOKEN_KEY` would isolate them; not added, because it changes key management and migration for no benefit while the root key is uncompromised. |
 
 ## C. MANUAL ACCOUNT-OWNER ACTIONS
 
@@ -244,6 +246,43 @@ public.
 
 **C4 — Delete the backup bundle** after accepting the rewrite:
 `rm backups/pre-purge-20261128T132506Z.bundle`. Until then it is the rollback.
+
+**C5 — Turn on the GitHub-side controls** (Settings → Code security, or `gh` once installed).
+These were not enabled: `gh` is absent and no token is available here.
+
+1. **Secret scanning** — free on public repositories; on a private repository it
+   requires GitHub Secret Protection, a paid add-on. This project must not
+   introduce paid services, so enable it only if the repository is public or the
+   owner has the add-on already.
+2. **Push protection** — same licensing rule; it is the control that stops the
+   next key from being committed.
+3. **Dependabot alerts** — free for every repository. No `.github/dependabot.yml`
+   exists yet, so also add update config or alerts only notify.
+4. **Branch protection on `main`** — require a pull request and the `security`
+   workflow as a required check. Do not require signed commits until the owner's
+   tooling supports it, or pushes will be rejected.
+
+```bash
+# After installing gh and authenticating (no secret values are printed):
+gh api -X PATCH repos/{owner}/{repo} -f security_and_analysis[secret_scanning][status]=enabled
+gh api -X PATCH repos/{owner}/{repo} -f security_and_analysis[secret_scanning_push_protection][status]=enabled
+gh api -X PUT repos/{owner}/{repo}/vulnerability-alerts
+```
+
+**C6 — Invalidate sessions and reconnect Gmail.** The published history still
+contains `artifacts/backups/*.db` from `d43cb94`: 10 session rows, one
+`gmail_accounts` row with encrypted access/refresh tokens, and the owner profile.
+Rotating the root secret is not the answer (it would break MFA), so:
+
+```sql
+-- signs every browser out; users sign in again
+DELETE FROM sessions;
+```
+
+Then disconnect the app at `myaccount.google.com/permissions` and reconnect Gmail
+from Settings, so the refresh token in the published dump is dead regardless of
+whether `APP_SECRET_KEY` ever leaked. Until the remote rewrite lands, both steps
+should be repeated after it.
 
 ## D. REMOTE GITHUB ACTIONS REQUIRING AUTHORISATION
 
@@ -286,6 +325,23 @@ scanning, push protection, Dependabot alerts, and branch protection requiring th
 
 **D3 — Notify collaborators / forks** that history was rewritten, and treat the
 old key as compromised in any external copy until C1 is resolved.
+
+## E. FINAL REMOTE VERIFICATION (2026-11-28, second phase)
+
+| # | Check | Command | Result |
+|---|-------|---------|--------|
+| 1 | Remote `main` replaced by the rewritten history | `git ls-remote origin` | **FAILED** — remote `refs/heads/main` and `HEAD` are both `2b8471422c71a6eb9dc51b230fb580a4ff6bfd4f`, the pre-rewrite commit. Local rewritten `main` is `1cddea2` (19 commits). Nothing was pushed. |
+| 2 | Old exposed commit and DB-backup commit unreachable from remote `main` | `git ls-remote origin`; `git merge-base --is-ancestor` | **FAILED on the remote** — `2b847142` *is* the remote tip, so it is reachable by definition, and `d43cb94` (the committed SQLite backups) is in its ancestry. Locally, `2b847142` is **not** an ancestor of the rewritten `main`. |
+| 3 | Secret scanner against the rewritten local history | `secret-scan.mjs --history` in a single-branch clone of local `main` | **PASSED** — no finding in 19 commits. Whole-clone `--history` fails only because of the re-imported `origin/main` objects (B9); tracked-tree scan passes. |
+| 4 | GitHub security workflow configuration | `.github/workflows/security.yml` | **PASSED** — `security` workflow on every push/PR: `permissions: contents: read`, `secret-scan` (tree + full history, runs before `npm ci`), `dependencies` (`npm audit --audit-level=high`), `quality` (typecheck, unit, production build). No third-party paid scanner. No `.github/dependabot.yml`. |
+| 5 | Secret scanning, push protection, Dependabot, branch protection | `gh auth status` | **NOT ENABLED, NOT ENABLEABLE HERE** — `gh` is not installed and no GitHub token is available, so these repository settings cannot be read or changed from this machine. Steps in C5. |
+| 6 | No tracking of `.tmp`, `.checkpoints`, `artifacts/backups`, environment secrets | `git ls-files`, `git check-ignore` | **PASSED** — none tracked; all four rules resolve via `.gitignore`; `.env.example` remains tracked; rewritten history contains no such path. |
+| 7 | Tracked artifacts reviewed for personal information | `git grep` for emails, names, `/Users/`, hostnames | **FOUND AND FIXED** — `artifacts/reset/` and `real-world-acceptance.md` untracked. Residual: `artifacts/phase6-acceptance.md` and `artifacts/provider-restoration/final-report.md` contain `/Users/<name>/Desktop/jobs` in command examples (B10). |
+| 8 | Gmail OAuth token encryption-key isolation | `lib/gmail.ts`, `lib/mfa.ts` | **PASSED with a caveat** — AES-256-GCM, random 12-byte IV, auth tag, `v1.` format; key is `scrypt(APP_SECRET_KEY, "atw-gmail-token", 32)`, domain-separated from MFA's `atw-mfa-secret`; only `tokenEncrypted: true` is ever returned, never a token. Caveat: both subkeys derive from one root secret, so APP_SECRET_KEY compromise exposes tokens (B11). |
+| 9 | Session invalidation / Gmail reconnect | `lib/auth.ts`, `lib/actions/admin.ts` | **RECOMMENDED** — session tokens are stored as SHA-256 hashes; logout, admin disable/delete and “revoke other sessions” all delete rows. Because the DB dump is published, purge sessions and reconnect Gmail (C6). |
+| 10 | Production build and automated security tests | `npm audit`, `typecheck`, `test:unit`, `build`, Playwright auth/admin/schedules | **PASSED** — 0 vulnerabilities; typecheck clean; 749 pass / 0 fail / 4 skipped; build clean; 21/21 Playwright security tests pass with retries disabled. |
+
+Policies re-checked, unchanged: `daily_recruitment` is `12:00 Europe/Zurich`, enabled, all seven weekdays; CHF 0.00 budget and verified-free provider gating untouched; no eligibility, submission or agent-permission code was modified this phase.
 
 ## Verification performed (final state)
 
@@ -331,6 +387,7 @@ Playwright projects for mobile, visual, voice and integration were not run (B7).
 | `scripts/verify-remote-history.mjs` | Post-push verifier: fetches the remote, checks tip, secrets and purged paths |
 | `artifacts/backups/**` | Untracked (files kept locally) |
 | `artifacts/**/*.png`, `artifacts/**/*.wav`, `artifacts/investigations/**` | Untracked and ignored (files kept locally) |
+| `artifacts/reset/**`, `artifacts/autonomous-submission/real-world-acceptance.md` | Untracked and ignored (owner name, email, hostname, home paths) |
 | `.gitignore` | Ignore the personal captures; keep the security report tracked |
 
 ## Recovery
@@ -346,8 +403,13 @@ It contains the exposed key, so delete it after accepting the rewrite (C4).
 
 ## Remaining risk statement
 
-The local clone no longer contains a credential-shaped value in any commit, and
-the newly found database dumps are gone from history. The exposure is not closed
-until the key is rotated or confirmed as a third party's (C1) and the rewritten
-`main` replaces the published history (D1). Until then, treat the key as
-compromised and the repository as **not production-ready**.
+The **rewritten** local `main` (19 commits) contains no credential-shaped value
+and no purged path, and the database dumps are gone from it. But the remote was
+verified this phase and **still serves the pre-rewrite commit `2b847142`**, where
+the key, the two test fixtures and `d43cb94`'s SQLite backups are all reachable.
+A local clone therefore still holds those objects through `origin/main`.
+
+The exposure is not closed until the key is rotated or confirmed as a third
+party's (C1), the rewrite is published (D1), and C5/C6 are done. Until then treat
+the key as compromised and the repository as **not production-ready**. No remote
+push, deployment, setting change or credential revocation was performed.
