@@ -65,6 +65,12 @@ jobs:
           node-version: "24"
           cache: npm
       - run: npm ci --ignore-scripts
+      # The submission executor tests drive a real headless Chromium against
+      # loopback fixtures. Without this the runner has no browser and those
+      # tests fail with "Executable doesn't exist", not because of the code.
+      # Only Chromium is installed; nothing is uploaded and no secret is used.
+      - name: Install the browser used by the submission executor tests
+        run: npx playwright install --with-deps chromium
       - name: Typecheck
         run: npm run typecheck
       - name: Unit tests
