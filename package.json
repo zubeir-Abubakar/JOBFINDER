@@ -54,7 +54,7 @@
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "three": "^0.187.0",
-    "undici": "^7.30.2",
+    "undici": "^8.13.1",
     "unpdf": "^2.2.1"
   },
   "devDependencies": {
