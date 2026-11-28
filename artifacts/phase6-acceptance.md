@@ -60,7 +60,7 @@ was not disturbed; `data/` and `artifacts/` were excluded from that copy.
 ## Local start
 
 ```bash
-cd /Users/abubakartowfiq/Desktop/jobs
+cd ~/Desktop/jobs
 npm run dev
 ```
 

@@ -253,7 +253,7 @@ Until then, OpenRouter stays `BLOCKED — FREE-TIER ACCESS UNAVAILABLE`; no requ
 The long-running production supervisor and dev server are still serving the pre-change code. I did **not** restart them, per your instruction. The current production supervisor command is:
 
 ```text
-node /Users/abubakartowfiq/Desktop/jobs/scripts/production-runtime.mjs --supervise
+node scripts/production-runtime.mjs --supervise
 ```
 
 Restart it through your normal service manager, or stop it and use the repository's production start command. The development server is `next dev`; restart it with `npm run dev` if that is your active UI.
