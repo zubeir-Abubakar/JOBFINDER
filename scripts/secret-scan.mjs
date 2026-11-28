@@ -2,6 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { PLACEHOLDER_VALUE, STRONG, TEMPLATE_VALUE } from "./secret-patterns.mjs";
 
 /**
  * Repository secret scanner.
@@ -34,22 +35,6 @@ const SKIP_PATHS = [
   /^package-lock\.json$/, // hashes only; audited by npm audit
 ];
 
-/** High-signal formats. These are enforced in every file, tests included. */
-const STRONG = [
-  { name: "Google API key", re: /AIza[0-9A-Za-z_-]{35}/ },
-  { name: "Google OAuth client secret", re: /GOCSPX-[A-Za-z0-9_-]{20,}/ },
-  { name: "OpenAI-style key", re: /\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}/ },
-  { name: "Anthropic key", re: /\bsk-ant-[A-Za-z0-9_-]{20,}/ },
-  { name: "Groq key", re: /\bgsk_[A-Za-z0-9]{20,}/ },
-  { name: "Resend key", re: /\bre_[A-Za-z0-9_]{16,}/ },
-  { name: "GitHub token", re: /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}/ },
-  { name: "Slack token", re: /\bxox[baprs]-[A-Za-z0-9-]{20,}/ },
-  { name: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
-  { name: "Supabase key", re: /\bsb[p]_[A-Za-z0-9_-]{20,}/ },
-  { name: "private key", re: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/ },
-  { name: "database URL with password", re: /\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?):\/\/[^\s"'<>:@/]{1,64}:[^\s"'<>@/]{2,64}@/ },
-];
-
 /**
  * Generic `secret = "..."` assignments are noisy, so they only apply outside
  * test/documentation trees and only when the value looks genuinely random
@@ -61,15 +46,6 @@ const GENERIC = {
 };
 
 const GENERIC_SKIP = /^(?:tests?|e2e|docs?|artifacts|deploy\/.*\.example)/;
-
-/**
- * Placeholder detection applies to the MATCHED VALUE, never to the whole line:
- * a line that merely mentions "example" must still be scanned. A real key never
- * contains these words.
- */
-const PLACEHOLDER_VALUE = /(?:placeholder|change[-_]?this|your[-_]|example|redacted|not[-_]a[-_]|dummy|sample|fixture|xxxx)/i;
-/** Template expressions are not literal credentials. */
-const TEMPLATE_VALUE = /^(?:\$\{|<[^>]*>|\{\{)/;
 
 function sha(value) {
   return createHash("sha256").update(value).digest("hex").slice(0, 10);

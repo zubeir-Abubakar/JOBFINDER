@@ -66,19 +66,10 @@ printf '%s\n' "${PATHS[@]}" >"$PATHS_FILE"
 
 # Literal values that live outside the purged directories (for example a
 # credential-shaped test fixture) are rewritten across every commit. The values
-# are collected into a file and never printed to the terminal or a report.
+# come from the scanner's own patterns so an identifier that merely contains
+# "re_" or "sk-" is never rewritten, and they are never printed.
 EXPR_FILE="$SCRATCH/replacements.json"
-STRONG_RE='(AIza[0-9A-Za-z_-]{35}|GOCSPX-[A-Za-z0-9_-]{20,}|sk-(proj-)?[A-Za-z0-9_-]{20,}|gsk_[A-Za-z0-9]{20,}|re_[A-Za-z0-9_]{16,}|(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,}|AKIA[0-9A-Z]{16}|sb[p]_[A-Za-z0-9_-]{20,})'
-git log -p --all --no-color 2>/dev/null | grep -oE "$STRONG_RE" | sort -u >"$SCRATCH/values.txt" || true
-node - "$SCRATCH/values.txt" "$EXPR_FILE" <<'NODE'
-const fs = require("node:fs");
-const [, , valuesPath, outPath] = process.argv;
-const values = fs.existsSync(valuesPath)
-  ? fs.readFileSync(valuesPath, "utf8").split("\n").filter(Boolean)
-  : [];
-fs.writeFileSync(outPath, JSON.stringify({ replacements: values.map((value) => [value, "***REMOVED***"]) }, null, 1));
-console.log(`    ${values.length} literal value(s) will be replaced across history.`);
-NODE
+git log -p --all --no-color 2>/dev/null | node "$ORIG_ROOT/scripts/purge-values.mjs" "$EXPR_FILE"
 
 # git-filter-repo expressions file (literal==>replacement).
 : >"$SCRATCH/expressions.txt"
