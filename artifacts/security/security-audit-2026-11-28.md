@@ -217,7 +217,7 @@ the presence of the files.
 | B4 | Artifacts contain owner PII | **Resolved in the index** | 78 PNGs, two live-call recordings and a Gmail investigation note were untracked earlier (81 files). This phase also untracked `artifacts/reset/` (owner name, hostname, home paths, CV filenames) and `artifacts/autonomous-submission/real-world-acceptance.md` (name and email in an employer confirmation). All files stay on disk. The old copies, screenshots included, were in the published history; that history has since been rewritten and verified, so the only remaining copy is the rollback bundle (B6). |
 | B5 | Rate limiting is single-host | Low | Durable across processes that share the SQLite file, but not a distributed limiter for horizontally scaled replicas. The deployment is a single host; a shared store would be required to scale out. |
 | B6 | Pre-purge backup bundle holds the old history | Medium (local) | `backups/pre-purge-20261128T132506Z.bundle` contains the exposed key by design, so the purge is reversible. It is gitignored. The rewrite is now independently verified, so delete it once the owner accepts the new history (C4). |
-| B7 | Desktop-chromium Playwright project not re-run | Low | Auth, admin, schedules, mobile, visual, voice and integration projects pass (17 passed, 3 skipped by design, 0 failed, 0 flaky with retries disabled). The `desktop-chromium` project was not part of this run; `npm run test:e2e` covers everything but `integration`. |
+| B7 | Desktop-chromium Playwright project | **Resolved** | Run this phase with retries disabled: **52/52 passed** in 3.7 min, 0 failed, 0 flaky. Together with auth, admin, schedules, mobile, visual, voice and integration, every configured Playwright project has now passed; only the opt-in real-quota Gemini file is skipped by design. |
 | B8 | Other remote branches | Info | `checkpoint/*`, `feature/oracle-mobile-migration` and tag `phase2-baseline-2026-11-19` were checked: no `.tmp`/backups path at their tips and no key-shaped value in their histories. No action needed. |
 | B9 | A `git fetch` re-imports the old objects | **Resolved (local)** | During this phase `origin/main` still pointed at `2b847142`, so the old objects were present and the unscoped `--history` scan failed on the three original findings. After the published history was verified, `origin/main` and `origin/HEAD` were re-pointed to the rewritten branch, reflogs expired and `git gc --prune=now` run: `git cat-file -e 2b847142…` now fails and the full `--history` scan passes. A fetch of a still-unrewritten branch would restore the objects again — that is what makes the remote the source of truth. |
 | B10 | Home-directory paths in tracked reports | **Resolved** | `artifacts/phase6-acceptance.md` and `artifacts/provider-restoration/final-report.md` showed `/Users/<name>/Desktop/jobs`; both are now `~/Desktop/jobs` and `scripts/production-runtime.mjs`. `grep -r /Users/` over tracked files returns nothing. The original text remains in the pre-rewrite history only if it was ever committed there, which the verified remote no longer serves. |
@@ -268,21 +268,37 @@ gh api -X PATCH repos/{owner}/{repo} -f security_and_analysis[secret_scanning_pu
 gh api -X PUT repos/{owner}/{repo}/vulnerability-alerts
 ```
 
-**C6 — Invalidate sessions and reconnect Gmail.** The pre-rewrite published
-history contained `artifacts/backups/*.db` from `d43cb94` — gone from the remote
-now, but public for days, so treat it as copied: 10 session rows, one
-`gmail_accounts` row with encrypted access/refresh tokens, and the owner profile.
-Rotating the root secret is not the answer (it would break MFA), so:
+**C6 — Sessions purged; reconnect Gmail (owner steps outstanding).**
 
-```sql
--- signs every browser out; users sign in again
-DELETE FROM sessions;
-```
+**Sessions: done** on 2026-11-28T14:44:33Z — 10 rows → 0, recorded in
+`audit_logs` as `admin.sessions_purged`. `PRAGMA integrity_check` is ok, there
+are 0 foreign-key violations, the user and Gmail rows are untouched, and the
+pre-purge snapshot is `backups/pre-session-purge-2026-11-28T14-44-33-379Z.db`
+(mode 0600, gitignored). Every browser session is now invalid: its token hash is
+gone, so the next request redirects to login.
 
-Then disconnect the app at `myaccount.google.com/permissions` and reconnect Gmail
-from Settings, so the refresh token in the published dump is dead regardless of
-whether `APP_SECRET_KEY` ever leaked. The rewrite has landed, so one pass is
-enough; repeat both only if history is ever re-published from an older clone.
+**Gmail: still to do.** The pre-rewrite published history contained
+`artifacts/backups/*.db` from `d43cb94` with 10 session rows, one
+`gmail_accounts` row with encrypted access/refresh tokens, and the owner profile
+— gone from the remote now, but public for days, so treat the refresh token as
+copied. In this order:
+
+| # | Where | What to check |
+|---|---|---|
+| 1 | `.env` | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` present and never committed — the tracked-tree scanner reports no value |
+| 2 | Google Cloud console → APIs & Services → Credentials | The OAuth client's Authorized redirect URI equals `GOOGLE_REDIRECT_URI` exactly — no wildcard, no trailing slash |
+| 3 | App → Inbox, or Admin → Email → **Disconnect Gmail** | Confirm: only tokens are removed, message metadata and drafts stay |
+| 4 | myaccount.google.com/permissions | Remove this app's access, so the old refresh token cannot be reused from the dump |
+| 5 | App → sign in | New session; MFA prompt if enabled |
+| 6 | Admin → Email → **Connect Gmail** | Consent requests `gmail.readonly`, `gmail.compose`, `gmail.send` plus `openid` and `email` — nothing broader |
+| 7 | Admin → Email → **Sync inbox** | Sync completes; no `invalid_grant` or `access_token_rejected` |
+| 8 | Database | `SELECT COUNT(*) FROM gmail_accounts WHERE access_token NOT LIKE 'v1.%'` returns 0 (true now) |
+| 9 | Admin → Email → Gmail card | `tokenEncrypted` is true and no token is rendered anywhere |
+| 10 | Admin → Email / Schedules | `daily_recruitment` still `12:00 Europe/Zurich` and enabled — reconnecting must not change it |
+
+Do **not** rotate `APP_SECRET_KEY` for this: it would invalidate every MFA
+enrolment (B11). Repeat steps 3–7 only if history is ever re-published from an
+older clone.
 
 ## D. REMOTE GITHUB ACTIONS REQUIRING AUTHORISATION
 
@@ -344,8 +360,8 @@ old key as compromised in any external copy until C1 is resolved.
 | 6 | No tracking of `.tmp`, `.checkpoints`, `artifacts/backups`, environment secrets | `git ls-files`, `git check-ignore` | **PASSED** — none tracked; all four rules resolve via `.gitignore`; `.env.example` remains tracked; rewritten history contains no such path. |
 | 7 | Tracked artifacts reviewed for personal information | `git grep` for emails, names, `/Users/`, hostnames | **FOUND AND FIXED** — `artifacts/reset/` and `real-world-acceptance.md` untracked. The two remaining home-directory paths in `phase6-acceptance.md` and `provider-restoration/final-report.md` were redacted in the same pass; no `/Users/` remains in tracked files (B10). |
 | 8 | Gmail OAuth token encryption-key isolation | `lib/gmail.ts`, `lib/mfa.ts` | **PASSED with a caveat** — AES-256-GCM, random 12-byte IV, auth tag, `v1.` format; key is `scrypt(APP_SECRET_KEY, "atw-gmail-token", 32)`, domain-separated from MFA's `atw-mfa-secret`; only `tokenEncrypted: true` is ever returned, never a token. Caveat: both subkeys derive from one root secret, so APP_SECRET_KEY compromise exposes tokens (B11). |
-| 9 | Session invalidation / Gmail reconnect | `lib/auth.ts`, `lib/actions/admin.ts` | **RECOMMENDED** — session tokens are stored as SHA-256 hashes; logout, admin disable/delete and “revoke other sessions” all delete rows. Because the DB dump was published, purge sessions and reconnect Gmail (C6). |
-| 10 | Production build and automated security tests | `npm audit`, `typecheck`, `test:unit`, `build`, Playwright auth/admin/schedules | **PASSED** — 0 vulnerabilities; typecheck clean; 749 pass / 0 fail / 4 skipped; build clean; 21/21 Playwright security tests pass with retries disabled. |
+| 9 | Session invalidation / Gmail reconnect | direct SQL + `audit_logs` | **SESSIONS DONE / GMAIL PENDING** — sessions purged `10 → 0` at `2026-11-28T14:44:33Z`, audited as `admin.sessions_purged`; `integrity_check` ok, 0 FK violations, 1 user and 1 Gmail row preserved, pre-purge snapshot at `backups/pre-session-purge-2026-11-28T14-44-33-379Z.db` (0600). Tokens stay encrypted (`v1.`, 0 plaintext rows). Gmail reconnect is the owner step in C6. |
+| 10 | Production build and automated security tests | `npm audit`, `typecheck`, `test:unit`, `build`, Playwright auth/admin/schedules/desktop | **PASSED** — 0 vulnerabilities; typecheck clean; 749 pass / 0 fail / 4 skipped; build clean; 21/21 security tests and 52/52 desktop tests pass with retries disabled. |
 
 Policies re-checked, unchanged: `daily_recruitment` is `12:00 Europe/Zurich`, enabled, all seven weekdays; CHF 0.00 budget and verified-free provider gating untouched; no eligibility, submission or agent-permission code was modified this phase.
 
@@ -366,6 +382,8 @@ Policies re-checked, unchanged: `daily_recruitment` is `12:00 Europe/Zurich`, en
 | Voice pipeline stability | `--project=voice-chromium e2e/voice.spec.ts --repeat-each=3 --retries=0` | 3/3 passed before the full run |
 | Published history | `npm run verify:remote` | Remote tip equals local `HEAD`; no credential, no purged path, no dump in 20 commits |
 | Full history scan after pruning | `node scripts/secret-scan.mjs --history` | Passed; `2b847142` object pruned (`git cat-file -e` fails) |
+| Desktop Playwright project | `npx playwright test --project=desktop-chromium --retries=0` | 52 passed, 0 failed, 0 flaky (3.7 min) |
+| Session purge | direct SQL + `audit_logs` | 10 → 0 sessions; integrity ok; 0 FK violations; 1 user, 1 Gmail row kept |
 | Dependencies | `npm audit --audit-level=high` | 0 vulnerabilities |
 | Typecheck | `npm run typecheck` | exit 0 |
 | Unit tests | `npm run test:unit` | 753 tests, 749 pass, 4 skipped, **0 fail** |
@@ -420,8 +438,8 @@ reachable. The local clone's stale `origin/main` objects were pruned, so
 
 The repository side of the exposure is closed. It is **not** fully closed overall:
 the key itself is still unrotated or unconfirmed (C1), the GitHub-side controls
-are still off (C5), and the previously published dump argues for rotating
-sessions and reconnecting Gmail (C6). Treat the older key as compromised until
+are still off (C5), sessions are purged, and the previously published dump still
+argues for the Gmail reconnect in C6. Treat the older key as compromised until
 C1 is resolved, and the repository as **not production-ready** until C1 and C5
 are done. No deployment, setting change or credential revocation was performed;
 the rollback bundle was kept (B6/C4).
