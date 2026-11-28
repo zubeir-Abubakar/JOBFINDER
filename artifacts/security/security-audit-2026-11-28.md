@@ -122,10 +122,10 @@ the repository alone (that requires the Google Cloud project list), so:
   clean tree; purge script reviewed; dry run exit 0; verified 67 MB bundle backup
   (`backups/pre-purge-20261128T132506Z.bundle`, gitignored, `git bundle verify`
   reports a complete history).
-- **Result:** 13 commits rewritten. `.tmp/`, `.checkpoints/` and
-  `artifacts/backups/` are absent from every commit. The three candidate values
-  (the Google key and the two Resend-shaped historical fixtures) were replaced
-  with `***REMOVED***`; no other file content changed.
+- **Result:** 12 commits rewritten (plus the later remediation commits). `.tmp/`,
+  `.checkpoints/` and `artifacts/backups/` are absent from every commit. The
+  three candidate values (the Google key and the two Resend-shaped historical
+  fixtures) were replaced with `***REMOVED***`; no other file content changed.
 - **Source integrity:** the rewritten `HEAD` tree is byte-identical to the
   pre-purge tree outside the purged paths (`git diff` empty), and the tracked file
   count/source paths are unchanged. No identifier or unrelated line was rewritten
@@ -219,6 +219,7 @@ the presence of the files.
 | B6 | Pre-purge backup bundle holds the old history | Medium (local) | `backups/pre-purge-20261128T132506Z.bundle` contains the exposed key by design, so the purge is reversible. It is gitignored and must be deleted once the rewrite is accepted. |
 | B7 | Full Playwright suite not run | Low | Auth, admin and schedules projects were run. Mobile, visual, voice and integration projects were not, because no UI or voice code changed. Run `npm run test:e2e` before release. |
 | B8 | Other remote branches | Info | `checkpoint/*`, `feature/oracle-mobile-migration` and tag `phase2-baseline-2026-11-19` were checked: no `.tmp`/backups path at their tips and no key-shaped value in their histories. No action needed. |
+| B9 | A `git fetch` restores the old objects until D1 | Medium (local) | A background fetch during this audit reset `origin/main` to the published `2b847142` and brought the old blobs back into `.git`. The scanner correctly flagged it. `origin/main` was re-pointed and the objects re-pruned, but **do not fetch between the purge and the force-push**; if you do, re-point `refs/remotes/origin/main` and re-run `git gc --prune=now`. |
 
 ## C. MANUAL ACCOUNT-OWNER ACTIONS
 
@@ -257,7 +258,10 @@ git ls-remote origin refs/heads/main
 git push --force-with-lease=main:2b8471422c71a6eb9dc51b230fb580a4ff6bfd4f origin main
 ```
 
-Collaborators must re-clone; an existing clone can push the old objects back.
+Do not run `git fetch` between the purge and this push: the remote still holds
+the old history, so a fetch re-points `origin/main` at it and re-imports the
+blobs (B9). Collaborators must re-clone; an existing clone can push the old
+objects back.
 
 **D2 — Enable repository protections** (Settings → Code security): secret
 scanning, push protection, Dependabot alerts, and branch protection requiring the
@@ -272,7 +276,7 @@ old key as compromised in any external copy until C1 is resolved.
 |-------|---------|--------|
 | Tracked-file secret scan | `node scripts/secret-scan.mjs` | **Pass**, exit 0 |
 | Staged-file secret scan | pre-commit hook / `--staged` | **Pass**; hook blocked a synthetic probe |
-| History secret scan | `node scripts/secret-scan.mjs --history` | **Pass**, exit 0 after purge and gc |
+| History secret scan | `node scripts/secret-scan.mjs --history` | **Pass**, exit 0 (re-run after re-pointing the fetched `origin/main`; see B9) |
 | Purge path removal | `git log --all --name-only` | No `.tmp/`, `.checkpoints/`, `artifacts/backups/` |
 | Rewrite scope | `git diff <pre-purge> HEAD` (excluding purged paths) | **Empty** — no unrelated content changed |
 | Identifier integrity | `git grep '\*\*\*REMOVED\*\*\*' -- lib tests app components` | None at HEAD |
