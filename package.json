@@ -27,6 +27,7 @@
     "restore": "node scripts/restore.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
     "secret-scan:history": "node scripts/secret-scan.mjs --history",
+    "verify:remote": "node scripts/verify-remote-history.mjs",
     "prepare": "node scripts/install-hooks.mjs"
   },
   "engines": {

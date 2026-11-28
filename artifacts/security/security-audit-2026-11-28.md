@@ -266,6 +266,20 @@ the old history, so a fetch re-points `origin/main` at it and re-imports the
 blobs (B9). Collaborators must re-clone; an existing clone can push the old
 objects back.
 
+Then prove what the remote actually publishes (this fetches, which is why it
+belongs after the push and never before it):
+
+```bash
+npm run verify:remote
+```
+
+`scripts/verify-remote-history.mjs` fetches `origin/main` into its own ref,
+confirms the tip is the commit that was pushed, and runs the hardened history
+scanner against a throwaway bare clone of that branch only. It also fails on any
+reachable `.tmp/`, `.checkpoints/`, `artifacts/backups/`, database dump or
+`.env` file. Use `--remote`, `--branch` or `--expect <sha>` for other targets;
+it prints redacted findings and exits non-zero, so it can gate a release.
+
 **D2 — Enable repository protections** (Settings → Code security): secret
 scanning, push protection, Dependabot alerts, and branch protection requiring the
 `security` workflow. Consider making the `security` workflow a required check.
@@ -314,6 +328,7 @@ Playwright projects for mobile, visual, voice and integration were not run (B7).
 | `tests/oauth-state.test.ts`, `tests/session-security.test.ts` | New unit coverage |
 | `e2e/auth.spec.ts` | Session expiry, CSRF, document isolation, OAuth start/callback |
 | `e2e/voice.spec.ts` | Playback assertion removed from the fixed-order stage loop; first spoken turn gets a 60s budget |
+| `scripts/verify-remote-history.mjs` | Post-push verifier: fetches the remote, checks tip, secrets and purged paths |
 | `artifacts/backups/**` | Untracked (files kept locally) |
 | `artifacts/**/*.png`, `artifacts/**/*.wav`, `artifacts/investigations/**` | Untracked and ignored (files kept locally) |
 | `.gitignore` | Ignore the personal captures; keep the security report tracked |
